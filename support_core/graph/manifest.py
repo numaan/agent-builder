@@ -31,7 +31,62 @@ class LlmConfig(BaseModel):
 
     default_model: str = Field(min_length=1)
     escalation_model: str | None = None
-    """Used for handoff summaries and hard reasoning nodes; defaults to ``default_model``."""
+    """Used for handoff summaries and hard reasoning nodes; defaults to ``default_model``.
+
+    Also the last rung of DESIGN.md section 7.3's ladder: "retry with backoff, then fall back to
+    ``escalation_model``, then handoff with reason ``llm_unavailable``."""
+
+    confidence_threshold: float = Field(default=0.4, ge=0.0, le=1.0)
+    """DESIGN.md section 11.3: "Low confidence on a decision below a pack threshold routes to
+    ``unclear`` handling instead of a guess." Below this, the engine takes the node's ``unclear``
+    edge if it declares one and hands off if it does not - it never takes the model's guess."""
+
+    max_tool_iterations: int = Field(default=5, ge=0, le=20)
+    """The bound on DESIGN.md section 8.4's model-facing tool loop ("default 5 iterations")."""
+
+    retries: int = Field(default=2, ge=0, le=5)
+    """Attempts per model before the escalation rung (DESIGN.md section 7.3)."""
+
+    max_output_tokens: int = Field(default=4096, ge=256)
+    prompt_budget: dict[str, int] = Field(default_factory=dict)
+    """Per-layer token budgets (DESIGN.md section 10), keyed by the layer names of section 11.2.
+    Anything unset keeps the core default."""
+
+    @field_validator("prompt_budget")
+    @classmethod
+    def _known_layers(cls, value: dict[str, int]) -> dict[str, int]:
+        from support_core.llm.prompt import PromptBudget
+
+        known = set(PromptBudget.model_fields)
+        unknown = sorted(set(value) - known)
+        if unknown:
+            msg = f"unknown prompt layer(s) {unknown}; known layers are {sorted(known)}"
+            raise ValueError(msg)
+        if any(budget < 1 for budget in value.values()):
+            msg = "a layer budget must be at least one token"
+            raise ValueError(msg)
+        return value
+
+
+class MemoryConfig(BaseModel):
+    """The conversation memory of DESIGN.md section 10.
+
+    Section 10 says the conversation summary is "updated every K turns" and that prompt assembly
+    uses explicit token budgets, but section 5.1's example manifest has nowhere to put either.
+    Added here for the same reason phase 2 added ``timeouts:``, and with defaults that do nothing
+    surprising: summarising is off unless a pack asks for it, because it costs a model call per
+    K turns and a pack that never reads ``ctx.summary`` should not pay for it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    summarize_every_turns: int = Field(default=0, ge=0)
+    """``K``. Zero disables the rolling summary."""
+
+    window_messages: int = Field(default=12, ge=1)
+    """How many recent messages go in the prompt's turn window (section 10, "Turn window")."""
+
+    max_summary_chars: int = Field(default=1200, ge=100)
 
 
 class InterruptConfig(BaseModel):
@@ -154,6 +209,7 @@ class PackManifest(BaseModel):
     handoff: HandoffConfig
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     timeouts: TimeoutsConfig = Field(default_factory=TimeoutsConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
 
     @field_validator("version")
     @classmethod

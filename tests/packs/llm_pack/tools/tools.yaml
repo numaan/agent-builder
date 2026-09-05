@@ -1,0 +1,13 @@
+# Declared so the phase-3 tests can prove the model-facing tool loop refuses everything that is
+# not a READ-tier tool the node itself declared (DESIGN.md sections 8.2, 8.4).
+tools:
+  - name: get_balance
+    description: The customer's current account balance.
+    risk: read
+    input: { customer_ref: str }
+    output: { balance: float }
+  - name: issue_refund
+    description: Refund a charge to the original payment method.
+    risk: high
+    input: { charge_id: str, amount: float }
+    output: { refund_id: str, status: str }

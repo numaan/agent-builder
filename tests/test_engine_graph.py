@@ -13,7 +13,8 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from support_core import load_pack
-from support_core.engine import Executor, NodeNotExecutableError
+from support_core.engine import Executor
+from support_core.engine.runners import NotExecutableRunner, build_runner
 from support_core.graph.pack import Pack
 from tests.engine_support import (
     DETERMINISTIC_PACK,
@@ -131,12 +132,38 @@ async def test_a_router_without_a_matching_branch_hands_off(
     assert "node_error" in failed["error"]
 
 
-async def test_the_engine_refuses_node_types_core_cannot_run_yet(engine: AsyncEngine) -> None:
-    """PLAN.md's standing rule: nothing in phase 2 can execute a tool, and it does not pretend."""
-    executor = Executor(load_pack(PACKS / "refund_pack"), engine, hooks=Recorder().hooks())
+async def test_the_engine_refuses_node_types_core_cannot_run_yet() -> None:
+    """PLAN.md's standing rule: nothing yet can execute a tool, and core does not pretend.
+
+    ``llm`` became executable in phase 3, so the refusal is now asserted where it lives - the
+    runner registry - rather than through the one pack that happened to reach an ``llm`` node
+    first. ``tool`` and ``confirm`` are the two that matter for the standing rule: no code path
+    can run a tool, with or without an ``ActionApproval``, until phase 4 builds one.
+    """
+    pack = load_pack(PACKS / "refund_pack")
+    graph = pack.graphs["refund"]
+    for node_id, phase in (("fetch_charge", 4), ("confirm_refund", 4), ("handoff_dispute", 6)):
+        runner = build_runner(node_id, graph.nodes[node_id])
+        assert isinstance(runner, NotExecutableRunner)
+        assert runner.phase == phase
+
+
+async def test_an_llm_node_without_a_provider_hands_off_rather_than_guessing(
+    engine: AsyncEngine,
+) -> None:
+    """An executor with no LLM layer must not silently walk past a prompted node.
+
+    DESIGN.md section 7.3 has no "carry on regardless" rung: a node that cannot do its job is a
+    node error, and a node error with nowhere to route is a handoff.
+    """
+    recorder = Recorder()
+    executor = Executor(load_pack(PACKS / "llm_pack"), engine, hooks=recorder.hooks())
     conversation_id = await executor.start_conversation()
-    with pytest.raises(NodeNotExecutableError, match="'llm' is not executable until phase 3"):
-        await executor.on_inbound(conversation_id, "hello")
+    outcome = await executor.on_inbound(conversation_id, "hello")
+
+    assert outcome.status == "waiting_human"
+    assert [request.reason for request in recorder.handoffs] == ["llm_unavailable"]
+    assert "needs an LLM provider" in (recorder.handoffs[0].detail or "")
 
 
 async def test_a_runaway_graph_hits_the_per_turn_limit(

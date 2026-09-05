@@ -12,7 +12,19 @@ class EngineError(RuntimeError):
 
 
 class NodeError(EngineError):
-    """A node failed while running. Routed per DESIGN.md section 7.3."""
+    """A node failed while running. Routed per DESIGN.md section 7.3.
+
+    ``reason`` is the handoff reason to record when the failure reaches the handoff hook.
+    DESIGN.md section 7.3 names one that a node can produce on its own - ``llm_unavailable`` -
+    and phase 3 adds two more of the same kind (``llm_invalid_output``, ``low_confidence``),
+    because "the model would not answer", "the model answered with something the graph does not
+    allow" and "the model was not sure enough to be believed" are three different things for
+    whoever picks the conversation up. The default stays ``node_error``.
+    """
+
+    def __init__(self, message: str, *, reason: str = "node_error") -> None:
+        self.reason = reason
+        super().__init__(message)
 
 
 class NodeNotExecutableError(EngineError):

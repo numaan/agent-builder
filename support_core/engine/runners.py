@@ -13,15 +13,15 @@ frame stack and writes the checkpoint.
 """
 
 import uuid
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from jinja2.sandbox import SandboxedEnvironment
 from pydantic import BaseModel
 
 from support_core.engine.errors import NodeError, NodeNotExecutableError
-from support_core.engine.hooks import EngineHooks
+from support_core.engine.hooks import EngineHooks, SlotRequest
 from support_core.engine.types import (
     Frame,
     GraphInvocation,
@@ -38,6 +38,7 @@ from support_core.graph.nodes import (
     AskNode,
     EndNode,
     GateNode,
+    LlmNode,
     NodeBase,
     NodeTypeSpec,
     RouterNode,
@@ -48,6 +49,16 @@ from support_core.graph.nodes import (
 )
 from support_core.graph.schema import Graph, parse_value
 from support_core.graph.templates import TemplateError, render
+from support_core.llm.prompt import Decision, TranscriptMessage
+from support_core.llm.service import LlmService, NodeRequest
+from support_core.llm.tool_loop import (
+    ModelToolRunner,
+    ReadOnlyToolGateway,
+    ToolsUnavailableError,
+    UnavailableToolRunner,
+)
+from support_core.llm.types import LLMError, LLMUnavailableError, StructuredOutputError
+from support_core.tools.risk import Risk
 
 DEFAULT_EDGE = "default"
 """The edge label a ``router`` returns when no predicate matched. Not a possible predicate:
@@ -58,9 +69,17 @@ a predicate must start with a root, so ``default`` never parses as one."""
 class NodeRuntime:
     """What a node can reach outside itself (DESIGN.md section 6.3).
 
-    Phase 2 gives nodes the pack, their frame, their step id and the engine hooks. The LLM
-    layer (phase 3), retrieval (phase 5) and tool invocation (phase 4) arrive as further
-    attributes here, which is why nodes take ``rt`` rather than the individual pieces.
+    Phase 2 gives nodes the pack, their frame, their step id and the engine hooks; phase 3 adds
+    the LLM layer and the *seam* through which a model may call a tool. Retrieval (phase 5) and
+    the tool runtime itself (phase 4) arrive as further attributes here, which is why nodes take
+    ``rt`` rather than the individual pieces.
+
+    The tool seam is deliberately not a callable a node can use directly. A pack-registered
+    custom node type is arbitrary Python and ``rt`` is its only route to the outside
+    (reviews/phase-2.md, "the every-phase rule"), so what a node gets is
+    :meth:`tool_gateway` - a gateway constructed here, around the node's own declared tool list,
+    which refuses anything that is not a READ-tier tool that node declared. A node cannot obtain
+    the raw runner.
     """
 
     graph: Graph
@@ -72,8 +91,36 @@ class NodeRuntime:
     environment: SandboxedEnvironment
     """The *pack's* Jinja environment, never a shared one (phase-1 deferred finding P2)."""
 
+    llm: LlmService | None = None
+    """The LLM layer (DESIGN.md section 11). ``None`` where no provider is configured, which is
+    every phase-2 test: an ``llm`` node then fails as a node error and hands off, rather than
+    silently doing nothing."""
+
+    history: tuple[TranscriptMessage, ...] = ()
+    """The recent window of DESIGN.md section 10, read once per turn by the executor."""
+
+    tool_runner: ModelToolRunner = field(default_factory=UnavailableToolRunner)
+    """Phase 4's seam. Never reachable from a node except through :meth:`tool_gateway`."""
+
+    tool_risk: Mapping[str, Risk] = field(default_factory=dict)
+    max_tool_calls: int = 10
+
     def render(self, source: str, scope: Mapping[str, Any]) -> str:
         return render(source, dict(scope), env=self.environment)
+
+    def tool_gateway(self, declared: Sequence[str]) -> ReadOnlyToolGateway:
+        """The only way to reach a tool from inside a node (DESIGN.md sections 8.2, 8.4).
+
+        Built here rather than passed in, so no caller can hand a node a gateway with a wider
+        allow-list than the node's own ``tools:`` declaration.
+        """
+        return ReadOnlyToolGateway(
+            runner=self.tool_runner,
+            declared=tuple(declared),
+            manifest_risk=dict(self.tool_risk),
+            max_calls=self.max_tool_calls,
+            step_id=self.step_id,
+        )
 
 
 def scope_of(state: BaseModel, ctx: ConversationContext) -> dict[str, Any]:
@@ -291,12 +338,165 @@ class AskRunner(_Runner):
         if event.kind != "customer_message":
             msg = f"{self.id}: an ask node waits for a customer message, not {event.kind!r}"
             raise NodeError(msg)
-        patch = await rt.hooks.extract_slots(self.node.slots, event.text or "", ctx)
+        try:
+            prompt = rt.render(self.node.prompt, scope_of(state, ctx)).strip()
+        except TemplateError:  # pragma: no cover - run() rendered the same template already
+            prompt = self.node.prompt
+        request = SlotRequest(
+            node_id=self.id,
+            graph_id=rt.graph.id,
+            slots=list(self.node.slots),
+            prompt=prompt,
+            reply=event.text or "",
+            state_model=type(state),
+            state=state.model_dump(mode="json"),
+            window=[(message.author, message.text) for message in rt.history],
+            ctx=ctx,
+        )
+        try:
+            patch = await rt.hooks.extract_slots(request)
+        except LLMUnavailableError as exc:
+            raise NodeError(f"{self.id}: {exc}", reason="llm_unavailable") from exc
+        except LLMError as exc:
+            # A model that could not extract the slots must not fall back to a guess: the value
+            # would be treated as the customer's own words by every node after this one.
+            raise NodeError(
+                f"{self.id}: slot extraction failed: {exc}", reason="llm_invalid_output"
+            ) from exc
         unknown = set(patch) - set(type(state).model_fields)
         if unknown:
             msg = f"{self.id}: slot extraction produced unknown state fields {sorted(unknown)}"
             raise NodeError(msg)
         return NodeResult(state_patch=dict(patch))
+
+
+class LlmRunner(_Runner):
+    """A prompted step (DESIGN.md sections 6.2, 11.2, 11.3).
+
+    The node's job in one sentence: hand the LLM layer the *graph's* constraints and turn what
+    comes back into a :class:`~support_core.engine.types.NodeResult`, refusing anything the
+    graph did not allow. Three things it refuses, all of them DESIGN.md section 11.3 or
+    principle 2:
+
+    * an answer that is not valid against the node's own model - an undeclared edge label, a
+      state update outside ``output_schema``, no structured answer at all. The service has
+      already retried once with the reason stated back to the model; a second failure is a node
+      error, which routes to the handoff hook. It is never guessed at.
+    * a confidence below the pack's threshold: the node's ``unclear`` edge if it declares one,
+      and a handoff if it does not - because "no ``unclear`` edge" means the graph gave the
+      model no way to be unsure, not that the guess is now safe.
+    * ``needs_handoff``: the model may ask, and the engine decides. It decides yes, but the
+      decision is the engine's and is recorded as such.
+
+    The node's ``instructions`` are placed in layer 4 verbatim and are deliberately *not*
+    rendered as a template: interpolating state into a trusted layer would be a way for customer
+    text that reached a state field to become an instruction, which is the exact escape the
+    layering exists to prevent. State reaches the model through layer 6, inside a data block.
+    """
+
+    __slots__ = ("node",)
+
+    def __init__(self, node_id: str, node: NodeBase) -> None:
+        super().__init__(node_id, node)
+        assert isinstance(node, LlmNode)
+        self.node = node
+
+    async def run(self, state: BaseModel, ctx: ConversationContext, rt: NodeRuntime) -> NodeResult:
+        if rt.llm is None:
+            msg = (
+                f"{self.id}: this llm node needs an LLM provider and none is configured; "
+                f"build the Executor with an LlmService"
+            )
+            raise NodeError(msg, reason="llm_unavailable")
+
+        request = NodeRequest(
+            node_id=self.id,
+            instructions=self.node.instructions,
+            decisions=self._decisions(rt.graph),
+            output_schema=dict(self.node.output_schema),
+            state=state.model_dump(mode="json"),
+            summary=ctx.summary,
+            window=list(rt.history),
+            gateway=rt.tool_gateway(self.node.tools) if self.node.tools else None,
+            model=self.node.model,
+            max_tool_iterations=rt.llm.max_tool_iterations,
+        )
+        try:
+            decision = await rt.llm.decide(request)
+        except StructuredOutputError as exc:
+            msg = (
+                f"{self.id}: the model did not produce a usable decision after a retry: {exc}. "
+                f"The allowed decisions were {sorted(self.node.edges)}"
+            )
+            raise NodeError(msg, reason="llm_invalid_output") from exc
+        except (LLMUnavailableError, ToolsUnavailableError) as exc:
+            raise NodeError(f"{self.id}: {exc}", reason="llm_unavailable") from exc
+        except LLMError as exc:  # pragma: no cover - every subclass is handled above
+            raise NodeError(f"{self.id}: {exc}", reason="llm_unavailable") from exc
+
+        output = decision.output
+        trace = decision.as_trace()
+        if output.needs_handoff:
+            msg = (
+                f"{self.id}: the model asked for a human "
+                f"(decision {output.decision!r}, confidence {output.confidence})"
+            )
+            raise NodeError(msg, reason="model_requested_handoff")
+
+        edge = output.decision
+        if output.confidence < rt.llm.confidence_threshold:
+            if "unclear" not in self.node.edges:
+                msg = (
+                    f"{self.id}: confidence {output.confidence} is below the pack threshold "
+                    f"{rt.llm.confidence_threshold} and this node declares no 'unclear' edge, so "
+                    f"there is nothing to route to but a human"
+                )
+                raise NodeError(msg, reason="low_confidence")
+            trace["routed_to_unclear"] = True
+            edge = "unclear"
+
+        outbound = (
+            [OutboundMessage(text=output.message_to_customer.strip())]
+            if output.message_to_customer and output.message_to_customer.strip()
+            else []
+        )
+        return NodeResult(
+            state_patch=self._patch(output.state_updates, state),
+            next_edge=edge,
+            outbound=outbound,
+            llm_response=trace,
+        )
+
+    def _decisions(self, graph: Graph) -> list[Decision]:
+        """The node's edge labels, described by the node each one leads to.
+
+        DESIGN.md section 11.2 layer 5 is "the node's edge labels with descriptions"; the only
+        description a graph carries is the target node's own ``description``, which is what a
+        pack author writes when they want to say what a branch means.
+        """
+        described: list[Decision] = []
+        for label, target in self.node.edges.items():
+            node = graph.nodes.get(target)
+            description = getattr(node, "description", None) if node is not None else None
+            described.append(Decision(label=label, description=description))
+        return described
+
+    def _patch(self, updates: Any, state: BaseModel) -> dict[str, Any]:
+        """State updates, restricted to what the node declared and the state can hold."""
+        if isinstance(updates, BaseModel):
+            values = updates.model_dump(mode="json", exclude_unset=True)
+        else:
+            values = dict(updates or {})
+        declared = set(self.node.output_schema) or set(values)
+        fields = set(type(state).model_fields)
+        unknown = sorted((set(values) - declared) | (set(values) - fields))
+        if unknown:
+            msg = (
+                f"{self.id}: the model tried to write state fields it was not offered: "
+                f"{unknown}; output_schema declares {sorted(self.node.output_schema) or 'nothing'}"
+            )
+            raise NodeError(msg, reason="llm_invalid_output")
+        return values
 
 
 class NotExecutableRunner(_Runner):
@@ -327,6 +527,7 @@ NODE_RUNNERS: dict[str, RunnerFactory] = {
     "end": EndRunner,
     "gate": GateRunner,
     "ask": AskRunner,
+    "llm": LlmRunner,
 }
 """Runner per node type. A type in :data:`~support_core.graph.nodes.NODE_TYPES` but not here
 is validated and refused at run time by :class:`NotExecutableRunner`."""

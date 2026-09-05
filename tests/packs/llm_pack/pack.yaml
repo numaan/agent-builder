@@ -1,0 +1,24 @@
+# A pack for the phase-3 tests: prompted nodes, slot extraction and the rolling summary.
+# It uses only node types core can execute in phase 3, so it runs end to end against the fake
+# provider without a tool runtime.
+id: llm-pack
+version: 1.0.0
+core: ">=0.0.1,<1"
+entry_graph: root
+language: en
+channels: [web_chat, email]
+llm:
+  default_model: test-model
+  escalation_model: test-escalation-model
+  confidence_threshold: 0.4
+  max_tool_iterations: 3
+  retries: 1
+handoff:
+  queue: llm-tests
+limits:
+  max_nodes_per_turn: 12
+  max_tool_calls_per_turn: 4
+memory:
+  summarize_every_turns: 2
+  window_messages: 8
+  max_summary_chars: 400

@@ -461,23 +461,36 @@ async def test_one_poisoned_conversation_does_not_stop_the_recovery_sweep(
 ) -> None:
     """Independent review finding R3.
 
-    A sweep is a batch. A conversation core cannot get through - here a pack that reaches an
-    ``llm`` node, which phase 2 refuses by design - used to raise out of the loop and take every
-    stalled conversation behind it down with it, and to do so again on every later sweep, for
-    ever. Now each conversation fails on its own and is parked for a human after a few tries.
-    """
-    from support_core.engine.errors import NodeNotExecutableError
-    from tests.engine_support import PACKS
+    A sweep is a batch. A conversation core cannot get through - here a node that fails with an
+    exception the engine does not route - used to raise out of the loop and take every stalled
+    conversation behind it down with it, and to do so again on every later sweep, for ever. Now
+    each conversation fails on its own and is parked for a human after a few tries.
 
-    pack = load_pack(PACKS / "refund_pack")
-    conversations = []
-    for _ in range(2):
-        executor = Executor(pack, engine, hooks=Recorder().hooks())
-        conversation_id = await executor.start_conversation()
-        with pytest.raises(NodeNotExecutableError):
-            await executor.on_inbound(conversation_id, "hello")
-        conversations.append(conversation_id)
-        assert (await run_row(engine, conversation_id))["status"] == "running"
+    Phase 2 wrote this with a pack that reached an ``llm`` node, which core refused to run at
+    all. Phase 3 runs ``llm`` nodes, so the poison is now the ``crash`` node type registered by
+    the tests: an unroutable failure, which is what the finding is actually about and what will
+    still be one after phase 6.
+    """
+    from tests.engine_support import PACKS, custom_node_types
+
+    with custom_node_types():
+        pack = load_pack(PACKS / "custom_pack")
+        conversations = []
+        for _ in range(2):
+            executor = Executor(pack, engine, hooks=Recorder().hooks())
+            conversation_id = await executor.start_conversation(
+                context={"customer": {"attributes": {"mode": "crash"}}}
+            )
+            with pytest.raises(RuntimeError, match="cannot route"):
+                await executor.on_inbound(conversation_id, "hello")
+            conversations.append(conversation_id)
+            assert (await run_row(engine, conversation_id))["status"] == "running"
+        await _sweep_until_parked(engine, pack, conversations)
+
+
+async def _sweep_until_parked(
+    engine: AsyncEngine, pack: Pack, conversations: list[uuid.UUID]
+) -> None:
 
     recorder = Recorder()
     sweeper = Executor(pack, engine, hooks=recorder.hooks())

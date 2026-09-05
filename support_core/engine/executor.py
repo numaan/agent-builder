@@ -41,6 +41,7 @@ from support_core.engine.errors import (
     NodeError,
 )
 from support_core.engine.hooks import EngineHooks, HandoffRequest
+from support_core.engine.hooks import SummaryRequest as SummaryHookRequest
 from support_core.engine.locks import conversation_lock
 from support_core.engine.runners import (
     GateRunner,
@@ -63,6 +64,9 @@ from support_core.graph.manifest import Channel, SuspendStatus
 from support_core.graph.nodes import GateNode, NodeBase
 from support_core.graph.pack import Pack
 from support_core.graph.schema import Graph
+from support_core.llm.prompt import TranscriptMessage
+from support_core.llm.service import LlmService
+from support_core.llm.tool_loop import ModelToolRunner, UnavailableToolRunner
 from support_core.storage import repositories as repo
 from support_core.storage.models import Conversation, Run
 from support_core.storage.repositories import RunUpdate, StepWrite
@@ -166,6 +170,8 @@ class Executor:
         *,
         hooks: EngineHooks | None = None,
         lock_wait_seconds: float = 30.0,
+        llm: LlmService | None = None,
+        tool_runner: ModelToolRunner | None = None,
     ) -> None:
         self.pack = pack
         self.engine = engine
@@ -173,6 +179,18 @@ class Executor:
         self.lock_wait_seconds = lock_wait_seconds
         self.sessions = make_session_factory(engine)
         self._runners: dict[tuple[str, str], Any] = {}
+        self.llm = llm
+        """The LLM layer (DESIGN.md section 11). ``None`` is a legitimate configuration - the
+        engine's own durability tests run without one - and an ``llm`` node then fails as a node
+        error naming what is missing, rather than pretending."""
+
+        self.tool_runner: ModelToolRunner = tool_runner or UnavailableToolRunner()
+        """Phase 4's tool runtime. Whatever is injected here is wrapped by a
+        :class:`~support_core.llm.tool_loop.ReadOnlyToolGateway` before any node can reach it
+        (see :meth:`~support_core.engine.runners.NodeRuntime.tool_gateway`), so the risk policy
+        of DESIGN.md section 8.2 is not something phase 4 can choose to apply."""
+
+        self._tool_risk = {name: spec.risk for name, spec in pack.tools.tools.items()}
 
     # -- entry points --------------------------------------------------------------------
 
@@ -393,6 +411,7 @@ class Executor:
             outcome.messages_processed += 1
             run = await self._turn(conversation, turn)
         await self._flush_outbound(conversation_id)
+        await self._maybe_summarize(conversation_id)
         outcome.status = run.status  # type: ignore[assignment]
         return outcome
 
@@ -529,6 +548,7 @@ class Executor:
             undelivered = await self._loop(turn, self._context(conversation))
             await self._requeue(turn, undelivered)
             await self._flush_outbound(conversation_id)
+            await self._maybe_summarize(conversation_id)
             outcome.status = (await self._run_for(conversation_id)).status  # type: ignore[assignment]
         return outcome
 
@@ -620,7 +640,7 @@ class Executor:
                 try:
                     gate_id = self._failed_gate(graph, frame, state, ctx)
                 except NodeError as exc:
-                    await self._handoff(turn, frame.node_id, "node_error", str(exc))
+                    await self._handoff(turn, frame.node_id, exc.reason, str(exc))
                     return turn.pending_event
                 if gate_id is not None:
                     await self._run_gate_recheck(turn, graph, frame, gate_id)
@@ -648,6 +668,11 @@ class Executor:
                 conversation_id=turn.conversation_id,
                 hooks=self.hooks,
                 environment=self.pack.environment,
+                llm=self.llm,
+                history=await self._history(turn.conversation_id),
+                tool_runner=self.tool_runner,
+                tool_risk=self._tool_risk,
+                max_tool_calls=self.pack.manifest.limits.max_tool_calls_per_turn,
             )
             runner = self._runner(graph, frame.node_id, node)
             started = self.hooks.clock()
@@ -797,7 +822,11 @@ class Executor:
         on_error = getattr(node, "on_error", None)
         node_id = frame.node_id
         if not isinstance(on_error, str):
-            await self._handoff(turn, node_id, "node_error", str(exc), started=started, sid=sid)
+            # ``reason`` is the node's own diagnosis where it has one: DESIGN.md section 7.3
+            # names ``llm_unavailable``, and phase 3 distinguishes it from a model that answered
+            # with something the graph does not allow. Whoever picks the conversation up needs
+            # to know which happened.
+            await self._handoff(turn, node_id, exc.reason, str(exc), started=started, sid=sid)
             return False
         frame.node_id = on_error
         frame.attempts[node_id] = frame.attempts.get(node_id, 0) + 1
@@ -1045,10 +1074,77 @@ class Executor:
             await self.hooks.send(conversation_id, [OutboundMessage(text=m.text) for m in waiting])
             await repo.mark_sent(session, [m.id for m in waiting])
 
+    async def _history(self, conversation_id: uuid.UUID) -> tuple[TranscriptMessage, ...]:
+        """The turn window of DESIGN.md section 10, read from the database every time.
+
+        Not cached across the turn on purpose. The window is part of what a prompted node sees,
+        so it is part of what the node decides with, and phase 2's rule is that anything a turn
+        depends on comes from durable state - a node re-executed after a crash must see the same
+        window it saw before, which is the set of committed messages and nothing else.
+        """
+        if self.llm is None:
+            return ()
+        limit = self.pack.manifest.memory.window_messages
+        async with self.sessions() as session, session.begin():
+            rows = await repo.recent_messages(session, conversation_id, limit)
+            return tuple(TranscriptMessage(author=row.author, text=row.text) for row in rows)
+
+    async def _maybe_summarize(self, conversation_id: uuid.UUID) -> None:
+        """Refresh the rolling summary if K turns have passed (DESIGN.md section 10).
+
+        Called with the conversation lock still held, after the turn has settled, so the summary
+        covers what actually happened. Everything it decides with is durable: ``turn_count`` and
+        ``summary_turn`` are columns, and the summary and its marker are written together.
+
+        A failing summariser is swallowed deliberately. The summary is prompt *context* - no
+        node reads it to decide anything, and ``ctx.summary`` being stale or absent changes no
+        durable outcome - so letting a model call that failed take a completed turn down with it
+        would trade a real thing for a nice-to-have.
+        """
+        every = self.pack.manifest.memory.summarize_every_turns
+        if not every:
+            return
+        async with self.sessions() as session, session.begin():
+            conversation = await repo.get_conversation(session, conversation_id)
+            if conversation is None:  # pragma: no cover - the caller just used it
+                return
+            turn_count = conversation.turn_count
+            previous = conversation.summary
+            if turn_count - conversation.summary_turn < every:
+                return
+            window = [
+                (row.author, row.text)
+                for row in await repo.recent_messages(
+                    session, conversation_id, self.pack.manifest.memory.window_messages
+                )
+            ]
+        try:
+            summary = await self.hooks.summarize(
+                SummaryHookRequest(
+                    conversation_id=conversation_id,
+                    turn_count=turn_count,
+                    previous=previous,
+                    transcript=window,
+                )
+            )
+        except Exception:
+            return
+        if not summary:
+            return
+        async with self.sessions() as session, session.begin():
+            await repo.write_summary(session, conversation_id, summary=summary, at_turn=turn_count)
+
     async def _begin_turn(self, turn: _Turn) -> None:
-        """Mark the run running and reset the per-turn counter (DESIGN.md section 7.3)."""
+        """Mark the run running and reset the per-turn counter (DESIGN.md section 7.3).
+
+        A resume is a turn too, for DESIGN.md section 10's "every K turns": the counter is
+        advanced in the same transaction that marks the run running, for the same reason the
+        claim advances it for a customer message.
+        """
         turn.status = "running"
         turn.turn_nodes = 0
+        async with self.sessions() as session, session.begin():
+            await repo.count_turn(session, turn.conversation_id)
         await self._set(
             turn.run_id,
             status="running",
@@ -1092,6 +1188,7 @@ class Executor:
             return await repo.claim_and_begin_turn(
                 session,
                 message_id=message_id,
+                conversation_id=turn.conversation_id,
                 run=repo.TurnStart(
                     run_id=turn.run_id,
                     frames=[frame.model_dump(mode="json") for frame in turn.frames],

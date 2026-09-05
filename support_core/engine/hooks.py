@@ -16,8 +16,14 @@ hook                          owner phase  default
 ``extract_slots``             3            the whole reply fills the first declared slot
 ``handoff``                   6            record nothing; the run still suspends for a human
 ``send``                      7            do not deliver; rows stay ``pending_send``
+``summarize``                 3            no summary; ``conversation.summary`` is left alone
 ``probe``                     -            nothing (tests use it to kill a turn mid-flight)
 ============================  ===========  ==================================================
+
+Phase 3 replaces the *default* of ``extract_slots`` rather than the ``ask`` node, which is what
+reviews/phase-2.md asked for, and adds ``summarize`` for DESIGN.md section 10's rolling summary.
+``SlotRequest`` is why the extractor's signature grew: structured extraction (DESIGN.md section
+6.2) needs the declared *type* of each slot, and a list of names cannot carry one.
 """
 
 import uuid
@@ -63,10 +69,49 @@ class InterruptCheck(Protocol):
     ) -> InterruptDecision: ...
 
 
+class SlotRequest(BaseModel):
+    """Everything an ``ask`` node knows when the customer replies (DESIGN.md section 6.2)."""
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    node_id: str
+    graph_id: str
+    slots: list[str]
+    prompt: str
+    """The question the node asked, so the extractor knows what the reply is answering."""
+
+    reply: str
+    state_model: type[BaseModel]
+    """The frame's state model, which carries each slot's declared type. A name-only signature
+    cannot express ``amount: float | None``, and an extractor that does not know the type can
+    only guess at it."""
+
+    state: dict[str, Any] = Field(default_factory=dict)
+    window: list[tuple[str, str]] = Field(default_factory=list)
+    """``(author, text)`` for the recent messages before the reply, oldest first: what the
+    customer is answering may only be readable in the light of what came before it."""
+
+    ctx: ConversationContext
+
+
 class SlotExtractor(Protocol):
-    async def __call__(
-        self, slots: Sequence[str], reply: str, ctx: ConversationContext
-    ) -> dict[str, Any]: ...
+    async def __call__(self, request: SlotRequest) -> dict[str, Any]: ...
+
+
+class SummaryRequest(BaseModel):
+    """A conversation due for a new rolling summary (DESIGN.md section 10)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: uuid.UUID
+    turn_count: int
+    previous: str | None = None
+    transcript: list[tuple[str, str]] = Field(default_factory=list)
+    """``(author, text)`` for the recent window, oldest first."""
+
+
+class Summarizer(Protocol):
+    async def __call__(self, request: SummaryRequest) -> str | None: ...
 
 
 class HandoffHook(Protocol):
@@ -94,17 +139,25 @@ async def continue_interrupt_check(
     return InterruptDecision(kind="continue")
 
 
-async def first_slot_extractor(
-    slots: Sequence[str], reply: str, ctx: ConversationContext
-) -> dict[str, Any]:
+async def first_slot_extractor(request: SlotRequest) -> dict[str, Any]:
     """Put the whole reply into the first declared slot.
 
     Deterministic and obviously not the real thing: DESIGN.md section 6.2 says an ``ask`` node
-    "extracts slots via structured output", which is phase 3. Keeping the extraction behind
-    this hook is what lets phase 2 own suspension and resumption (section 7.2) without owning
-    the model call.
+    "extracts slots via structured output", which is
+    :class:`~support_core.llm.wiring.StructuredSlotExtractor`. This default stays because it is
+    what lets the engine's own tests - suspension, resumption, crash recovery - run without a
+    model, and because a pack that wants a deterministic single-slot ask can use it.
     """
-    return {slots[0]: reply} if slots else {}
+    return {request.slots[0]: request.reply} if request.slots else {}
+
+
+async def no_summary(request: SummaryRequest) -> str | None:
+    """Write no summary. ``conversation.summary`` keeps whatever it had.
+
+    The real one is a model call (DESIGN.md section 10) and is wired by whoever builds the LLM
+    layer; the engine only knows *when* a summary is due, which it reads from durable columns.
+    """
+    return None
 
 
 async def no_handoff(request: HandoffRequest) -> None:
@@ -133,6 +186,7 @@ class EngineHooks:
     extract_slots: SlotExtractor = field(default=first_slot_extractor)
     handoff: HandoffHook = field(default=no_handoff)
     send: ChannelSend = field(default=no_send)
+    summarize: Summarizer = field(default=no_summary)
     probe: Probe = field(default=no_probe)
     clock: Callable[[], datetime] = utc_now
     """Every timestamp the engine writes comes from here, never from the database default:

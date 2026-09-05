@@ -174,6 +174,7 @@ class LlmService:
         models: ModelChoice,
         budget: PromptBudget | None = None,
         confidence_threshold: float = 0.4,
+        max_tool_iterations: int = 5,
         retries: int = 2,
         backoff_seconds: float = 0.5,
         max_tokens: int = 4096,
@@ -185,6 +186,7 @@ class LlmService:
         self.models = models
         self.budget = budget or PromptBudget()
         self.confidence_threshold = confidence_threshold
+        self.max_tool_iterations = max_tool_iterations
         self.retries = retries
         self.backoff_seconds = backoff_seconds
         self.max_tokens = max_tokens

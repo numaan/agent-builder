@@ -1,0 +1,56 @@
+id: root
+description: Classify what the customer wants, then chat or collect an amount.
+outputs:
+  outcome: str | None
+state:
+  intent: str | None
+  amount: float | None
+  outcome: str | None
+start: classify
+nodes:
+  classify:
+    type: llm
+    instructions: |
+      Classify the customer's latest message as small talk or a refund request.
+      Set intent to what you decided.
+    output_schema:
+      intent: str | None
+    edges:
+      small_talk: chat
+      refund: collect
+      unclear: puzzled
+
+  chat:
+    type: llm
+    description: Ordinary conversation with no workflow behind it.
+    instructions: Reply to the small talk in one short sentence.
+    edges:
+      done: finish_chat
+
+  collect:
+    type: ask
+    slots: [amount]
+    prompt: How much was the charge?
+    next: research
+
+  research:
+    type: llm
+    description: Gather the facts needed to answer, using read-only tools.
+    instructions: |
+      Look up the balance with get_balance before you answer, then report what you found.
+    tools: [get_balance]
+    edges:
+      done: finish_refund
+
+  puzzled:
+    type: say
+    message: I did not follow that. Could you say it another way?
+    next: finish_chat
+
+  finish_chat:
+    type: end
+    outputs: { outcome: "small_talk" }
+
+  finish_refund:
+    type: end
+    outputs: { outcome: "refund" }

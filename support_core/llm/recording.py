@@ -1,6 +1,6 @@
-"""Recorded model responses. Implements PLAN.md's "Phases 3+ use a recorded-response fake
-provider in tests; live calls only in a marked ``live`` test group" and the phase 3 backlog line
-"``FakeProvider`` that replays recorded responses keyed by prompt hash".
+"""Recorded model responses: the storage format behind DESIGN.md section 11.1's fake provider.
+Implements PLAN.md's "Phases 3+ use a recorded-response fake provider in tests; live calls only
+in a marked ``live`` test group".
 
 A cassette is a JSON file holding, for each interaction, the *whole canonical request* beside
 the SHA-256 of it (:meth:`~support_core.llm.types.CompletionRequest.fingerprint`) and the

@@ -1,5 +1,6 @@
-"""Providers that answer without a network. Implements the phase 3 backlog line "``FakeProvider``
-that replays recorded responses keyed by prompt hash for tests".
+"""Providers that answer without a network: DESIGN.md section 11.1's protocol, implemented
+against recordings instead of an API. Delivers the phase 3 backlog line "``FakeProvider`` that
+replays recorded responses keyed by prompt hash for tests".
 
 Two of them, for two different jobs:
 

@@ -78,6 +78,17 @@ class Conversation(Base):
     status: Mapped[str] = mapped_column(nullable=False, server_default="open")
     context: Mapped[JsonObject] = mapped_column(nullable=False, server_default=_EMPTY_OBJECT)
     summary: Mapped[str | None] = mapped_column()
+    """The rolling conversation summary of section 10, rewritten every K turns."""
+
+    turn_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    """Turns begun on this conversation. Incremented in the transaction that starts the turn,
+    so a process that dies mid-turn cannot lose or double-count one (section 10's "every K
+    turns" needs a K that survives a crash)."""
+
+    summary_turn: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    """The ``turn_count`` the stored ``summary`` covers. The pair is written together, so a
+    crash leaves them consistent and the next due turn simply summarises again."""
+
     created_at: Mapped[datetime] = _created_at()
     closed_at: Mapped[datetime | None] = mapped_column()
 

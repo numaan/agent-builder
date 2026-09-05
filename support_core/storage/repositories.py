@@ -190,6 +190,7 @@ async def claim_and_begin_turn(
     *,
     message_id: uuid.UUID,
     run: TurnStart,
+    conversation_id: uuid.UUID | None = None,
     before_commit: Callable[[], Awaitable[None]] | None = None,
 ) -> bool:
     """Claim one inbound message and start the turn that will consume it, in one transaction.
@@ -232,9 +233,65 @@ async def claim_and_begin_turn(
                 updated_at=run.updated_at,
             )
         )
+        if conversation_id is not None:
+            # The turn counter of DESIGN.md section 10 advances with the claim, not beside it.
+            await count_turn(session, conversation_id)
         if before_commit is not None:
             await before_commit()
         return True
+
+
+async def count_turn(session: AsyncSession, conversation_id: uuid.UUID) -> int:
+    """Record that a turn has begun and return the conversation's new turn count.
+
+    DESIGN.md section 10 updates the conversation summary "every K turns", so K has to be
+    counted somewhere that survives a crash. It is a column, incremented in the *same*
+    transaction that starts the turn, for the reason phase 2's two must-fix findings were both
+    about: a counter in memory is a counter that a dead process takes with it, and one written
+    in its own transaction has a window where a turn is started but not counted.
+    """
+    result = await session.execute(
+        text(
+            "UPDATE conversation SET turn_count = turn_count + 1 "
+            "WHERE id = :id RETURNING turn_count"
+        ),
+        {"id": conversation_id},
+    )
+    return int(result.scalar_one())
+
+
+async def recent_messages(
+    session: AsyncSession, conversation_id: uuid.UUID, limit: int = 12
+) -> list[Message]:
+    """The turn window of DESIGN.md section 10: the last ``limit`` messages, oldest first.
+
+    Read from the ``message`` table rather than kept in memory, so the window a node sees after
+    a crash is the window it saw before one. Only committed messages exist, which is exactly the
+    set a re-executed step would have seen.
+    """
+    result = await session.execute(
+        select(Message)
+        .where(Message.conversation_id == conversation_id, Message.status != "pending")
+        .order_by(Message.created_at.desc(), Message.ordinal.desc(), Message.id.desc())
+        .limit(limit)
+    )
+    return list(reversed(list(result.scalars())))
+
+
+async def write_summary(
+    session: AsyncSession, conversation_id: uuid.UUID, *, summary: str, at_turn: int
+) -> None:
+    """Store a rolling summary and the turn it covers (DESIGN.md section 10).
+
+    ``summary_turn`` is what makes "every K turns" idempotent: a crash between writing the
+    summary and the next turn simply leaves the pair consistent, and nothing a turn *depends on*
+    is read from either column.
+    """
+    await session.execute(
+        update(Conversation)
+        .where(Conversation.id == conversation_id)
+        .values(summary=summary, summary_turn=at_turn)
+    )
 
 
 async def requeue(session: AsyncSession, message_id: uuid.UUID) -> None:

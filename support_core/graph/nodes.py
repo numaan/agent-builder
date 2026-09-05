@@ -110,6 +110,9 @@ class LlmNode(NodeBase):
     output_schema: dict[str, str] = Field(default_factory=dict)
     knowledge: KnowledgeQuery | None = None
     edges: dict[str, str] = Field(min_length=1)
+    model: str | None = None
+    """Per-node model override (DESIGN.md section 11.1: "Model choice is per pack with per-node
+    override"). Unset means the pack's ``llm.default_model``."""
 
 
 class AskNode(NodeBase):
@@ -233,7 +236,7 @@ NODE_TYPES: dict[str, NodeTypeSpec] = {
         model=LlmNode,
         chooses_edge=True,
         suspends=None,
-        executable=False,
+        executable=True,
         executable_phase=3,
     ),
     "ask": NodeTypeSpec(

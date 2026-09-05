@@ -19,7 +19,12 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from support_core.engine.errors import NodeError
-from support_core.engine.hooks import EngineHooks, HandoffRequest, InterruptDecision
+from support_core.engine.hooks import (
+    EngineHooks,
+    HandoffRequest,
+    InterruptDecision,
+    SlotRequest,
+)
 from support_core.engine.runners import NodeRuntime, register_node_type, unregister_node_type
 from support_core.engine.types import (
     NodeResult,
@@ -91,12 +96,10 @@ class Recorder:
     ) -> InterruptDecision:
         return self.interrupt or InterruptDecision(kind="continue")
 
-    async def _extract(
-        self, slots: Sequence[str], reply: str, ctx: ConversationContext
-    ) -> dict[str, Any]:
+    async def _extract(self, request: SlotRequest) -> dict[str, Any]:
         if self.slots is not None:
             return dict(self.slots)
-        return {slots[0]: reply} if slots else {}
+        return {request.slots[0]: request.reply} if request.slots else {}
 
 
 # -- reading what the engine wrote --------------------------------------------------------
@@ -197,6 +200,39 @@ class WaitRunner:
         return NodeResult(state_patch=patch)
 
 
+class CrashNode(NodeBase):
+    """Fails with an exception the engine does *not* route (not a ``NodeError``).
+
+    Phase 2 used a pack that reached an ``llm`` node for this, because core refused to run one.
+    Phase 3 runs them, so the "conversation core cannot get through" case needs a node that is
+    unroutable on purpose rather than one that is merely unimplemented - and this one stays
+    unroutable however many phases arrive.
+    """
+
+    type: Literal["crash"]
+    next: str
+
+
+class CrashRunner:
+    def __init__(self, node_id: str, node: NodeBase) -> None:
+        self.id = node_id
+        self.type = node.type
+
+    async def run(self, state: BaseModel, ctx: ConversationContext, rt: NodeRuntime) -> NodeResult:
+        msg = f"{self.id}: this node fails in a way the engine cannot route"
+        raise RuntimeError(msg)
+
+    async def resume(
+        self,
+        state: BaseModel,
+        ctx: ConversationContext,
+        rt: NodeRuntime,
+        event: ResumeEvent,
+    ) -> NodeResult:  # pragma: no cover - a crash node never suspends
+        msg = f"{self.id}: this node fails in a way the engine cannot route"
+        raise RuntimeError(msg)
+
+
 class BoomRunner:
     def __init__(self, node_id: str, node: NodeBase) -> None:
         self.id = node_id
@@ -225,6 +261,14 @@ WAIT_SPEC = NodeTypeSpec(
     executable=True,
     executable_phase=2,
 )
+CRASH_SPEC = NodeTypeSpec(
+    name="crash",
+    model=CrashNode,
+    chooses_edge=False,
+    suspends=None,
+    executable=True,
+    executable_phase=2,
+)
 BOOM_SPEC = NodeTypeSpec(
     name="boom",
     model=BoomNode,
@@ -237,11 +281,13 @@ BOOM_SPEC = NodeTypeSpec(
 
 @contextmanager
 def custom_node_types() -> Iterator[None]:
-    """Register ``wait`` and ``boom`` for the duration of the block."""
+    """Register ``wait``, ``boom`` and ``crash`` for the duration of the block."""
     register_node_type(WAIT_SPEC, WaitRunner)
     register_node_type(BOOM_SPEC, BoomRunner)
+    register_node_type(CRASH_SPEC, CrashRunner)
     try:
         yield None
     finally:
         unregister_node_type("wait")
         unregister_node_type("boom")
+        unregister_node_type("crash")
