@@ -103,6 +103,21 @@ parallel against one database.
 `make check` runs lint, typecheck, tests and the pack validation in sequence. CI
 (`.github/workflows/ci.yml`) runs the same steps against a `pgvector/pgvector:pg16` service.
 
+No test calls a model. Model responses come from recorded cassettes under `tests/cassettes/`,
+keyed by the SHA-256 of the request, so a test that passes is a test whose prompt matched the
+recording to the byte. Two commands matter:
+
+```sh
+python -m tests.cassettes.build_cassettes          # re-record offline, from scripted answers
+python -m tests.cassettes.build_cassettes --live   # re-record against the real API
+python -m pytest -m live                           # the opt-in live group (skips with no key)
+```
+
+The `live` group is excluded from a plain `pytest` run (`addopts = ["-m", "not live"]`) and skips
+cleanly when `ANTHROPIC_API_KEY` is unset. A change to prompt assembly changes every fingerprint,
+which `tests/test_golden_conversation.py` catches with a message telling you to re-record; no test
+file contains a hash, so re-recording - offline or live - touches no test.
+
 ## CLI
 
 ```sh
@@ -119,9 +134,10 @@ ERROR   graph.unconfirmed_write [graphs/refund.yaml:issue_refund]: tool 'issue_r
 
 Exit status is 0 when the pack is well-formed, 1 when it has errors; `--strict` also fails on
 warnings, `--quiet` prints only the summary. The checks cover the manifest (`pack.yaml`,
-DESIGN.md 5.1), the directory layout (5), and every graph rule in 5.2. `packs/acme_billing` has no
-graphs yet, so it reports `empty but well-formed`; `tests/packs/refund_pack` is the worked
-DESIGN.md 6.4 example and reports `well-formed` with warnings.
+DESIGN.md 5.1), the directory layout (5), and every graph rule in 5.2. `packs/acme_billing` has a
+`root.yaml` from phase 3 on and reports `well-formed` with four warnings (the workflows phase 4
+adds, already named in `interrupts`); `tests/packs/refund_pack` is the worked DESIGN.md 6.4 example
+and reports `well-formed` with warnings.
 
 `support pack knowledge sync`, `support pack eval` and `support replay` exist but exit with
 status 3 and name the phase that delivers them.
@@ -133,10 +149,21 @@ from support_core import load_pack
 from support_core.engine import Executor
 from support_core.storage.session import make_engine
 
-executor = Executor(load_pack("packs/acme_billing"), make_engine())
+pack = load_pack("packs/acme_billing")
+service = service_for_pack(pack, AnthropicProvider())          # DESIGN.md 11.1
+hooks = EngineHooks(
+    extract_slots=StructuredSlotExtractor(service),            # DESIGN.md 6.2
+    summarize=LlmSummarizer(service),                          # DESIGN.md 10
+)
+executor = Executor(pack, make_engine(), hooks=hooks, llm=service)
 conversation_id = await executor.start_conversation(channel="web_chat")
 await executor.on_inbound(conversation_id, "I was charged twice")
 ```
+
+(`service_for_pack` and `StructuredSlotExtractor` are in `support_core.llm.wiring`,
+`LlmSummarizer` in `support_core.memory`. An `Executor` built without `llm=` still runs a pack
+with no `llm` nodes; one that reaches an `llm` node hands off with reason `llm_unavailable`
+rather than walking past it.)
 
 What the engine guarantees (DESIGN.md 7.1 to 7.3, 17), and what it does not yet do:
 
@@ -153,11 +180,26 @@ What the engine guarantees (DESIGN.md 7.1 to 7.3, 17), and what it does not yet 
   expired deadlines is `sweep_timeouts`.
 - **Gates fire on every entry to a frame**, so a customer cannot suspend after a gate, let the
   precondition lapse, and come back to the protected node.
+- **A prompted step chooses only among the graph's edges.** An `llm` node's structured output
+  has `decision` typed as a `Literal` over exactly that node's declared edge labels, and the
+  answer is validated against it. An undeclared edge, a malformed answer or a state update
+  outside the node's `output_schema` is retried once - with the reason stated back to the model -
+  and then handed off; a confidence below the pack's `llm.confidence_threshold` takes the node's
+  `unclear` edge, or hands off if it has none. Nothing is guessed at.
+- **Untrusted text is data.** Customer messages, tool results, retrieved passages, state values
+  and the rolling summary are rendered inside `-----BEGIN UNTRUSTED DATA (...)-----` fences in a
+  fixed nine-layer prompt (DESIGN.md 11.2) that a pack can fill but cannot reorder or escape.
+- **Only READ-tier tools, and only the ones the node declared,** can be reached from a prompted
+  step: the node holds a gateway, the gateway holds phase 4's runtime, and a refusal is fed back
+  to the model rather than executed.
+- **A rolling summary every K turns** (`memory.summarize_every_turns`), stored on the
+  conversation with the turn it covers. It is prompt context only: nothing a turn depends on is
+  read from it, and a lost summary changes no durable outcome.
 - Everything a later phase owns is a hook on `EngineHooks` with a default that does nothing
-  surprising: the interrupt check answers `continue` (phase 6), slot extraction fills the first
-  slot with the whole reply (phase 3), handoff records nothing but the run still parks for a
-  human (phase 6), and outbound messages stay `pending_send` because there is no channel
-  adapter (phase 7). `llm`, `tool` and `confirm` nodes refuse to run and name their phase.
+  surprising: the interrupt check answers `continue` (phase 6), handoff records nothing but the
+  run still parks for a human (phase 6), no summary is written unless one is wired up, and
+  outbound messages stay `pending_send` because there is no channel adapter (phase 7). `tool`
+  and `confirm` nodes refuse to run and name their phase.
 
 ## Writing a pack's graphs
 
