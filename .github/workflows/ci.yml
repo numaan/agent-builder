@@ -60,6 +60,13 @@ jobs:
       - name: Pytest
         run: python -m pytest -v
 
+      - name: Durability and concurrency proofs (phase 2 resolution)
+        # Not collected by a plain `pytest` run: it is slow (a 28-case crash matrix over a
+        # suspend-and-resume conversation, plus five-process and ten-coroutine contention) and
+        # every case duplicates work the default suite already covers more cheaply. Running it
+        # here is what stops it rotting - see reviews/phase-2.md "Resolution".
+        run: python -m pytest tests/verify_phase_2_resolution.py -v
+
       - name: Alembic check (models and migrations agree)
         run: python -m alembic upgrade head && python -m alembic check
 
