@@ -147,6 +147,19 @@ def test_manifest_core_compatibility(pack_copy: Path) -> None:
     assert "manifest.core_incompatible" in _rules(pack_copy, Severity.ERROR)
 
 
+@pytest.mark.parametrize("value", ['""', '"   "'])
+def test_manifest_rejects_empty_core_specifier(pack_copy: Path, value: str) -> None:
+    """An empty specifier matches every version, silently disabling the compatibility check."""
+    manifest_path = pack_copy / "pack.yaml"
+    manifest_path.write_text(
+        manifest_path.read_text().replace('core: ">=0.0.1,<1"', f"core: {value}"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ManifestError, match=r"core.*at least one version constraint"):
+        load_manifest(pack_copy)
+    assert "manifest.invalid" in _rules(pack_copy, Severity.ERROR)
+
+
 def test_manifest_interrupt_lists_must_not_overlap(pack_copy: Path) -> None:
     manifest_path = pack_copy / "pack.yaml"
     manifest_path.write_text(
@@ -161,6 +174,27 @@ def test_malformed_yaml_is_reported_not_raised(pack_copy: Path) -> None:
     report = validate_pack(pack_copy)
     assert not report.ok
     assert {f.rule for f in report.errors} == {"manifest.invalid"}
+
+
+@pytest.mark.parametrize(
+    ("rel", "rule"),
+    [
+        ("pack.yaml", "manifest.unreadable"),
+        ("policies.md", "policies.unreadable"),
+        ("knowledge/sources.yaml", "knowledge.sources_unreadable"),
+        ("tools/__init__.py", "tools.unreadable"),
+    ],
+)
+def test_non_utf8_files_are_reported_not_raised(pack_copy: Path, rel: str, rule: str) -> None:
+    """validate_pack promises never to raise for a bad pack; a latin-1 byte must not break it."""
+    (pack_copy / rel).write_bytes(b"\xff\xfe not utf-8\n")
+    report = validate_pack(pack_copy)
+    assert not report.ok
+    assert rule in {f.rule for f in report.errors}
+
+    result = CliRunner().invoke(cli, ["pack", "validate", str(pack_copy)])
+    assert result.exit_code == EXIT_INVALID
+    assert rule in result.output, "the CLI must print the finding, not a traceback"
 
 
 def test_tools_module_must_export_tools(pack_copy: Path) -> None:

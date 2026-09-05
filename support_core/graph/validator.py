@@ -17,7 +17,12 @@ import yaml
 from pydantic import BaseModel, Field
 
 from support_core import __version__
-from support_core.graph.manifest import ManifestError, PackManifest, load_manifest
+from support_core.graph.manifest import (
+    ManifestError,
+    ManifestUnreadableError,
+    PackManifest,
+    load_manifest,
+)
 
 REQUIRED_FILES: tuple[str, ...] = (
     "pack.yaml",
@@ -113,6 +118,15 @@ def validate_pack(pack_path: Path) -> ValidationReport:
 
     try:
         report.manifest = load_manifest(pack_path)
+    except ManifestUnreadableError as exc:
+        findings.append(
+            Finding(
+                severity=Severity.ERROR,
+                rule="manifest.unreadable",
+                message=str(exc),
+                location="pack.yaml",
+            )
+        )
     except ManifestError as exc:
         findings.append(
             Finding(
@@ -186,6 +200,20 @@ def validate_graphs(
     ]
 
 
+def _read_utf8(pack_path: Path, rel: str, rule: str) -> tuple[str | None, list[Finding]]:
+    """Read a pack file as UTF-8; an unreadable file becomes an error finding, not a crash."""
+    try:
+        return (pack_path / rel).read_text(encoding="utf-8"), []
+    except (OSError, UnicodeDecodeError) as exc:
+        finding = Finding(
+            severity=Severity.ERROR,
+            rule=rule,
+            message=f"cannot be read as UTF-8 text: {exc}",
+            location=rel,
+        )
+        return None, [finding]
+
+
 def _check_layout(pack_path: Path) -> list[Finding]:
     findings: list[Finding] = []
     for rel in REQUIRED_DIRS:
@@ -250,10 +278,11 @@ def _check_manifest(manifest: PackManifest) -> list[Finding]:
 
 def _check_tools_module(pack_path: Path) -> list[Finding]:
     """Static check only: importing pack code belongs to the tool registry (phase 4)."""
-    init = pack_path / "tools" / "__init__.py"
-    if not init.is_file():
+    if not (pack_path / "tools" / "__init__.py").is_file():
         return []
-    source = init.read_text(encoding="utf-8")
+    source, findings = _read_utf8(pack_path, "tools/__init__.py", "tools.unreadable")
+    if source is None:
+        return findings
     if not any(line.startswith("TOOLS") for line in source.splitlines()):
         return [
             Finding(
@@ -271,8 +300,11 @@ def _check_knowledge_sources(pack_path: Path) -> list[Finding]:
     if not sources_path.is_file():
         return []
     location = "knowledge/sources.yaml"
+    source, findings = _read_utf8(pack_path, location, "knowledge.sources_unreadable")
+    if source is None:
+        return findings
     try:
-        raw: Any = yaml.safe_load(sources_path.read_text(encoding="utf-8"))
+        raw: Any = yaml.safe_load(source)
     except yaml.YAMLError as exc:
         return [
             Finding(
@@ -293,7 +325,6 @@ def _check_knowledge_sources(pack_path: Path) -> list[Finding]:
                 location=location,
             )
         ]
-    findings: list[Finding] = []
     for key, value in raw.items():
         if key not in KNOWLEDGE_SECTIONS:
             findings.append(
@@ -317,10 +348,12 @@ def _check_knowledge_sources(pack_path: Path) -> list[Finding]:
 
 
 def _check_policies(pack_path: Path) -> list[Finding]:
-    policies = pack_path / "policies.md"
-    if not policies.is_file():
+    if not (pack_path / "policies.md").is_file():
         return []
-    lines = [ln for ln in policies.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    source, findings = _read_utf8(pack_path, "policies.md", "policies.unreadable")
+    if source is None:
+        return findings
+    lines = [ln for ln in source.splitlines() if ln.strip()]
     if len(lines) > POLICIES_MAX_LINES:
         return [
             Finding(

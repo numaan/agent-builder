@@ -22,6 +22,10 @@ class ManifestError(ValueError):
     """``pack.yaml`` is missing, unreadable, or fails validation."""
 
 
+class ManifestUnreadableError(ManifestError):
+    """``pack.yaml`` exists but cannot be read as UTF-8 text (or at all)."""
+
+
 class LlmConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -87,10 +91,15 @@ class PackManifest(BaseModel):
     @classmethod
     def _core_is_specifier(cls, value: str) -> str:
         try:
-            SpecifierSet(value)
+            specifiers = SpecifierSet(value)
         except InvalidSpecifier as exc:
             msg = f"core {value!r} is not a valid version specifier (example: '>=1.4,<2')"
             raise ValueError(msg) from exc
+        if not specifiers:
+            # SpecifierSet('') is valid and matches every version, which would let a pack
+            # opt out of the compatibility check the manifest exists to enforce.
+            msg = "core must name at least one version constraint (example: '>=1.4,<2')"
+            raise ValueError(msg)
         return value
 
     @field_validator("channels")
@@ -117,6 +126,9 @@ def load_manifest(path: Path) -> PackManifest:
     except FileNotFoundError as exc:
         msg = f"{manifest_path}: not found"
         raise ManifestError(msg) from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        msg = f"{manifest_path}: cannot be read as UTF-8 text: {exc}"
+        raise ManifestUnreadableError(msg) from exc
     except yaml.YAMLError as exc:
         msg = f"{manifest_path}: invalid YAML: {exc}"
         raise ManifestError(msg) from exc
