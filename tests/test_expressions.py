@@ -6,6 +6,7 @@ behaviour a pack author sees.
 """
 
 import string
+import sys
 from typing import Any, Literal
 
 import pytest
@@ -26,7 +27,7 @@ from support_core.graph.expr import (
     parse,
     roots_used,
 )
-from support_core.graph.expr.syntax import unparse
+from support_core.graph.expr.syntax import unparse, walk
 from support_core.graph.expr.typecheck import TypeNote
 
 
@@ -149,6 +150,9 @@ def test_parse_error_names_the_token_and_position() -> None:
         ("not " * (MAX_DEPTH + 2) + "true", "nests deeper"),
         ("-" * (MAX_DEPTH + 2) + "1", "nests deeper"),
         ("state" + ".a" * MAX_TOKENS, "more than"),
+        ("state" + ".a" * (MAX_DEPTH + 2), "nests deeper"),
+        ("state" + " | len" * (MAX_DEPTH + 2), "nests deeper"),
+        ("state.a" + " | len" * (MAX_DEPTH + 2), "nests deeper"),
         ("x" * (MAX_LENGTH + 1), "longer than"),
     ],
 )
@@ -158,6 +162,84 @@ def test_pathological_input_is_a_parse_error_not_a_recursion_error(
     with pytest.raises(ParseError) as exc:
         parse(source)
     assert fragment in str(exc.value)
+
+
+def _stack_depth() -> int:
+    depth = 0
+    frame: Any = sys._getframe()
+    while frame is not None:
+        depth += 1
+        frame = frame.f_back
+    return depth
+
+
+def test_the_deepest_accepted_expression_walks_within_a_small_stack_budget() -> None:
+    """Phase-1 review F5: attribute and filter chains used to escape ``MAX_DEPTH`` entirely.
+
+    They were bounded only by ``MAX_TOKENS``, so the deepest accepted chain cost about 750
+    Python frames per walker and ``infer`` raised ``RecursionError`` from a moderately deep
+    caller stack. Every AST level is now counted, so the whole language fits in a budget that
+    does not depend on how deep the caller already is.
+    """
+    longest = "state"
+    while True:
+        candidate = longest + ".a"
+        try:
+            parse(candidate)
+        except ParseError:
+            break
+        longest = candidate
+    assert longest.count(".a") < MAX_DEPTH
+
+    class Deep(BaseModel):
+        a: Any = None
+
+    links = longest.count(".a")
+    nested: Any = None
+    for _ in range(links):
+        nested = Deep(a=nested)
+
+    budget = 120
+    original = sys.getrecursionlimit()
+    sys.setrecursionlimit(_stack_depth() + budget)
+    try:
+        tree = parse(longest)
+        assert unparse(tree) == longest
+        assert len(list(walk(tree))) == links + 1
+        assert infer(tree, model_type_env(state=Deep)).describe() == "unknown"
+        assert evaluate(tree, {"state": nested}) is None
+    finally:
+        sys.setrecursionlimit(original)
+
+
+@pytest.mark.parametrize(
+    ("source", "fragment"),
+    [
+        ("1e400", "too large"),
+        ("1e311", "too large"),
+        ("-1e400", "too large"),
+        ("1.5e999999", "too large"),
+        ("'\x07'", "control character"),
+        ("'\x00'", "control character"),
+        ("'\x7f'", "control character"),
+        ("'\x1b['", "control character"),
+    ],
+)
+def test_literals_that_could_not_round_trip_are_rejected(source: str, fragment: str) -> None:
+    """Phase-1 review F6: ``unparse`` has to be a canonical form, or 8.2's argument comparison
+    silently equates two different texts."""
+    with pytest.raises(ParseError) as exc:
+        parse(source)
+    assert fragment in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["'\\n'", "'\\t'", "'\\r'", "'\\0'", "'\\\\'", "'it\\'s'", "'é中'", "1e308", "'x' == '\\t'"],
+)
+def test_escapes_and_extremes_round_trip_through_unparse(source: str) -> None:
+    once = unparse(parse(source))
+    assert unparse(parse(once)) == once
 
 
 def test_roots_used() -> None:
@@ -306,7 +388,22 @@ def test_unknown_annotations_allow_everything() -> None:
 
 _ALPHABET = string.printable + "é中 "
 
+_QUOTED = st.text(st.characters(), max_size=12).map(lambda s: "'" + s.replace("'", "") + "'")
+"""A quoted literal over the *whole* character space, control characters included.
+
+The original generator drew from ``string.printable`` only, so it essentially never produced a
+control character inside quotes and could not falsify the round-trip property (F6)."""
+
+_NUMERIC = st.builds(
+    lambda mantissa, exponent: f"{mantissa}e{exponent}",
+    st.integers(min_value=0, max_value=99),
+    st.integers(min_value=-400, max_value=400),
+)
+"""Exponent forms, including the ones that used to overflow to ``inf`` (F6)."""
+
 _SOURCE = st.one_of(
+    _QUOTED,
+    _NUMERIC,
     st.text(alphabet=_ALPHABET, max_size=60),
     st.text(alphabet="state.ctx result | ()'\"=!<>-_ and or not 019.", max_size=60),
     st.lists(

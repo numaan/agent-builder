@@ -48,8 +48,12 @@ from support_core.graph.expr.syntax import (
 __all__ = ["MAX_DEPTH", "MAX_LENGTH", "MAX_TOKENS", "ParseError", "parse"]
 
 MAX_DEPTH = 32
-"""Maximum nesting depth. Without this, ``"(" * 100000`` is a ``RecursionError``, which is an
-unexpected exception type escaping a function whose contract is "``ParseError`` or an AST"."""
+"""Maximum AST depth. Without this, ``"(" * 100000`` is a ``RecursionError``, which is an
+unexpected exception type escaping a function whose contract is "``ParseError`` or an AST".
+
+Every level counts, including the links of an attribute or filter chain: each one adds an AST
+level and costs the walkers (``walk``, ``unparse``, ``infer``, ``evaluate``) one frame apiece,
+so the whole language fits in a bounded amount of stack no matter how deep the caller is."""
 
 KEYWORDS: frozenset[str] = frozenset({"and", "or", "not"})
 NAMED_LITERALS: dict[str, str | int | float | bool | None] = {
@@ -188,7 +192,16 @@ class _Parser:
 
     def postfix(self) -> Expr:
         node = self.primary()
+        links = 0
         while True:
+            if self.at_op(".") or self.at_op("|"):
+                # Each link adds one AST level, and the walkers (unparse, walk, infer,
+                # evaluate) recurse once per level. Without this the chain length was bounded
+                # only by MAX_TOKENS, which left the recursion safety of those walkers resting
+                # on CPython's frame limit (phase-1 review finding F5).
+                links += 1
+                if self.depth + links > MAX_DEPTH:
+                    raise self.fail(f"expression nests deeper than {MAX_DEPTH} levels")
             if self.at_op("."):
                 self.advance()
                 name_token = self.peek()

@@ -8,6 +8,7 @@ offending text and its position.
 
 from dataclasses import dataclass
 from enum import StrEnum
+from math import isfinite
 
 MAX_LENGTH = 2000
 """Longest expression source accepted. A graph predicate that needs more is a code smell."""
@@ -149,6 +150,13 @@ def _read_number(source: str, i: int) -> tuple[Token, int]:
             "number is followed by a name character", source=source, position=start, token=bad
         )
     value: int | float = float(text) if is_float else int(text)
+    if isinstance(value, float) and not isfinite(value):
+        # ``1e400`` would otherwise become ``inf``, which ``unparse`` renders as ``inf`` and the
+        # lexer then refuses to read back, so the canonical form would not be canonical and two
+        # different argument texts would compare equal (phase-1 review finding F6).
+        raise ParseError(
+            "number is too large to represent", source=source, position=start, token=text
+        )
     return Token(TokenKind.NUMBER, text, start, value), i
 
 
@@ -185,6 +193,18 @@ def _read_string(source: str, i: int) -> tuple[Token, int]:
                 source=source,
                 position=start,
                 token=quote,
+            )
+        if char < " " or char == "\x7f":
+            # Only the escapes in _ESCAPES can put a control character in a string value, and
+            # those are exactly the ones :func:`~support_core.graph.expr.syntax.unparse` can
+            # write back, which is what makes the canonical form canonical (F6). A raw one
+            # would round-trip through an escape the lexer does not accept.
+            raise ParseError(
+                f"control character {char!r} is not allowed in a string literal; "
+                "use an escape such as '\\t'",
+                source=source,
+                position=i,
+                token=char,
             )
         out.append(char)
         i += 1

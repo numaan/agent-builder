@@ -128,22 +128,44 @@ def roots_used(node: Expr) -> set[str]:
     return {n.name for n in walk(node) if isinstance(n, Root)}
 
 
+_STRING_ESCAPES = {"\\": "\\\\", "'": "\\'", "\n": "\\n", "\t": "\\t", "\r": "\\r", "\0": "\\0"}
+"""The only escapes the lexer accepts that ``repr`` would not produce identically."""
+
+
+def literal_source(value: str | int | float | bool | None) -> str:
+    """Render a literal so that the lexer reads it back to the same value.
+
+    ``repr`` is not enough for strings: it writes ``'\\x07'`` for a control character, and the
+    lexer has no ``\\x`` escape, so the "canonical" form would not re-parse (phase-1 review
+    finding F6). The lexer refuses raw control characters in a literal, so the only ones that
+    can reach here are those :data:`_STRING_ESCAPES` can write back.
+    """
+    if not isinstance(value, str):
+        return repr(value)
+    out = ["'"]
+    for char in value:
+        out.append(_STRING_ESCAPES.get(char, char))
+    out.append("'")
+    return "".join(out)
+
+
 def unparse(node: Expr) -> str:
     """Render the AST back to canonical source. Used to compare two expressions for equality.
 
     DESIGN.md section 8.2 binds an approval to the arguments of an action; the validator
     compares a ``confirm`` node's declared arguments with the ``tool`` node's by comparing
-    canonical text, so ``state.charge_id`` and ``state . charge_id`` count as the same.
+    canonical text, so ``state.charge_id`` and ``state . charge_id`` count as the same. The
+    output re-parses to the same AST, which is what makes that comparison trustworthy.
     """
     match node:
         case Literal():
-            return repr(node.value)
+            return literal_source(node.value)
         case Root():
             return node.name
         case Attribute():
             return f"{unparse(node.value)}.{node.name}"
         case FilterCall():
-            args = ", ".join(repr(a.value) for a in node.args)
+            args = ", ".join(literal_source(a.value) for a in node.args)
             call = f"({args})" if node.args else ""
             return f"{unparse(node.value)} | {node.name}{call}"
         case Unary():
