@@ -102,6 +102,13 @@ class Message(Base):
     redacted_text: Mapped[str | None] = mapped_column()
     status: Mapped[str] = mapped_column(nullable=False, server_default="received")
     created_at: Mapped[datetime] = _created_at()
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    """Position among the messages written by one checkpoint transaction.
+
+    ``created_at`` is the transaction timestamp, so every message a single node produced shares
+    it and cannot order them; ``ORDER BY created_at, ordinal, id`` can (phase 2 review finding
+    R4). Successive checkpoints get increasing timestamps, so the ordinal only ever breaks a
+    tie within one of them."""
 
 
 class Run(Base):
@@ -149,6 +156,13 @@ class Run(Base):
 
     awaiting: Mapped[JsonObject | None] = mapped_column()
     """What the run is waiting for, for example ``{"kind": "async_tool", "step_id": ...}``."""
+
+    recovery_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    """Failed passes of the recovery sweep over this run (section 7.3, review finding R3).
+
+    A conversation core cannot recover - an unexecutable node type, a hook that raises - is
+    parked for a human after a few attempts instead of being retried by every sweep for ever.
+    Reset when a sweep gets through the turn."""
 
     updated_at: Mapped[datetime] = _updated_at()
 

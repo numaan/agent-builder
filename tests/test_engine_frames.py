@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Iterator
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from support_core import load_pack
@@ -215,8 +216,34 @@ async def test_frame_sequence_numbers_are_never_reused(
     steps = [step["step_id"] for step in await trace_rows(engine, run_id)]
     assert len(steps) == len(set(steps))
     frame_seqs = [int(step.split(":")[-3]) for step in steps]
-    assert frame_seqs == sorted(dict.fromkeys(frame_seqs), key=frame_seqs.index) or True
+    first_seen = list(dict.fromkeys(frame_seqs))
+    assert first_seen == sorted(first_seen), (
+        "frame_seq is allocated monotonically, so each new frame's number is larger than every "
+        "number seen before it"
+    )
     verify_frames = {
         int(step.split(":")[-3]) for step in steps if step.split(":")[-2] in {"tell", "hold"}
     }
     assert len(verify_frames) >= 2, "each redirect push is a new frame"
+
+
+def test_a_node_result_cannot_ask_for_two_ways_out_at_once() -> None:
+    """Independent review finding R11.
+
+    ``_advance`` has to pick an order when a result asks to suspend *and* push *and* pop, and
+    whichever it picks silently discards the rest. Phase 2's runners never do it; phase 3 and 4
+    return richer results, and a dropped ``push_graph`` would be very hard to find.
+    """
+    from support_core.engine.types import NodeResult, SuspendReason
+
+    assert NodeResult(pop=True).pop
+    with pytest.raises(ValidationError, match="only one of suspend, push_graph or pop"):
+        NodeResult(
+            pop=True,
+            push_graph=GraphInvocation(graph="verify"),
+        )
+    with pytest.raises(ValidationError, match="only one of suspend, push_graph or pop"):
+        NodeResult(
+            suspend=SuspendReason(status="waiting_customer"),
+            push_graph=GraphInvocation(graph="verify"),
+        )

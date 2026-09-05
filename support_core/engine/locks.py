@@ -29,6 +29,10 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+LOCK_NOT_AVAILABLE = "55P03"
+"""Postgres SQLSTATE ``lock_not_available``, which is what ``lock_timeout`` raises. Every other
+SQLSTATE from the lock statement is a real failure and is re-raised (review finding R5)."""
+
 _PERSON = b"supportconv"
 """Namespace for the lock key, so a conversation id cannot collide with some other advisory
 lock taken on the same database by another component."""
@@ -70,7 +74,13 @@ async def conversation_lock(
                         text("SELECT pg_advisory_xact_lock(:key)"), {"key": key}
                     )
                     acquired = True
-                except DBAPIError:
+                except DBAPIError as exc:
+                    if getattr(exc.orig, "sqlstate", None) != LOCK_NOT_AVAILABLE:
+                        # A dropped connection, a cancelled statement or a permissions error is
+                        # not "somebody else is holding the lock". Reporting it as a busy lock
+                        # would leave the message pending with the failure recorded nowhere
+                        # (review finding R5).
+                        raise
                     # lock_timeout fired. The message is already stored as pending, so the
                     # work is not lost; the next caller to get the lock drains it in order.
                     acquired = False

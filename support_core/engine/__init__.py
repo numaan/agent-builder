@@ -10,7 +10,6 @@ holes in the loop.
 from support_core.engine.errors import (
     EngineError,
     IncompatiblePackError,
-    LockTimeout,
     NodeError,
     NodeNotExecutableError,
 )
@@ -48,7 +47,6 @@ __all__ = [
     "HandoffRequest",
     "IncompatiblePackError",
     "InterruptDecision",
-    "LockTimeout",
     "Node",
     "NodeError",
     "NodeNotExecutableError",

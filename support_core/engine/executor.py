@@ -26,6 +26,7 @@ inside the checkpoint transaction, or after it - resumes by re-reading the row.
 
 import uuid
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -82,6 +83,13 @@ TURN_EVENT_KEY = "turn_event"
 belongs to consumes it. Without it, a process that died between claiming a customer message and
 delivering it would leave the message claimed and the run with no idea what it was for."""
 
+MAX_RECOVERY_ATTEMPTS = 3
+"""Failed recovery passes before a stalled run is parked for a human (review finding R3).
+
+Three because a transient cause - the database being restarted under the sweep, a channel that
+is briefly down - deserves more than one try, and a permanent one deserves an operator rather
+than an unbounded retry loop."""
+
 RESUMABLE_BY_CUSTOMER = frozenset(["idle", "done", "waiting_customer"])
 """Statuses in which a customer message starts or continues a turn. A run waiting for a human,
 a tool or a timer keeps its queue: the message is stored and stays ``pending`` until the thing
@@ -125,6 +133,7 @@ class _RunRow:
     turn_nodes: int
     awaiting: dict[str, Any] | None
     pack_fingerprint: str | None
+    recovery_attempts: int = 0
 
 
 def _snapshot(run: Run) -> _RunRow:
@@ -138,6 +147,7 @@ def _snapshot(run: Run) -> _RunRow:
         turn_nodes=run.turn_nodes,
         awaiting=dict(run.awaiting) if run.awaiting else None,
         pack_fingerprint=run.pack_fingerprint,
+        recovery_attempts=run.recovery_attempts,
     )
 
 
@@ -284,8 +294,63 @@ class Executor:
             ) as acquired:
                 if not acquired:
                     continue  # somebody is working on it after all
-                outcomes.append(await self._drain(run.conversation_id))
+                outcomes.append(await self._recover_one(run))
         return outcomes
+
+    async def _recover_one(self, run: _RunRow) -> TurnOutcome:
+        """One conversation's recovery, whatever happens to it (review finding R3).
+
+        A sweep is a batch: a conversation core cannot get through - a node type this phase
+        cannot execute, the ``EngineError`` phase 6's ``new_intent`` raises, a ``send`` hook
+        that is down - must not stop the conversations behind it in the batch, and must not be
+        retried by every sweep from now until someone notices. After
+        :data:`MAX_RECOVERY_ATTEMPTS` failures the run is parked ``waiting_human`` with reason
+        ``engine_error``, which is DESIGN.md section 7.3's answer to a failure the engine cannot
+        route: a human looks at it.
+        """
+        try:
+            outcome = await self._drain(run.conversation_id)
+        except Exception as exc:
+            # Deliberately every exception: what must not escape is precisely the failure
+            # nothing else in the engine knows how to route.
+            return await self._recovery_failed(run, exc)
+        if run.recovery_attempts:
+            await self._set(run.id, recovery_attempts=0)
+        return outcome
+
+    async def _recovery_failed(self, run: _RunRow, exc: Exception) -> TurnOutcome:
+        outcome = TurnOutcome(conversation_id=run.conversation_id, run_id=run.id)
+        outcome.status = run.status  # type: ignore[assignment]
+        async with self.sessions() as session, session.begin():
+            attempts = await repo.count_recovery_attempt(session, run.id)
+        detail = f"{type(exc).__name__}: {exc}"
+        if attempts < MAX_RECOVERY_ATTEMPTS:
+            return outcome
+        now = self.hooks.clock()
+        await self._set(
+            run.id,
+            status="waiting_human",
+            timeout_at=None,
+            suspended_at=now,
+            awaiting={"kind": "handoff", "reason": "engine_error", "detail": detail},
+            updated_at=now,
+        )
+        outcome.status = "waiting_human"
+        outcome.handoff_reason = "engine_error"
+        frames = [Frame.model_validate(frame) for frame in run.frames]
+        # A handoff sink that is itself down must not re-poison the batch it is being told
+        # about; the run is already parked durably, which is the part that matters.
+        with suppress(Exception):
+            await self.hooks.handoff(
+                HandoffRequest(
+                    conversation_id=run.conversation_id,
+                    run_id=run.id,
+                    reason="engine_error",
+                    detail=f"recovery failed {attempts} times: {detail}",
+                    frames=frames,
+                )
+            )
+        return outcome
 
     async def sweep_timeouts(self, now: datetime | None = None) -> list[TurnOutcome]:
         """Apply expired per-status timeouts (DESIGN.md section 7.2).

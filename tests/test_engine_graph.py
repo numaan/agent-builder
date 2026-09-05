@@ -160,3 +160,49 @@ async def test_a_runaway_graph_hits_the_per_turn_limit(
     row = await run_row(engine, conversation_id)
     assert row["status"] == "waiting_human"
     assert row["turn_nodes"] == 4  # three nodes, then the step that records the refusal
+
+
+async def test_an_output_mapping_the_caller_no_longer_declares_is_a_node_error(
+    engine: AsyncEngine, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Independent review finding R12.
+
+    The validator refuses a ``subgraph`` node whose ``outputs`` name a state field the caller
+    does not declare, so the only way to reach one at run time is a pack redeployed while a run
+    is suspended inside the callee: the *frame* carries the old mapping. Writing the value in
+    regardless makes the caller's own state model reject it one node later, which is reported to
+    the operator as ``pack_incompatible`` - a diagnosis that sends them looking at the stored
+    state instead of at the mapping that is actually wrong.
+    """
+    import shutil
+
+    from tests.engine_support import custom_node_types, set_context
+
+    with custom_node_types():
+        before = tmp_path_factory.mktemp("packs") / "before"
+        shutil.copytree(PACKS / "custom_pack", before)
+        context = {"customer": {"identity_verified": True, "attributes": {"mode": "gate"}}}
+        executor = Executor(load_pack(before), engine, hooks=Recorder().hooks())
+        conversation_id = await executor.start_conversation(context=context)
+        assert (await executor.on_inbound(conversation_id, "go")).status == "waiting_customer"
+
+        # Redeployed with the caller's state field renamed. The new pack is valid; it is the
+        # frame already suspended inside the callee that still maps into the old name.
+        after = tmp_path_factory.mktemp("packs") / "after"
+        shutil.copytree(PACKS / "custom_pack", after)
+        root = after / "graphs" / "root.yaml"
+        root.write_text(
+            root.read_text(encoding="utf-8")
+            .replace("  reached: bool | None", "  arrived: bool | None")
+            .replace("outputs: { reached: reached }", "outputs: { arrived: reached }"),
+            encoding="utf-8",
+        )
+        await set_context(engine, conversation_id, context)
+        recorder = Recorder()
+        upgraded = Executor(load_pack(after), engine, hooks=recorder.hooks())
+        outcome = await upgraded.on_inbound(conversation_id, "42")
+
+    assert outcome.status == "waiting_human"
+    assert [request.reason for request in recorder.handoffs] == ["node_error"]
+    detail = recorder.handoffs[0].detail or ""
+    assert "['reached']" in detail and "root does not declare" in detail

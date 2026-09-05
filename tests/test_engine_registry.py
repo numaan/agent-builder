@@ -37,6 +37,28 @@ def test_a_core_node_type_cannot_be_replaced() -> None:
     assert NODE_RUNNERS["say"] is SayRunner
 
 
+def test_a_second_registration_of_one_name_cannot_replace_the_first() -> None:
+    """Review finding R6: a silent overwrite is how two packs corrupt each other.
+
+    DESIGN.md section 6.7 keeps two pack versions loaded side by side, and phase 9 splits core
+    from the packs; both packs defining a ``verify_identity`` node type must not be a race for
+    who imported last. Registering the identical spec and runner again is a no-op, because
+    loading the same pack twice is not an error.
+    """
+
+    class OtherRunner(BoomRunner):
+        pass
+
+    with custom_node_types():
+        register_node_type(BOOM_SPEC, BoomRunner)  # idempotent
+        assert NODE_RUNNERS["boom"] is BoomRunner
+        with pytest.raises(ValueError, match="already registered"):
+            register_node_type(BOOM_SPEC, OtherRunner)
+        with pytest.raises(ValueError, match="already registered"):
+            register_node_type(replace(BOOM_SPEC, executable_phase=9), BoomRunner)
+        assert NODE_RUNNERS["boom"] is BoomRunner
+
+
 def test_unregistering_something_that_was_never_registered_is_refused() -> None:
     with pytest.raises(ValueError, match="was not registered"):
         unregister_node_type("say")

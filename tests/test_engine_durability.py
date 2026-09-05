@@ -75,13 +75,27 @@ async def _signature(engine: AsyncEngine, conversation_id: uuid.UUID) -> dict[st
     }
 
 
+_BASELINE: dict[str, Any] | None = None
+
+
 async def _uninterrupted(pack: Pack, engine: AsyncEngine) -> dict[str, Any]:
-    executor = Executor(pack, engine, hooks=Recorder().hooks())
-    conversation_id = await executor.start_conversation(
-        inputs={"amount": 250.0}, context={"customer": {"name": "Ada"}}
-    )
-    await executor.on_inbound(conversation_id, "hello")
-    return await _signature(engine, conversation_id)
+    """The signature of a turn nobody interrupted, computed once for the whole module.
+
+    Rebuilding it inside each of the parametrised cases was most of this file's run time
+    (review finding R14), and it never differs: nothing in the signature carries a run or
+    conversation id - the step ids are compared by their suffix - so one conversation's outcome
+    is every conversation's outcome. The per-test ``engine`` fixture truncates the tables it was
+    built in, which is why the *signature* is cached rather than the conversation.
+    """
+    global _BASELINE
+    if _BASELINE is None:
+        executor = Executor(pack, engine, hooks=Recorder().hooks())
+        conversation_id = await executor.start_conversation(
+            inputs={"amount": 250.0}, context={"customer": {"name": "Ada"}}
+        )
+        await executor.on_inbound(conversation_id, "hello")
+        _BASELINE = await _signature(engine, conversation_id)
+    return _BASELINE
 
 
 @pytest.mark.parametrize("point", CRASH_POINTS)
@@ -440,6 +454,126 @@ async def test_a_run_whose_graph_changed_underneath_it_hands_off(
     assert outcome.status == "waiting_human"
     assert [request.reason for request in recorder.handoffs] == ["pack_incompatible"]
     assert "state shape" in (recorder.handoffs[0].detail or "")
+
+
+async def test_one_poisoned_conversation_does_not_stop_the_recovery_sweep(
+    engine: AsyncEngine,
+) -> None:
+    """Independent review finding R3.
+
+    A sweep is a batch. A conversation core cannot get through - here a pack that reaches an
+    ``llm`` node, which phase 2 refuses by design - used to raise out of the loop and take every
+    stalled conversation behind it down with it, and to do so again on every later sweep, for
+    ever. Now each conversation fails on its own and is parked for a human after a few tries.
+    """
+    from support_core.engine.errors import NodeNotExecutableError
+    from tests.engine_support import PACKS
+
+    pack = load_pack(PACKS / "refund_pack")
+    conversations = []
+    for _ in range(2):
+        executor = Executor(pack, engine, hooks=Recorder().hooks())
+        conversation_id = await executor.start_conversation()
+        with pytest.raises(NodeNotExecutableError):
+            await executor.on_inbound(conversation_id, "hello")
+        conversations.append(conversation_id)
+        assert (await run_row(engine, conversation_id))["status"] == "running"
+
+    recorder = Recorder()
+    sweeper = Executor(pack, engine, hooks=recorder.hooks())
+    for attempt in range(1, 4):
+        outcomes = await sweeper.recover_stalled(older_than=timedelta(seconds=-1))
+        assert {outcome.conversation_id for outcome in outcomes} == set(conversations), (
+            f"sweep {attempt} did not reach every stalled conversation"
+        )
+
+    for conversation_id in conversations:
+        row = await run_row(engine, conversation_id)
+        assert row["status"] == "waiting_human"
+        assert row["awaiting"]["reason"] == "engine_error"
+        assert row["recovery_attempts"] == 3
+    assert sorted(request.reason for request in recorder.handoffs) == [
+        "engine_error",
+        "engine_error",
+    ]
+    assert await sweeper.recover_stalled(older_than=timedelta(seconds=-1)) == [], (
+        "a parked run is no longer stalled, so nothing retries it"
+    )
+
+
+async def test_a_recovered_conversation_forgets_its_earlier_failures(
+    pack: Pack, engine: AsyncEngine
+) -> None:
+    """The attempt counter is about *unrecoverable* runs, so success clears it."""
+    baseline = await _uninterrupted(pack, engine)
+    dying = Recorder(crash_at="after_node", crash_after=1)
+    executor = Executor(pack, engine, hooks=dying.hooks())
+    conversation_id = await executor.start_conversation(
+        inputs={"amount": 250.0}, context={"customer": {"name": "Ada"}}
+    )
+    with pytest.raises(SimulatedCrash):
+        await executor.on_inbound(conversation_id, "hello")
+    async with engine.begin() as connection:
+        await connection.execute(
+            text("UPDATE run SET recovery_attempts = 2 WHERE conversation_id = :c"),
+            {"c": conversation_id},
+        )
+
+    survivor = Executor(pack, engine, hooks=Recorder().hooks())
+    await survivor.recover_stalled(older_than=timedelta(seconds=-1))
+
+    assert (await run_row(engine, conversation_id))["recovery_attempts"] == 0
+    assert await _signature(engine, conversation_id) == baseline
+
+
+async def test_messages_written_by_one_checkpoint_keep_their_order(engine: AsyncEngine) -> None:
+    """Independent review finding R4.
+
+    Outbound rows take the server-side ``created_at``, which is the transaction timestamp, so
+    every message one node produced shares it and ``ORDER BY created_at, id`` fell through to a
+    random UUID. No phase-2 runner emits more than one message; phase 3's ``llm`` node and phase
+    6's handoff do.
+    """
+    from support_core.storage import repositories as repo
+
+    sessions = make_session_factory(engine)
+    async with sessions() as session, session.begin():
+        conversation = await repo.create_conversation(session, channel="web_chat")
+        run = await repo.create_run(
+            session, conversation_id=conversation.id, pack_version="1.0.0", pack_fingerprint="x"
+        )
+        conversation_id, run_id = conversation.id, run.id
+
+    now = Recorder().now
+    bodies = [f"part {index}" for index in range(8)]
+    async with sessions() as session:
+        await write_checkpoint(
+            session,
+            run=RunUpdate(
+                run_id=run_id,
+                status="running",
+                frames=[],
+                checkpoint_seq=1,
+                next_frame_seq=1,
+                turn_nodes=1,
+                updated_at=now,
+            ),
+            step=StepWrite(
+                run_id=run_id,
+                step_id=f"{run_id}:0:chorus:0",
+                seq=1,
+                node_id="chorus",
+                started_at=now,
+                ended_at=now,
+            ),
+            conversation_id=conversation_id,
+            outbound=bodies,
+        )
+
+    assert await outbound_texts(engine, conversation_id) == bodies
+    async with sessions() as session, session.begin():
+        waiting = await repo.pending_outbound(session, conversation_id)
+    assert [message.text for message in waiting] == bodies
 
 
 GATE_PACK = DETERMINISTIC_PACK.parent / "custom_pack"

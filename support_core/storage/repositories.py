@@ -255,10 +255,14 @@ async def forget_turn_event(session: AsyncSession, run_id: uuid.UUID) -> None:
     )
 
 
-async def pending_count(session: AsyncSession, conversation_id: uuid.UUID) -> int:
+async def count_recovery_attempt(session: AsyncSession, run_id: uuid.UUID) -> int:
+    """Record one failed recovery pass over this run and return the new total (finding R3)."""
     result = await session.execute(
-        text("SELECT count(*) FROM message WHERE conversation_id = :c AND status = 'pending'"),
-        {"c": conversation_id},
+        text(
+            "UPDATE run SET recovery_attempts = recovery_attempts + 1 "
+            "WHERE id = :id RETURNING recovery_attempts"
+        ),
+        {"id": run_id},
     )
     return int(result.scalar_one())
 
@@ -313,11 +317,13 @@ async def write_checkpoint(
                 ended_at=step.ended_at,
             )
         )
-        for body in outbound:
+        for ordinal, body in enumerate(outbound):
             # created_at is left to the server default. It orders the customer's transcript,
             # and a conversation is single-writer, so successive checkpoints get increasing
             # transaction timestamps whichever process wrote them - which an engine clock,
             # injectable and therefore skewable, could not promise across a crash and a resume.
+            # Within one checkpoint every row shares that timestamp, so `ordinal` is what
+            # orders the messages one node produced (review finding R4).
             session.add(
                 Message(
                     conversation_id=conversation_id,
@@ -325,6 +331,7 @@ async def write_checkpoint(
                     author="agent",
                     text=body,
                     status="pending_send",
+                    ordinal=ordinal,
                 )
             )
         if before_commit is not None:
@@ -346,7 +353,7 @@ async def pending_outbound(session: AsyncSession, conversation_id: uuid.UUID) ->
             Message.direction == "outbound",
             Message.status == "pending_send",
         )
-        .order_by(Message.created_at, Message.id)
+        .order_by(Message.created_at, Message.ordinal, Message.id)
     )
     return list(result.scalars())
 
@@ -361,11 +368,6 @@ async def trace(session: AsyncSession, run_id: uuid.UUID) -> list[TraceStep]:
         select(TraceStep).where(TraceStep.run_id == run_id).order_by(TraceStep.seq)
     )
     return list(result.scalars())
-
-
-async def step_exists(session: AsyncSession, step_id: str) -> bool:
-    result = await session.execute(select(TraceStep.id).where(TraceStep.step_id == step_id))
-    return result.first() is not None
 
 
 async def stalled_runs(session: AsyncSession, cutoff: datetime, limit: int = 100) -> list[Run]:

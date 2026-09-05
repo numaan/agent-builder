@@ -19,8 +19,17 @@ Phase 2 (BACKLOG.md), DESIGN.md sections 7.1 to 7.3 and 17.
   ids stable across turns. Phase 0 left the question open for phase 2.
 
 The ``seq`` backfill uses ``row_number()`` so the migration applies to a table that already has
-rows; ``conversation_id`` is de-duplicated before the unique constraint for the same reason.
-Nothing has run the engine yet, so both are precautions rather than data migrations.
+rows, and the unique constraint on ``conversation_id`` refuses to apply if any conversation
+already has two runs. Nothing has run the engine yet, so both are precautions rather than data
+migrations.
+
+**The back-fill invents an order where finding F5 says none exists.** It orders by
+``(started_at, id)``, and for the rows F5 is about - several steps written in one transaction,
+so sharing one ``now()`` - the tie is broken by a random UUID. There is no better answer
+available after the fact: the information that would give the true order is what this revision
+adds. A run whose steps were all written in one transaction therefore gets *an* order rather
+than *the* order (phase 2 review finding R13). It matters only for rows written before this
+revision, and the engine has never written any.
 """
 
 from collections.abc import Sequence
@@ -65,15 +74,29 @@ def upgrade() -> None:
     op.add_column("run", sa.Column("awaiting", postgresql.JSONB(), nullable=True))
     op.create_index("ix_run_timeout_at", "run", ["timeout_at"])
 
-    # One run per conversation from now on. Keep the oldest if history ever holds more.
-    op.execute(
-        """
-        DELETE FROM run AS r
-        USING run AS other
-        WHERE r.conversation_id = other.conversation_id
-          AND (other.updated_at, other.id) < (r.updated_at, r.id)
-        """
+    # One run per conversation from now on. A database that already holds more than one is a
+    # database this migration must not decide about: deleting the loser cascades its trace
+    # steps away (and, once phase 4 adds tool_call.run_id, its tool calls), which is a silent
+    # loss of exactly the history section 7.3 exists to keep. Fail instead and let an operator
+    # choose (phase 2 review finding R8).
+    duplicates = (
+        op.get_bind()
+        .execute(
+            sa.text(
+                "SELECT conversation_id, count(*) FROM run "
+                "GROUP BY conversation_id HAVING count(*) > 1 LIMIT 5"
+            )
+        )
+        .fetchall()
     )
+    if duplicates:
+        listed = ", ".join(f"{row[0]} ({row[1]} runs)" for row in duplicates)
+        msg = (
+            "uq_run_conversation cannot be created: these conversations have more than one "
+            f"run: {listed}. Merge or archive them first - this migration will not delete "
+            "runs, because that would cascade their trace steps away."
+        )
+        raise RuntimeError(msg)
     op.drop_index("ix_run_conversation_id", table_name="run")
     op.create_unique_constraint("uq_run_conversation", "run", ["conversation_id"])
 

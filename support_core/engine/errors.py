@@ -30,7 +30,3 @@ class IncompatiblePackError(EngineError):
     run started. The engine hands the conversation off rather than feeding a node a state model
     it was not written for.
     """
-
-
-class LockTimeout(EngineError):
-    """The conversation lock could not be taken within the configured wait."""

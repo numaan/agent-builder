@@ -183,3 +183,47 @@ async def test_a_dead_process_releases_the_lock(pack: Pack, engine: AsyncEngine)
     assert [row["status"] for row in inbound] == ["received", "received"], (
         "the message the dead process had claimed was replayed, not lost"
     )
+
+
+async def test_a_failure_that_is_not_a_busy_lock_is_reported_not_swallowed(
+    pack: Pack, engine: AsyncEngine
+) -> None:
+    """Independent review finding R5.
+
+    ``conversation_lock`` treated every ``DBAPIError`` from the lock statement as "somebody else
+    is holding it", so a dropped connection, a cancelled statement or a permissions error came
+    back to the caller as ``queued=True`` with the message left pending and the failure recorded
+    nowhere at all. Only SQLSTATE ``55P03`` (``lock_timeout`` fired) means busy.
+
+    The cancellation here is a ``statement_timeout`` shorter than the lock wait, which is a real
+    Postgres error (``57014``) raised by the same statement on the same path.
+    """
+    from sqlalchemy.exc import DBAPIError
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from support_core.storage.config import test_database_url
+
+    executor = Executor(pack, engine, hooks=Recorder().hooks())
+    conversation_id = await executor.start_conversation()
+
+    impatient = create_async_engine(
+        test_database_url(),
+        poolclass=NullPool,
+        connect_args={"server_settings": {"statement_timeout": "150"}},
+    )
+    try:
+        async with conversation_lock(engine, conversation_id, wait_seconds=0) as held:
+            assert held
+            with pytest.raises(DBAPIError) as failure:
+                async with conversation_lock(impatient, conversation_id, wait_seconds=30):
+                    pass  # pragma: no cover - the lock statement never returns
+        assert getattr(failure.value.orig, "sqlstate", None) == "57014"
+    finally:
+        await impatient.dispose()
+
+    # A genuinely busy lock is still reported as busy rather than raised.
+    async with conversation_lock(engine, conversation_id, wait_seconds=0) as held:
+        assert held
+        async with conversation_lock(engine, conversation_id, wait_seconds=0.05) as second:
+            assert not second

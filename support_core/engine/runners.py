@@ -351,11 +351,27 @@ def register_node_type(spec: NodeTypeSpec, factory: RunnerFactory) -> None:
     rather than to hand-write database rows. Phase 4 uses the same call to load a pack's
     ``nodes/`` directory.
 
-    Registration is process-wide, like the built-in table it extends. Use
-    :func:`unregister_node_type` to undo it.
+    Registration is process-wide, like the built-in table it extends, and a name may be
+    registered only once: re-registering the *same* spec and factory is a no-op, and
+    registering a different behaviour under a name somebody already took is an error rather
+    than a silent replacement (review finding R6). Two packs that both define a
+    ``verify_identity`` node type would otherwise overwrite each other, which is the same
+    failure mode as the process-wide Jinja environment this phase removed, and DESIGN.md
+    section 6.7 keeps two pack versions loaded side by side. Making the registry per-pack -
+    so both packs can have their own - needs the loader and the validator to carry it too and
+    is recorded as a deferred finding against phase 9. Use :func:`unregister_node_type` to undo
+    a registration.
     """
     if spec.name in NODE_TYPES and spec.name not in _REGISTERED:
         msg = f"node type {spec.name!r} is a core type and cannot be replaced"
+        raise ValueError(msg)
+    if spec.name in _REGISTERED and (
+        NODE_TYPES[spec.name] != spec or NODE_RUNNERS[spec.name] is not factory
+    ):
+        msg = (
+            f"node type {spec.name!r} is already registered with a different spec or runner; "
+            f"unregister it first"
+        )
         raise ValueError(msg)
     NODE_TYPES[spec.name] = spec
     NODE_RUNNERS[spec.name] = factory
