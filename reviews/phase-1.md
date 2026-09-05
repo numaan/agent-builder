@@ -401,3 +401,291 @@ Phase 1 has no runtime, no database and no shared mutable state, so the honest a
 Three defects above were found by the self-critique and fixed in `074d092` rather than recorded:
 the `RecursionError` escaping `validate_pack`, the HIGH-risk `confirm_exempt` escape, and the
 `"Mr. Smith"` false positive in the literal heuristic. The rest stands as written.
+
+## Independent review
+
+Reviewer: independent agent, 2026-09-05. Wrote none of the phase-1 code. Read DESIGN.md
+sections 3, 5.2, 6.1 to 6.4, 6.7 and 8.2, PLAN.md, BACKLOG.md, reviews/phase-0.md, this file,
+every module under `support_core/graph/`, `support_core/cli/`, `support_core/tools/`,
+`tests/` and `packs/acme_billing`, and the five phase-1 commits (`917a450..0648ee9`).
+
+### Verdict
+
+Phase 1 is strong work and the exit criterion substantially holds: every command in the
+implementation notes reproduces exactly (ruff, format, mypy strict, 344 tests green three times,
+`support pack validate` on both packs, alembic check), the stepper really executes
+`router`/`say`/`subgraph`/`end` with assertions on path, messages, outputs and determinism, and
+the malformed fixtures are rejected with specific rule ids. **The expression sandbox held under
+every attack I could construct**: 135 hand-written adversarial inputs plus 2000 hypothesis-generated
+ones produced no unexpected exception type and no attribute outside a declared Pydantic model
+field; dunders, calls, subscripts, unicode homoglyphs, null bytes, comment syntax, huge literals,
+deep nesting and every Jinja escape I know (`__class__`, `attr()`, `lipsum`, `cycler`, `self`,
+`include`, `set`, `for`) are all rejected, at load time by `convert`/the parser and again at run
+time by the sandbox. **I did not break the confirm-on-all-paths analysis on any reachable path**:
+a differential test of 400 random graphs against an independently written product-automaton
+reachability agreed exactly, and hostile fixtures using a one-branch sub-graph confirm, mutual
+recursion, a gate redirect, an `on_error` edge, an `ask` between confirm and call, two call sites
+of one sub-graph, and an `end` returning past the confirm were all caught. Two things stop this
+being a clean pass. `graph.approval_missing` and `graph.approval_unknown` together make a HIGH or
+WRITE tool inside a sub-graph **impossible to validate** - the analysis blesses a caller-side
+confirm and then the approval rules reject every spelling of it, and the implementer's own test
+documents the contradiction. And five rule ids listed in "Rule ids implemented", two of them ERROR
+severity, have no test asserting on them, so the backlog's "one failing fixture per rule" and the
+exit criterion's "with the right rule name" are not true as delivered. Everything else is
+should-fix or smaller.
+
+### Findings
+
+| id | severity | location | finding | suggested fix |
+|----|----------|----------|---------|---------------|
+| F1 | must-fix | `support_core/graph/rules.py:536` | A WRITE/HIGH tool node in a sub-graph cannot be made valid. `approval_binding` requires `requires_approval` and then requires it to name a `confirm` **in the same graph**; but `confirm_coverage` deliberately inlines calls so a caller-side confirm satisfies DESIGN 5.2. Omitting `requires_approval` gives `graph.approval_missing`; naming the caller's confirm gives `graph.approval_unknown` **and** a spurious `graph.approval_unreachable` (reproduced, case R). `test_a_confirm_in_the_calling_graph_covers_a_call_in_the_sub_graph` asserts exactly this unsatisfiable pair. DESIGN 8.2 never says the confirm must be in the calling graph, and the `covered` set is already keyed by `(graph id, node id)`, so the information needed to allow it is already computed. | Let `requires_approval` name `graph.node`, or resolve a bare id against `covered[point]`, which is already cross-graph: accept when the named confirm is in that set; keep `approval_unknown` for a name no graph defines. Add the sub-graph case to the confirm tests. |
+| F2 | must-fix | `reviews/phase-1.md` "Rule ids implemented"; `tests/test_graph_validator.py` | Five listed rule ids have no test asserting on that id: `graph.end_output_unknown` and `graph.end_output_missing` (both ERROR - I verified by hand that they do fire), `graph.approval_not_needed`, `expr.optional_filter_input`, `expr.optional_comparison`. BACKLOG's checklist says "validator tests with one failing fixture per rule" and the exit criterion says "rejects each malformed fixture with the right rule name". | Add one fixture per id. Cheap; the two ERROR ones matter most, because nothing would notice if `end_outputs` regressed. |
+| F3 | should-fix | `support_core/graph/rules.py:644`, `control_flow_graph` entries at `:745` | The coverage analysis visits only points reachable from an entry, and `entries` excludes any graph that appears in `returns` - so a graph called **only from an unreachable node** is checked by nothing. Case G2: an orphaned `subgraph` node in `root` calls `worker`, whose router routes around `worker`'s own `confirm` straight into a HIGH `issue_refund` that names it in `requires_approval`. Result: zero errors, `load_pack` succeeds, and the only signal is a `graph.node_unreachable` WARNING on a node in a different file. The rule set is inconsistent here: a graph *nobody* calls is treated as an entry and fully checked, while a graph called only from dead code is not checked at all. | Intersect `returns` with reachable call sites before computing `entries`, so a callee whose only call sites are dead becomes an entry again. (Making `graph.node_unreachable` an error would also work but is blunter.) |
+| F4 | should-fix | `support_core/graph/rules.py:673-690` | A loop that re-enters a WRITE/HIGH tool after its confirm validates clean, so one `ActionApproval` authorises unbounded calls. Case E: `confirm_it --yes--> issue_refund --> handoff --resumed--> issue_refund`. `handoff` is a pass-through for both lattices (admitted, item 5) *and* suspends, so `graph.unsuspended_cycle` stays quiet too; the phase-4 hash check will also pass, because the arguments never change. This is phase-0 finding N1 (approvals are not single-use) made reachable from a statically valid graph. | Report a cycle that re-enters a `needs_confirm` tool node without passing its confirm - the CFG and the `covered` map already hold everything needed - and make phase 4's approval single-use. Cross-reference N1 in BACKLOG. |
+| F5 | should-fix | `support_core/graph/expr/parser.py:189`, `MAX_DEPTH` at `parser.py:50` | `postfix` never calls `_descend`, so attribute and filter chains are the one AST shape `MAX_DEPTH = 32` does not bound; they are capped only incidentally by `MAX_TOKENS = 500`, at about 249 links. The recursive walkers then use **749 Python frames** for one such expression (measured), against a 1000-frame limit: `infer` raises `RecursionError` once ~500 frames of caller stack are already in place (measured). The parser docstring's "never raises `RecursionError`" holds today only because `MAX_TOKENS` happens to be 500 and the validator's stack is shallow; raising either limit, or calling from an async server stack, breaks it. | Count `postfix` links against `MAX_DEPTH` too (a 32-link attribute chain is already absurd), or make `walk`/`unparse`/`_infer`/`evaluate` iterative. Add a test that pins the frame cost. |
+| F6 | should-fix | `support_core/graph/expr/syntax.py:139`; `tests/test_expressions.py:309-372` | `unparse` is not a canonical form, so the property the self-critique leans on ("`unparse` is idempotent under re-parsing, which is what makes that comparison trustworthy") is false. `parse("1e311")` unparses to `inf`, which does not re-parse; any string literal containing a non-printable character (`'\x07'`, U+202E, the NUL produced by `'\0'`) unparses to a `\x`/`\u` escape the lexer rejects. The existing hypothesis test misses this because `_SOURCE` draws short strings from `string.printable`, so it essentially never produces a float overflow or a control character inside quotes; adding `st.characters()` and an exponent builder falsified it in seconds. Impact today is bounded - `_canonical_args` applies the same transform to both sides - but two distinct argument texts (`1e400`, `2e400`) do compare equal. | Reject a numeric literal that overflows to `inf` in the lexer, and render string literals with an escape set the lexer accepts (or reject control characters in literals). Widen the property generator and keep the round-trip assertion. |
+| F7 | should-fix | `support_core/graph/rules.py:1051` | `_canonical_args` classifies scalars by different rules than `parse_value`, which is what the engine will actually use. It pushes every string through `parse`, so `{amount: 100}` (a YAML int) and `{amount: "100"}` (a string literal to `parse_value`) canonicalise identically, as do `{note: true}` and `{note: "true"}`. A confirm and a tool node that disagree in exactly that way pass `graph.approval_mismatch` and then fail the phase-4 hash check at run time - the failure 8.2 exists to prevent statically. | Build the canonical form from `parse_value`: `unparse(expression)` when it is an expression, `repr(literal)` otherwise. |
+| F8 | should-fix | `support_core/graph/expr/typecheck.py:251` vs `evaluate.py:141-146` | The evaluator traverses `Mapping`s but the type checker refuses to, so any expression through a dict is a load-time error and the evaluator's mapping support is unreachable dead code. Concretely `ctx.customer.attributes.<anything>` - the CRM record DESIGN 10 says the context carries - can never appear in a graph. | Type a `dict[str, X]` read as `X` (or as unknown) to match the evaluator, or drop mapping traversal from the evaluator so the two walkers agree. Decide before phase 3 writes prompts against `ctx`. |
+| N1 | nit | `support_core/graph/templates.py:90` | `render` documents "Raises :class:`TemplateError`" but catches only `jinja2.TemplateError`. `{% include 'x' %}` raises `TypeError: no loader for this environment specified`; `{{ state.count ** 99999 }}` raises `ValueError: Exceeds the limit (4300 digits)`. Unreachable from a validated pack, but DESIGN 7.3 wants node failures rather than crashes, and phase 2's hot reload may render before validating. | Catch `Exception` and re-raise as `TemplateError`, or state that the contract holds only for validated templates. |
+| N2 | nit | `support_core/graph/templates.py:59` | `TemplateIssue.fatal` is never read: `_Rules.template` reports every issue as ERROR. The field implies a distinction that does not exist. | Delete it, or use it (a template `type` issue against an unresolved pack model is arguably a warning). |
+| N3 | nit | `support_core/graph/rules.py:253` | `graph.subgraph_cycle` fires only when *no* graph in the cycle contains any suspending node anywhere (admitted, item 9). Reproduced: `a` and `b` recurse through each other and `a` has an `ask` on a branch the cycle never takes; zero findings, not even a warning. | Check the cycle path rather than the whole graph, or at least warn. |
+| N4 | nit | `BACKLOG.md:51` | The exit criterion records "343 tests green"; the implementation notes and reality say 344. Same class as phase-0 N7. | Correct the number when closing. |
+| N5 | nit | `support_core/graph/nodes.py:76-86` | `subgraph.inputs` is keyed by the callee's name and `subgraph.outputs` by the caller's, which the implementer asked a reviewer to confirm. It is consistent under "target: source" and the docstrings say so. | No change. Recorded so the question is closed rather than re-litigated in phase 2. |
+
+Severity counts: 2 must-fix, 6 should-fix, 5 nits.
+
+### Sandbox escape attempts
+
+Every input below was run through `parse`, then `unparse`/`walk`, then `infer`, then `evaluate`
+against a real Pydantic state model (`reviews/scratch-phase-1/attack_expr.py`, 135 cases). The
+contract under test: any string yields `ParseError`, `TypeError_` or `EvaluationError` and never
+anything else, and no attribute outside a declared model field is ever reachable. **No input
+falsified either half.** The only unexpected outcomes were the three `unparse` round-trip failures
+of F6.
+
+| Attempt | Result |
+|---------|--------|
+| `state.__class__`, `state.__class__.__mro__`, `state.__class__.__mro__[1].__subclasses__()`, `state.charge.__class__.__init__.__globals__`, `state.charge.__dict__`, `state.__init__`, `state . __class__`, `().__class__`, `ctx.customer.attributes.__class__` | `ParseError` "names starting with '_' are not addressable", raised in the lexer before the parser sees them |
+| `state._private` | `ParseError`, same rule |
+| `state.model_dump`, `state.model_fields`, `state.model_config` | parse; `TypeError_` "State has no field ..." at load time, `EvaluationError` at run time. Reachable only as a *declared* field, and `types.py` rejects a declared field starting with `model_` |
+| `state.model_dump()`, `state.name.upper()` | `ParseError` "calls are not supported" |
+| `getattr(state, '__class__')`, `open('x')`, `eval('1')`, `exec('1')`, `__import__('os')`, `range(10)`, `lipsum`, `cycler`, `self`, `namespace` | `ParseError` "unknown name ...; expressions may only start from ctx, result, state" |
+| `state|attr('__class__')`, `state | unknown_filter` | `ParseError` "unknown filter" |
+| `state.items[0]`, `state.mapping['secret']`, `state.items[0:1]`, `[].append`, `{}.keys` | `ParseError` "unexpected character '['/'{'" |
+| `state.count + 1`, `*`, `**`, `%`, `~`, `lambda: 1`, `1 if 2 else 3` | `ParseError` |
+| `state.mapping.secret` | parses; `TypeError_` at load time (the checker rejects dict traversal, F8), so unreachable from a validated pack |
+| `"(" * 10000 + "1" + ")" * 10000`, `"(" * 100000` | `ParseError` "expression is longer than 2000 characters" |
+| `"not " * 5000`, `"-" * 5000 + "1"`, `"1 or " * 400`, `"1 and " * 400`, `"state" + ".a" * 5000`, `" | default(2)" * 200` | `ParseError` (length) |
+| `"-9" * 500` | `ParseError` "more than 500 tokens" |
+| `"state" + ".a" * 249` (the deepest chain the limits allow) | parses and type-checks; 749 Python frames; `RecursionError` only with ~500 frames of caller padding (F5) |
+| `"9" * 1999` | parses to a 1999-digit int; stays under CPython's 4300-digit conversion limit only because `MAX_LENGTH` is 2000 |
+| `1e999999`, `1e-999999`, `1_000`, `0x41`, `0b1010`, `0o17`, `1j`, `1.2.3`, `1..2` | all `ParseError` except `1e999999`/`1e-999999`, which parse to `inf`/`0.0` (F6) |
+| `'unterminated`, `"unterminated`, `'a\nb'`, `'''triple'''`, `'a' 'b'`, `b"bytes"`, `r'raw'`, `f'{state.charge_id}'` | `ParseError` |
+| `'\x41'`, `'A'`, a dangling backslash | `ParseError` "unknown escape sequence" / "dangling backslash" |
+| `'\0'` (yields a real NUL in the value) | parses; the NUL lives inside a string literal only, and `unparse` then breaks (F6) |
+| Cyrillic `а`/`е`/`ѕ` homoglyphs, fullwidth `ｓ`, small-capital `ᴄ`, zero-width space U+200B, NBSP U+00A0, RTL override U+202E, Greek text | `ParseError` "unexpected character" - the lexer allowlists ASCII identifier characters, so no homoglyph can impersonate `state` |
+| A literal NUL byte before and after an expression | `ParseError` "unexpected character '\x00'" |
+| `# comment`, `-- comment`, `/* c */`, `;drop table x` | `ParseError` |
+| `1 < 2 < 3`, `1 == 2 == 3` | `ParseError` "chained comparisons are not supported" |
+| `state.count > > 1`, `><`, `=`, `!= !=`, `and`, `or or or`, `()`, `(,)`, `state.`, `.state`, `|`, `state |`, `state | len len`, empty string, whitespace only | `ParseError` |
+| `state | default(state.count)` | `ParseError` "filter arguments must be literals" - filter arguments cannot smuggle an expression |
+| `state | default(1, 2)`, `state | money(1)`, `state | default` | `ParseError` on arity |
+| `state.state`, `state.and`, `state.not`, `state.true` | `ParseError` "reserved word ... cannot be an attribute name" |
+| `result` with no result in scope | `TypeError_` / `EvaluationError` "not available here" |
+| 2000 hypothesis examples over an alphabet including `\x00`, `\x0b`, `\x1b`, U+202E and exponent forms | no unexpected exception; falsified only the `unparse` round-trip (F6) |
+
+Templates (`reviews/scratch-phase-1/attack_templates.py`, 57 cases). Every escape is caught twice -
+`convert` rejects it at load time and the sandbox rejects it again at render time:
+
+| Attempt | validate() | render() |
+|---------|-----------|----------|
+| `{{ state.__class__ }}`, `{{ state.__class__.__mro__ }}`, `{{ state['__class__'] }}`, `{{ ''.__class__.__mro__[1].__subclasses__() }}` | issue (`type` / `unsupported`) | `SecurityError` "access to attribute '__class__' ... is unsafe" |
+| `{{ self }}`, `{{ self._TemplateReference__context }}` | `unsupported` | `self` renders as an opaque reference; the private attribute is refused |
+| `{{ lipsum.__globals__ }}`, `{{ cycler }}`, `{{ joiner }}`, `{{ namespace() }}`, `{{ range(10) }}`, `{{ dict() }}`, `{{ config }}`, `{{ request }}` | `unsupported` | "'x' is undefined" - `env.globals` is cleared |
+| `{% for %}`, `{% set %}`, `{% with %}`, `{% block %}`, `{% macro %}`, `{% call %}`, `{% filter %}`, `{% include %}`, `{% import %}`, `{% extends %}`, `{% do %}` | `unsupported` or `syntax_error` for every one | three of them raise a non-`TemplateError` (N1) |
+| `{{ state|attr('__class__') }}`, `{{ x | upper }}`, `{{ x is defined }}`, `{{ x is none }}` | `unsupported` | filters and tests are cleared: "No filter named", "No test named" |
+| `{{ a + b }}`, `{{ a ~ b }}`, `{{ '%s' % a }}`, `{{ a if b else c }}`, `{{ [1,2] }}`, `{{ {'a':1} }}`, `{{ (1,2) }}`, `{{ a.b() }}`, `{{ a['b'] }}` | `unsupported` | n/a |
+| `{{ '{{ state.note }}' }}`, `{% raw %}{{ state }}{% endraw %}` | accepted | braces render as inert text; nothing is re-parsed, so DESIGN principle 7 holds |
+| `{{ state.chrage }}`, `{{ state.charge.nope }}`, `{{ state.note|money }}` | `type` | `StrictUndefined` / `FilterError` |
+
+Hostile packs against the confirm rule (`attack_confirm.py`, `attack_confirm2.py`). "Caught" means
+the pack is rejected by `load_pack`:
+
+| Hostile shape | Result |
+|---------------|--------|
+| A: sub-graph whose `confirm` covers only one router branch | caught, `graph.unconfirmed_write` |
+| B: mutual recursion `a -> b -> a` with the write in `b` | caught, `graph.unconfirmed_write` + `graph.approval_missing` |
+| C: write inside a `gate` redirect graph, caller confirms nothing | caught, both rules - redirect edges really are inlined |
+| D: a `tool` node's `on_error` edge jumping past the confirm onto the write | caught, `graph.unconfirmed_write` |
+| E: loop re-entering the write after the confirm, through a `handoff` | **not caught** (F4) |
+| F: one sub-graph called from a confirmed and an unconfirmed site | caught - context-insensitive returns fail safe |
+| G: write in a graph called only from an unreachable node, no confirm anywhere | caught by `graph.approval_missing` alone; the coverage analysis never visits it |
+| G2: same, but the callee has a `confirm` the tool node can name, and a router around it | **not caught** (F3): zero errors, one unrelated warning |
+| H: `tool` node rewriting `state.charge.amount` between the confirm and the call, identical argument text | **not caught** - the admitted textual-comparison hole, confirmed |
+| I: `issue_refund` declared `risk: read` | **not caught** - the admitted self-declared-tier hole, confirmed |
+| J: WRITE tool with `confirm_exempt: true` | **not caught** by design; INFO `graph.confirm_exempt` only (admitted) |
+| K: confirm's `yes` and `no` branches both reaching the write through a shared sub-graph | caught, `graph.unconfirmed_write` |
+| N: an `ask` between the confirm and the call | caught, `graph.unconfirmed_write` |
+| R: confirm in the caller, tool in the callee, `requires_approval` naming the caller's confirm | "caught", but unsatisfiably so (F1) |
+| T: mutual recursion with an `ask` on an untaken branch | not caught (N3, admitted item 9) |
+| Deep-nested YAML (20k brackets) and an alias bomb in `graphs/*.yaml`, `tools/tools.yaml`, `pack.yaml`, `knowledge/sources.yaml` | all become findings (`graph.invalid_yaml`, `tools.manifest_invalid`, `manifest.invalid`, `knowledge.sources_invalid`); no exception escapes `validate_pack` or `load_pack_report` |
+
+### Exit criterion
+
+Both halves hold, with the F2 caveat.
+
+- **Stepper.** `tests/test_stepper.py` runs `tests/packs/deterministic_pack` (only `router`, `say`,
+  `subgraph`, `end`) and asserts the exact seven-visit path across two graphs, the rendered
+  messages, the sub-graph outputs landing in the caller's state, byte-identical repeat runs, the
+  router dead-end, the step limit, and `NotExecutableError` naming the phase. Real behavioural
+  assertions, not restatements of the implementation.
+- **Validator.** 38 tests in `tests/test_graph_validator.py`, each a minimal delta from a
+  known-good fixture, asserting a specific rule id. Every ERROR-severity rule id in the source is
+  asserted somewhere except `graph.end_output_unknown` and `graph.end_output_missing` (F2).
+- **Quarantine.** `pyproject.toml` ships `packages = ["support_core"]` only, nothing under
+  `support_core/` imports `tests.stepper`, and the module docstring lists what phase 2 must add.
+  Genuinely a test utility, not a second executor.
+
+### Design conformance
+
+- **6.2 node vocabulary, row by row.** All ten types are registered with the table's
+  `chooses_edge` and `suspends` values, including `tool` suspending only for a declared `async`
+  tool and `subgraph` being transparent. The one gap is the sentence after the table: custom node
+  types registered by name in the pack are impossible because `NODE_TYPES` is a closed dict
+  (admitted; phase 4 owns pack imports).
+- **6.4, field by field.** I extracted the `refund.yaml` block from DESIGN.md verbatim (lines 244
+  to 359), dropped it into a pack unchanged and validated it: **0 errors**, 7 warnings, all
+  advisory (`Charge` unresolved until phase 4, `charge_hint` not in `state`, four `str | None`
+  into `str` notes, no router `default`). Bare `yes:`/`no:` confirm edges, the mixed
+  `into: { eligible: result.eligible }` and `into: { outcome: "refunded" }` forms,
+  `requires_approval`, `knowledge: { query, k }` and `edges: { resumed: ..., closed: ... }` all
+  load as written. That is the strongest conformance evidence available and it passes.
+- **Deviations.** `router.default` (addition; improves determinism, warned when absent);
+  `say.message` and `subgraph.graph/inputs/outputs/next` key names (DESIGN gives none);
+  `graph.node_unreachable` and the approval trio (additions derived from 8.2); the flat
+  `graphs/<id>.yaml` layout enforced by `graph.id_mismatch`; `ConversationContext` invented so
+  `ctx` is type-checkable. All are documented in the plan and none contradicts the document. The
+  literal-versus-expression rule is a language decision DESIGN.md does not make; the choice
+  ("starts with a root, or it is an error if it merely looks like one") is the safe direction.
+- **5.2.** Every listed check exists as a named rule. Two are weaker than the prose: "no graph is
+  reachable from itself without passing through a suspending node" is exact per-graph but only
+  coarse cross-graph (N3), and the confirm rule's reachability frontier has the F3 hole.
+- **8.2.** The risk table is transcribed once, in `tools/risk.py`; `MODEL_CALLABLE` blocks
+  WRITE/HIGH from `llm` tool loops; `needs_confirm` correctly refuses to honour `confirm_exempt`
+  for HIGH. Good.
+
+### Forward compatibility
+
+- **Phase 2 (executor, checkpoints, frame stack).** The seams are clean: `NODE_TYPES` carries
+  `suspends`/`chooses_edge`, `Graph` carries built Pydantic models, `parse_value` is the single
+  literal-versus-expression decision, `PackPin` is ready. Concrete problems: (a) DESIGN 6.3's
+  `NodeResult`/`Node` protocol does not exist, so phase 2 writes it from scratch and the node
+  *config* models in `nodes.py` will need to sit beside *behaviour* classes - decide now whether
+  `NodeTypeSpec` grows a `runner` field or a parallel registry appears; (b) "an input lands in the
+  state field of the same name" is enforced only as a warning yet is baked into both the stepper
+  and `graph.input_not_in_state`, so overruling it changes both; (c) `ENVIRONMENT` is a
+  process-wide Jinja environment and must become per-pack the moment a pack supplies a filter or
+  two pack versions are loaded side by side (6.7); (d) `load_pack` reads and parses every graph
+  twice, so `PackPin` can hash a different byte sequence than it parsed if the directory changes
+  underneath - snapshot once. (c) and (d) are admitted.
+- **Phase 4 (real registry, gate and confirm execution).** `ToolManifest`/`ToolSpec` is a good
+  shape to swap out. Concrete problems: (a) F1 must be fixed before any pack can put a write
+  behind a sub-graph; (b) `needs_confirm` lives on `ToolSpec`, in the file phase 4 replaces - move
+  the policy next to `Risk` so it is not reimplemented; (c) the validator must compare the imported
+  `TOOLS` with `tools/tools.yaml` and report drift, or hostile case I (a HIGH tool declared `read`)
+  survives into production; (d) the approval hash the engine computes must be built from the same
+  `parse_value` classification the validator uses, or F7's collisions become run-time refusals.
+- **Phase 6 (interrupts).** The CFG models neither the interrupt push nor the return-and-resume of
+  DESIGN 6.6, so an approval given before an interrupt is assumed to survive it (admitted, item 4).
+  With F4 that is now two ways an approval outlives the customer turn it was given in. Phase 6 must
+  revisit `covered_out`, not only the engine.
+
+### Test quality
+
+Sampled `test_graph_validator.py` (38 tests), `test_expressions.py` (19), `test_templates.py` (9),
+`test_loader.py` (11), `test_graph_types.py` (9), `test_pack_validate.py` (22). They assert
+behaviour, not implementation: the validator tests mutate one exact substring of a known-good
+fixture so each case shows only its own defect, and the accepted/rejected expression tables assert
+canonical output and error fragments rather than internal structure. `pytest -q` three times:
+`344 passed` each time, no ordering dependence; a four-file subset in isolation: `200 passed`.
+Weaknesses: the confirm analysis has nine behavioural tests but none for gate-redirect inlining,
+the `on_error` shape or the loop of F4 (I exercised all three by hand; only the loop is broken);
+the parser property test's generator is too narrow to explore the space it claims to (F6) - I
+falsified its round-trip property in 2000 examples with a two-line change to the strategy; and
+there is no property or differential test for the dataflow, which the implementer identified as the
+test they would write first. I wrote that test in scratch (400 random graphs, the dataflow versus
+an independently written product-automaton reachability) and it found **zero mismatches**, which is
+real evidence the intra-graph analysis is correct. It belongs in the suite.
+
+### The every-phase rule
+
+Holds. `grep` over `support_core/` finds no `eval`, `exec`, `compile`, `ast`, `importlib`,
+`subprocess`, `pickle` or `os.system`, and no code path that invokes a tool. The stepper raises
+`NotExecutableError` for `tool`, `confirm`, `gate`, `llm`, `ask` and `handoff` before doing
+anything, and a test pins the message. Statically, the rules that make phase-4 enforcement possible
+are present, and importantly `graph.approval_missing` fires on **every** WRITE/HIGH tool node
+independently of the dataflow - that is what caught hostile case G when the coverage analysis did
+not, and it is the right belt-and-braces design. F1 is the one place where those static rules are
+currently self-contradictory.
+
+### Missed by self-critique
+
+The self-critique is unusually good: items 1 (textual approval comparison), 2 (`confirm_exempt`),
+3 (self-declared risk tiers), 4 (context insensitivity, interrupts), 5 (`handoff` does not clear
+approvals), 6 (unreachable code unanalysed) and 9 (coarse `subgraph_cycle`) all reproduce exactly
+as described. What it missed:
+
+1. `requires_approval` cannot name a confirm in another graph, which makes a write inside a
+   sub-graph unvalidatable and contradicts the interprocedural analysis the same file implements
+   (F1). Its own passing test encodes the contradiction.
+2. Item 6 is worse than "a warning-only finding is load-bearing": given a same-graph confirm to
+   name, the WRITE tool produces **no finding at all** except a warning about a different node in a
+   different file (F3), and the entry rules are inconsistent about which uncalled graphs get
+   checked.
+3. Item 5 combined with a loop means one approval authorises unbounded calls, and neither the
+   validator nor the phase-4 hash check will see it (F4).
+4. `MAX_DEPTH` does not bound attribute and filter chains at all; the recursion safety of the
+   walkers rests on `MAX_TOKENS` versus CPython's frame limit, with about 250 frames of headroom
+   (F5).
+5. The `unparse` round-trip property the approval comparison is said to rest on is false, and the
+   property test's generator cannot find the counterexamples (F6).
+6. `_canonical_args` does not use `parse_value`, so it compares scalars by different rules than the
+   engine will evaluate them (F7).
+7. The evaluator and the type checker disagree about mapping traversal, which makes
+   `ctx.customer.attributes` - DESIGN 10's CRM record - unreadable from any graph (F8).
+8. `render` violates its documented exception contract (N1) and `TemplateIssue.fatal` is dead (N2).
+9. BACKLOG's exit criterion says 343 tests where the notes and reality say 344 (N4) - the same
+   bookkeeping slip as phase-0 N7.
+
+### Commands run and results
+
+All from the repository root with `.venv/Scripts/python.exe`, Windows 11, Docker container
+`customer-support-agent-db-1` healthy, database `support_test`.
+
+| Command | Result |
+|---------|--------|
+| `python -m ruff check .` | `All checks passed!` (exit 0) |
+| `python -m ruff format --check .` | `58 files already formatted` (exit 0) |
+| `python -m mypy` | `Success: no issues found in 58 source files` (exit 0) |
+| `python -m pytest -q` (run 1) | `344 passed in 7.26s` |
+| `python -m pytest -q` (run 2) | `344 passed in 11.35s` |
+| `python -m pytest -q` (run 3) | `344 passed in 9.98s` |
+| `python -m pytest -q -p no:cacheprovider tests/test_graph_validator.py tests/test_expressions.py tests/test_stepper.py tests/test_loader.py` | `200 passed` (no cross-file ordering dependence) |
+| `support pack validate packs/acme_billing` | `INFO pack.empty`, then `acme-billing: empty but well-formed`, exit 0 |
+| `support pack validate tests/packs/refund_pack` | `refund-pack: well-formed (5 warning(s))`, exit 0 |
+| `support pack validate --strict tests/packs/refund_pack` | exit 1 (warnings fail strict; every finding still printed) |
+| `python -m alembic upgrade head && python -m alembic check` | `No new upgrade operations detected.` |
+| `attack_expr.py` (135 adversarial expressions) | 0 unexpected exception types; 3 `unparse` round-trip failures (F6) |
+| `falsify_roundtrip.py` (2000 hypothesis examples, wider alphabet) | round-trip property falsified by `1e311` and `'\x07'`; still no unexpected exception (F6) |
+| deep attribute chain probe (`state` + `.a` * 249) | parses and type-checks; peak 749 Python frames; `RecursionError` at ~500 frames of caller padding (F5) |
+| `attack_templates.py` (57 templates) | every escape rejected at load and at render; 3 non-`TemplateError` render exceptions (N1) |
+| `attack_confirm.py` / `attack_confirm2.py` (16 hostile packs) | 11 caught, 5 accepted (E, G2, H, I, J) as tabulated above |
+| `differential_confirm.py` (400 random graphs: dataflow vs product-automaton reachability) | `400 random graphs compared, 0 mismatches` |
+| DESIGN.md 6.4 `refund.yaml` extracted verbatim into a pack and validated | 0 errors, 7 warnings, 7 infos |
+| YAML deep-nest and alias bomb in each of `graphs/`, `tools/tools.yaml`, `pack.yaml`, `knowledge/sources.yaml` | all reported as findings; no exception escapes `validate_pack` or `load_pack_report` |
+| `grep` for `eval(`, `exec(`, `compile(`, `ast`, `importlib`, `subprocess`, `pickle`, `os.system` under `support_core/` | no hits (one `def pack_eval` CLI stub that exits 3) |
+| rule-id cross-check script (source vs `tests/`) | 5 listed ids with no test assertion (F2) |
+
+Scratch files were created under `reviews/scratch-phase-1/` and deleted. No source, test or config
+file was modified; the only repository changes are this section and the Phase 1 status cell in
+BACKLOG.md, set to `in-review`. Nothing was committed. The database was left at `0001 (head)`.
