@@ -1,0 +1,16 @@
+# Knowledge sources for the Acme Billing pack (DESIGN.md section 9.1).
+# Empty until phase 5. The shape each section takes:
+#
+# documents:
+#   - id: policy-docs
+#     type: markdown_dir
+#     path: ./docs/policies
+# knowledge_graph:
+#   - id: products
+#     type: yaml
+#     path: ./kg/products.yaml
+# live_lookups:
+#   - tool: get_plan_details
+documents: []
+knowledge_graph: []
+live_lookups: []
