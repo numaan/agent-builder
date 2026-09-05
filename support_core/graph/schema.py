@@ -316,29 +316,43 @@ def _declaration_findings(kind: str, built: BuiltModel, *, file: str) -> list[Fi
 
 
 def read_graphs(
-    pack_path: Path, graph_files: Iterable[str]
+    pack_path: Path,
+    graph_files: Iterable[str],
+    *,
+    sources: dict[str, str] | None = None,
 ) -> tuple[dict[str, Graph], list[Finding]]:
     """Read and parse every graph file of a pack.
 
     Returns the graphs by id plus the findings raised while parsing them. A file that cannot be
     read or parsed contributes findings and no graph; two files declaring the same id keep the
     first and report the second, so later rules see a consistent set.
+
+    ``sources`` is a snapshot of file text keyed by the pack-relative path. A file already in
+    it is parsed from the snapshot rather than re-read; a file read here is added to it. That
+    is what stops a pack edited on disk between two reads producing a
+    :class:`~support_core.graph.pack.PackPin` whose hashes describe a mix of two versions
+    (phase-1 deferred finding P1): the validator fills the snapshot and the loader parses the
+    same bytes it hashes.
     """
     graphs: dict[str, Graph] = {}
     findings: list[Finding] = []
     for rel in graph_files:
-        try:
-            text = (pack_path / rel).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            findings.append(
-                Finding(
-                    severity=Severity.ERROR,
-                    rule="graph.unreadable",
-                    message=f"cannot be read as UTF-8 text: {exc}",
-                    location=rel,
+        text = sources.get(rel) if sources is not None else None
+        if text is None:
+            try:
+                text = (pack_path / rel).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                findings.append(
+                    Finding(
+                        severity=Severity.ERROR,
+                        rule="graph.unreadable",
+                        message=f"cannot be read as UTF-8 text: {exc}",
+                        location=rel,
+                    )
                 )
-            )
-            continue
+                continue
+            if sources is not None:
+                sources[rel] = text
         graph, graph_findings = parse_graph(text, file=rel)
         findings.extend(graph_findings)
         if graph is None:

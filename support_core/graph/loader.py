@@ -46,15 +46,19 @@ def load_pack_report(path: Path | str) -> tuple[Pack | None, ValidationReport]:
     to produce the report, and once here to build the object. Parsing a pack is a handful of
     small YAML files at startup, and the alternative - threading parsed graphs out through
     ``ValidationReport``, which is a serialisable Pydantic model - would put non-serialisable
-    objects into the CLI's report type. Phase 2 can revisit it if pack loading ever appears in a
-    profile.
+    objects into the CLI's report type.
+
+    They are *read* only once, though: ``validate_pack`` records the text of every graph file
+    on ``report.graph_sources`` and the second parse works from that snapshot. A pack edited on
+    disk between the two parses can therefore no longer produce a ``PackPin`` whose hashes
+    describe a mix of two versions (phase-1 deferred finding P1).
     """
     pack_path = Path(path)
     report = validate_pack(pack_path)
     if not report.ok or report.manifest is None:
         return None, report
 
-    graphs, findings = read_graphs(pack_path, report.graph_files)
+    graphs, findings = read_graphs(pack_path, report.graph_files, sources=report.graph_sources)
     if any(finding.severity is Severity.ERROR for finding in findings):  # pragma: no cover
         # validate_pack already reported these; reaching here would mean the two disagree.
         report.findings.extend(findings)

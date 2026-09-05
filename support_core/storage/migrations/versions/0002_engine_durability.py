@@ -56,9 +56,7 @@ def upgrade() -> None:
     op.create_unique_constraint("uq_trace_step_run_seq", "trace_step", ["run_id", "seq"])
 
     op.add_column("run", sa.Column("pack_fingerprint", sa.Text(), nullable=True))
-    op.add_column(
-        "run", sa.Column("turn_nodes", sa.Integer(), nullable=False, server_default="0")
-    )
+    op.add_column("run", sa.Column("turn_nodes", sa.Integer(), nullable=False, server_default="0"))
     op.add_column("run", sa.Column("suspended_at", _TS, nullable=True))
     op.add_column("run", sa.Column("timeout_at", _TS, nullable=True))
     op.add_column("run", sa.Column("awaiting", postgresql.JSONB(), nullable=True))

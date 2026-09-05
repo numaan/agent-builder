@@ -15,13 +15,15 @@ later; nothing here has run-time behaviour.
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from jinja2.sandbox import SandboxedEnvironment
 from pydantic import BaseModel, ConfigDict
 
 from support_core.graph.manifest import PackManifest
 from support_core.graph.schema import Graph
+from support_core.graph.templates import make_environment
 from support_core.graph.tools_manifest import ToolManifest
 
 
@@ -126,6 +128,13 @@ class Pack:
     graphs: dict[str, Graph]
     tools: ToolManifest
     pin: PackPin
+    environment: SandboxedEnvironment = field(default_factory=make_environment)
+    """This pack's own sandboxed Jinja environment.
+
+    A Jinja environment carries a template cache and a filter table. While nothing varies per
+    pack the sharing is harmless, but DESIGN.md section 6.7 keeps two pack versions loaded side
+    by side and a pack may one day supply a filter, so each pack gets its own from the start
+    (phase-1 deferred finding P2). The engine renders every message through it."""
 
     @property
     def id(self) -> str:

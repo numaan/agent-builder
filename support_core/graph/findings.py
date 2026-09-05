@@ -47,6 +47,13 @@ class ValidationReport(BaseModel):
     pack_path: Path
     manifest: PackManifest | None = None
     graph_files: list[str] = Field(default_factory=list)
+    graph_sources: dict[str, str] = Field(default_factory=dict, repr=False)
+    """The text of each graph file as it was read, keyed by the path in ``graph_files``.
+
+    :func:`support_core.graph.loader.load_pack` parses this snapshot instead of reading the
+    files a second time, so the ``PackPin`` it builds hashes the bytes that were actually
+    parsed even if the directory changes underneath (phase-1 deferred finding P1)."""
+
     findings: list[Finding] = Field(default_factory=list)
 
     @property

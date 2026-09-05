@@ -84,9 +84,16 @@ def _wrap(call: Any) -> Any:
 
 
 ENVIRONMENT = make_environment()
+"""The fallback environment for callers that have no pack in hand.
+
+It is *not* shared by loaded packs: :class:`~support_core.graph.pack.Pack` builds its own with
+:func:`make_environment` and the engine renders through that one, because a Jinja environment
+carries a template cache and a filter table, and two pack versions loaded side by side
+(DESIGN.md section 6.7) must not share either (phase-1 deferred finding P2).
+"""
 
 
-def render(source: str, scope: dict[str, Any]) -> str:
+def render(source: str, scope: dict[str, Any], *, env: SandboxedEnvironment | None = None) -> str:
     """Render ``source`` with the roots in ``scope``. Raises :class:`TemplateError`, only.
 
     Jinja does not keep every failure inside its own exception hierarchy: ``{% include %}``
@@ -97,7 +104,7 @@ def render(source: str, scope: dict[str, Any]) -> str:
     (phase-1 review nit N1). ``BaseException`` is deliberately not caught.
     """
     try:
-        template = ENVIRONMENT.from_string(source)
+        template = (env or ENVIRONMENT).from_string(source)
         return template.render(**scope)
     except TemplateError:
         raise
@@ -105,16 +112,20 @@ def render(source: str, scope: dict[str, Any]) -> str:
         raise TemplateError(f"{type(exc).__name__}: {exc}") from exc
 
 
-def validate(source: str, env: TypeEnv) -> tuple[list[TemplateIssue], list[TypeNote]]:
+def validate(
+    source: str, env: TypeEnv, *, jinja_env: SandboxedEnvironment | None = None
+) -> tuple[list[TemplateIssue], list[TypeNote]]:
     """Parse ``source``, reject anything outside the allowed subset, and type-check it.
 
     Returns ``(issues, notes)``. Every issue is a validator error; notes become warnings (an
-    attribute read through an optional value, for example).
+    attribute read through an optional value, for example). ``jinja_env`` is the environment
+    to parse in; the validator passes one it made for this pack so no state is shared between
+    packs (phase-1 deferred finding P2).
     """
     issues: list[TemplateIssue] = []
     notes: list[TypeNote] = []
     try:
-        tree = ENVIRONMENT.parse(source)
+        tree = (jinja_env or ENVIRONMENT).parse(source)
     except jinja2.TemplateSyntaxError as exc:
         return [TemplateIssue(code="syntax_error", message=str(exc), line=exc.lineno or 0)], notes
 

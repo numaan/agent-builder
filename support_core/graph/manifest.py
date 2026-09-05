@@ -71,6 +71,71 @@ class LimitsConfig(BaseModel):
     max_llm_cost_per_conversation_usd: float = Field(default=2.0, ge=0)
 
 
+SuspendStatus = Literal["waiting_customer", "waiting_human", "waiting_async_tool", "waiting_timer"]
+"""The four statuses a run can suspend into (DESIGN.md section 7.2)."""
+
+TimeoutAction = Literal["none", "close", "handoff"]
+"""What the engine does when a suspension times out.
+
+``close`` closes the conversation, ``handoff`` calls the handoff hook and leaves the run
+waiting for a human, ``none`` leaves it waiting. DESIGN.md section 7.2: "A ``waiting_customer``
+timeout in web chat closes the conversation; in email it does nothing for days."
+"""
+
+
+class TimeoutRule(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    seconds: int | None = Field(default=None, ge=1)
+    """``None`` means the run waits indefinitely."""
+
+    action: TimeoutAction = "none"
+
+
+class ChannelTimeouts(BaseModel):
+    """Per-channel overrides; an unset status falls back to the pack-level rule."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    waiting_customer: TimeoutRule | None = None
+    waiting_human: TimeoutRule | None = None
+    waiting_async_tool: TimeoutRule | None = None
+    waiting_timer: TimeoutRule | None = None
+
+
+class TimeoutsConfig(BaseModel):
+    """Per-status suspension timeouts (DESIGN.md section 7.2).
+
+    Section 5.1's example manifest has no block for these and section 7.2 requires them to be
+    "per status and configurable per pack", so this is an addition to the manifest schema
+    (recorded in reviews/phase-2.md). The defaults never time anything out except a long-running
+    async tool: closing a customer's conversation is a product decision a pack must make
+    explicitly, not something a default should do behind the author's back.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    waiting_customer: TimeoutRule = Field(default_factory=TimeoutRule)
+    waiting_human: TimeoutRule = Field(default_factory=TimeoutRule)
+    waiting_async_tool: TimeoutRule = Field(
+        default_factory=lambda: TimeoutRule(seconds=900, action="handoff")
+    )
+    waiting_timer: TimeoutRule = Field(default_factory=TimeoutRule)
+    channels: dict[Channel, ChannelTimeouts] = Field(default_factory=dict)
+
+    def rule(self, status: SuspendStatus, channel: Channel | None = None) -> TimeoutRule:
+        """The rule for ``status`` on ``channel``: the channel override, else the pack rule."""
+        override = self.channels.get(channel) if channel is not None else None
+        if override is not None:
+            specific = getattr(override, status)
+            if specific is not None:
+                assert isinstance(specific, TimeoutRule)
+                return specific
+        rule = getattr(self, status)
+        assert isinstance(rule, TimeoutRule)
+        return rule
+
+
 class PackManifest(BaseModel):
     """Parsed ``pack.yaml``. Unknown keys are rejected."""
 
@@ -88,6 +153,7 @@ class PackManifest(BaseModel):
     interrupts: InterruptConfig = Field(default_factory=InterruptConfig)
     handoff: HandoffConfig
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
+    timeouts: TimeoutsConfig = Field(default_factory=TimeoutsConfig)
 
     @field_validator("version")
     @classmethod

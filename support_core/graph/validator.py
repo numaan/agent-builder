@@ -151,12 +151,20 @@ def validate_pack(pack_path: Path) -> ValidationReport:
     findings.extend(_check_tools_module(pack_path))
     findings.extend(_check_knowledge_sources(pack_path))
     findings.extend(_check_policies(pack_path))
-    findings.extend(validate_graphs(pack_path, report.manifest, report.graph_files))
+    findings.extend(
+        validate_graphs(
+            pack_path, report.manifest, report.graph_files, sources=report.graph_sources
+        )
+    )
     return report
 
 
 def validate_graphs(
-    pack_path: Path, manifest: PackManifest | None, graph_files: Iterable[str]
+    pack_path: Path,
+    manifest: PackManifest | None,
+    graph_files: Iterable[str],
+    *,
+    sources: dict[str, str] | None = None,
 ) -> list[Finding]:
     """Every graph rule in DESIGN.md section 5.2.
 
@@ -164,7 +172,8 @@ def validate_graphs(
     set, plus the pack's declared tools, to :func:`support_core.graph.rules.validate_graph_set`.
     Parsing and rule-checking are separate so one broken file does not hide the problems in the
     others: a file that cannot be parsed contributes its own finding and the remaining graphs are
-    still validated.
+    still validated. ``sources`` collects the text of every file read, so the loader can parse
+    exactly the bytes the validator saw (phase-1 deferred finding P1).
     """
     files = list(graph_files)
     findings: list[Finding] = []
@@ -182,7 +191,7 @@ def validate_graphs(
         )
     if not files:
         return findings
-    graphs, parse_findings = read_graphs(pack_path, files)
+    graphs, parse_findings = read_graphs(pack_path, files, sources=sources)
     findings.extend(parse_findings)
     findings.extend(validate_graph_set(graphs, tools, manifest))
     return findings

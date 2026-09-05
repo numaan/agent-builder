@@ -50,6 +50,7 @@ from support_core.graph.nodes import (
     graph_references,
 )
 from support_core.graph.schema import Graph, ValueLooksLikeExpression, parse_value
+from support_core.graph.templates import make_environment
 from support_core.graph.templates import validate as validate_template
 from support_core.graph.tools_manifest import ToolManifest, ToolSpec
 from support_core.graph.types import build_model
@@ -93,6 +94,9 @@ class _Rules:
         self.tools = tools
         self.manifest = manifest
         self.findings: list[Finding] = []
+        self.jinja = make_environment()
+        """This validation run's own Jinja environment: template caches and filter tables are
+        never shared between packs (phase-1 deferred finding P2)."""
 
     # -- reporting -----------------------------------------------------------------------
 
@@ -1065,7 +1069,7 @@ class _Rules:
             )
 
     def template(self, graph: Graph, node_id: str, source: str, *, field: str) -> None:
-        issues, notes = validate_template(source, self.state_env(graph))
+        issues, notes = validate_template(source, self.state_env(graph), jinja_env=self.jinja)
         for issue in issues:
             self.error(
                 f"template.{issue.code}",
