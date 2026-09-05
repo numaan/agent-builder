@@ -274,14 +274,15 @@ def test_policies_length_warning(pack_copy: Path) -> None:
     assert lenient.exit_code == EXIT_OK
 
 
-def test_graph_files_hit_the_phase_1_hook(pack_copy: Path) -> None:
+def test_graph_files_are_validated(pack_copy: Path) -> None:
+    """Phase 0 only counted graph files here; phase 1 runs the DESIGN.md 5.2 rules on them."""
     (pack_copy / "graphs" / "root.yaml").write_text("id: root\n", encoding="utf-8")
     report = validate_pack(pack_copy)
-    assert report.ok
+    assert not report.ok
     assert not report.empty
     assert report.graph_files == ["graphs/root.yaml"]
-    assert "graph.not_validated" in {f.rule for f in report.warnings}
-    assert report.summary() == "acme-billing: well-formed (1 warning(s))"
+    assert "graph.invalid" in {f.rule for f in report.errors}
+    assert "graph.not_validated" not in {f.rule for f in report.findings}
 
 
 def test_directory_with_graph_suffix_is_reported(pack_copy: Path) -> None:

@@ -1,29 +1,47 @@
-"""Pack validation. Implements DESIGN.md section 5.2 (the layout half; graph rules are phase 1).
+"""Pack validation. Implements DESIGN.md section 5.2.
 
 ``validate_pack`` never raises for a bad pack: it returns a :class:`ValidationReport` whose
-findings the CLI prints and whose ``ok`` flag decides the exit code. ``load_pack`` (phase 1)
-will call the same function and refuse to start on any error finding.
+findings the CLI prints and whose ``ok`` flag decides the exit code.
+:func:`support_core.graph.loader.load_pack` calls the same function and refuses to start on any
+error finding.
 
-Phase 1 hook: :func:`validate_graphs`. It receives the manifest and the graph files and must
-implement every rule listed in section 5.2. Until then it only reports that graphs were seen.
+Phase 0 implemented the layout and manifest half. Phase 1 filled in :func:`validate_graphs`,
+which parses every graph file (:mod:`support_core.graph.schema`) and runs every graph rule in
+section 5.2 (:mod:`support_core.graph.rules`). :class:`Severity`, :class:`Finding` and
+:class:`ValidationReport` moved to :mod:`support_core.graph.findings` to break an import cycle
+and are re-exported here, which is where the CLI and the tests import them from.
 """
 
 import re
 from collections.abc import Iterable
-from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
 
 from support_core import __version__
+from support_core.graph.findings import Finding, Severity, ValidationReport
 from support_core.graph.manifest import (
     ManifestError,
     ManifestUnreadableError,
     PackManifest,
     load_manifest,
 )
+from support_core.graph.rules import validate_graph_set
+from support_core.graph.schema import read_graphs
+from support_core.graph.tools_manifest import (
+    ToolManifest,
+    ToolManifestError,
+    load_tool_manifest,
+)
+
+__all__ = [
+    "Finding",
+    "Severity",
+    "ValidationReport",
+    "validate_graphs",
+    "validate_pack",
+]
 
 REQUIRED_FILES: tuple[str, ...] = (
     "pack.yaml",
@@ -47,58 +65,6 @@ POLICIES_MAX_LINES = 40
 """Section 5: policies.md is 'short hard rules injected into every prompt (max ~40 lines)'."""
 TOOLS_EXPORT = re.compile(r"^TOOLS\s*(?::|=)")
 """A module-level ``TOOLS = ...`` or ``TOOLS: list[...] = ...`` line (section 8.3)."""
-
-
-class Severity(StrEnum):
-    ERROR = "error"
-    WARNING = "warning"
-    INFO = "info"
-
-
-class Finding(BaseModel):
-    severity: Severity
-    rule: str
-    """Stable dotted identifier, for example ``layout.missing_file``; tests assert on these."""
-    message: str
-    location: str | None = None
-    """File (and later node) the finding points at, relative to the pack directory."""
-
-    def render(self) -> str:
-        where = f" [{self.location}]" if self.location else ""
-        return f"{self.severity.value.upper():7} {self.rule}{where}: {self.message}"
-
-
-class ValidationReport(BaseModel):
-    pack_path: Path
-    manifest: PackManifest | None = None
-    graph_files: list[str] = Field(default_factory=list)
-    findings: list[Finding] = Field(default_factory=list)
-
-    @property
-    def errors(self) -> list[Finding]:
-        return [f for f in self.findings if f.severity is Severity.ERROR]
-
-    @property
-    def warnings(self) -> list[Finding]:
-        return [f for f in self.findings if f.severity is Severity.WARNING]
-
-    @property
-    def ok(self) -> bool:
-        return not self.errors
-
-    @property
-    def empty(self) -> bool:
-        """A pack with no graphs has nothing to run yet, but may still be well-formed."""
-        return not self.graph_files
-
-    def summary(self) -> str:
-        name = self.manifest.id if self.manifest else self.pack_path.name
-        if not self.ok:
-            n = len(self.errors)
-            return f"{name}: {n} error{'s' if n != 1 else ''}; pack is not valid"
-        shape = "empty but well-formed" if self.empty else "well-formed"
-        extra = f" ({len(self.warnings)} warning(s))" if self.warnings else ""
-        return f"{name}: {shape}{extra}"
 
 
 def validate_pack(pack_path: Path) -> ValidationReport:
@@ -192,25 +158,34 @@ def validate_pack(pack_path: Path) -> ValidationReport:
 def validate_graphs(
     pack_path: Path, manifest: PackManifest | None, graph_files: Iterable[str]
 ) -> list[Finding]:
-    """Phase 1 hook for the graph rules in DESIGN.md section 5.2.
+    """Every graph rule in DESIGN.md section 5.2.
 
-    Phase 1 replaces this body with the real loader and validator (edge targets exist, one
-    ``start`` and at least one ``end``, tool references, gate redirects, confirm-on-all-paths,
-    sub-graph mapping types, no un-suspended cycles). Phase 0 only makes graphs visible in the
-    report so nobody mistakes "no findings" for "validated".
+    Parses each graph file into a :class:`~support_core.graph.schema.Graph` and hands the whole
+    set, plus the pack's declared tools, to :func:`support_core.graph.rules.validate_graph_set`.
+    Parsing and rule-checking are separate so one broken file does not hide the problems in the
+    others: a file that cannot be parsed contributes its own finding and the remaining graphs are
+    still validated.
     """
     files = list(graph_files)
-    if not files:
-        return []
-    return [
-        Finding(
-            severity=Severity.WARNING,
-            rule="graph.not_validated",
-            message=f"{len(files)} graph file(s) found but graph validation is not implemented yet "
-            "(phase 1)",
-            location=", ".join(files),
+    findings: list[Finding] = []
+    try:
+        tools = load_tool_manifest(pack_path)
+    except ToolManifestError as exc:
+        tools = ToolManifest()
+        findings.append(
+            Finding(
+                severity=Severity.ERROR,
+                rule="tools.manifest_invalid",
+                message=str(exc),
+                location="tools/tools.yaml",
+            )
         )
-    ]
+    if not files:
+        return findings
+    graphs, parse_findings = read_graphs(pack_path, files)
+    findings.extend(parse_findings)
+    findings.extend(validate_graph_set(graphs, tools, manifest))
+    return findings
 
 
 def _read_utf8(pack_path: Path, rel: str, rule: str) -> tuple[str | None, list[Finding]]:
