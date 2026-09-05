@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # The repository branch is `master`; `main` is listed so a later rename does not silently
+    # turn CI off again. Feature branches are covered by `pull_request`, so `push` is not
+    # widened to every branch (that would run each PR twice).
+    branches: [main, master]
   pull_request:
 
 jobs:
@@ -54,6 +57,9 @@ jobs:
 
       - name: Pytest
         run: python -m pytest -v
+
+      - name: Alembic check (models and migrations agree)
+        run: python -m alembic upgrade head && python -m alembic check
 
       - name: Pack validate (phase 0 exit criterion)
         run: support pack validate packs/acme_billing
