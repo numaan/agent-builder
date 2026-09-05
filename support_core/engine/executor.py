@@ -263,6 +263,30 @@ class Executor:
             conversation_id, ResumeEvent(kind="timer"), expected="waiting_timer"
         )
 
+    async def recover_stalled(
+        self, older_than: timedelta = timedelta(minutes=5), limit: int = 100
+    ) -> list[TurnOutcome]:
+        """Re-enter turns whose process died (DESIGN.md section 7.3, "engine crash mid-node").
+
+        A crashed turn leaves the run ``running`` and its advisory lock released. The next
+        message, resume or :meth:`drain` picks it up - but a conversation nobody touches again
+        would sit there for ever, and its pending queue with it, because a run that is not
+        suspended has no ``timeout_at`` for :meth:`sweep_timeouts` to find. A scheduler calls
+        this; ``older_than`` keeps it away from turns that are merely slow.
+        """
+        cutoff = self.hooks.clock() - older_than
+        async with self.sessions() as session, session.begin():
+            stalled = [_snapshot(run) for run in await repo.stalled_runs(session, cutoff, limit)]
+        outcomes: list[TurnOutcome] = []
+        for run in stalled:
+            async with conversation_lock(
+                self.engine, run.conversation_id, wait_seconds=0
+            ) as acquired:
+                if not acquired:
+                    continue  # somebody is working on it after all
+                outcomes.append(await self._drain(run.conversation_id))
+        return outcomes
+
     async def sweep_timeouts(self, now: datetime | None = None) -> list[TurnOutcome]:
         """Apply expired per-status timeouts (DESIGN.md section 7.2).
 

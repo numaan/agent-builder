@@ -305,6 +305,17 @@ async def step_exists(session: AsyncSession, step_id: str) -> bool:
     return result.first() is not None
 
 
+async def stalled_runs(session: AsyncSession, cutoff: datetime, limit: int = 100) -> list[Run]:
+    """Runs left ``running`` by a process that died before its turn finished."""
+    result = await session.execute(
+        select(Run)
+        .where(Run.status == "running", Run.updated_at < cutoff)
+        .order_by(Run.updated_at)
+        .limit(limit)
+    )
+    return list(result.scalars())
+
+
 async def due_runs(session: AsyncSession, now: datetime, limit: int = 100) -> list[Run]:
     """Suspended runs whose per-status timeout has expired (DESIGN.md section 7.2)."""
     result = await session.execute(

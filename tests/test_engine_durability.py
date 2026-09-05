@@ -8,7 +8,8 @@ re-execution safe." The invariant this file proves is stronger and simpler to st
 "Same outcome" is checked as a whole: the ordered trace (sequence number, node, edge, state
 patch), the final frame stack, the final status, and the customer-visible messages - not one
 assertion at one convenient point. The kill happens at four different places in the loop, at
-four different nodes, which is sixteen combinations:
+every node of the turn, which is twenty-eight combinations - including the node that pushes
+a frame and the node that pops one, where the stack changes shape:
 
 * ``before_node``    - the process died having decided what to run and nothing else;
 * ``after_node``     - the node ran, its effects are in memory, the checkpoint has not started;
@@ -23,6 +24,7 @@ import json
 import subprocess
 import sys
 import uuid
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -81,7 +83,7 @@ async def _uninterrupted(pack: Pack, engine: AsyncEngine) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize("point", CRASH_POINTS)
-@pytest.mark.parametrize("crash_after", [0, 2, 4, 6])
+@pytest.mark.parametrize("crash_after", [0, 1, 2, 3, 4, 5, 6])
 async def test_a_crash_anywhere_resumes_to_the_same_outcome(
     pack: Pack, engine: AsyncEngine, point: str, crash_after: int
 ) -> None:
@@ -356,3 +358,33 @@ async def test_a_run_whose_graph_changed_underneath_it_hands_off(
     assert outcome.status == "waiting_human"
     assert [request.reason for request in recorder.handoffs] == ["pack_incompatible"]
     assert "state shape" in (recorder.handoffs[0].detail or "")
+
+
+async def test_a_conversation_nobody_touches_again_is_still_recovered(
+    pack: Pack, engine: AsyncEngine
+) -> None:
+    """A crashed turn leaves the run ``running`` and no deadline for the timeout sweep to find.
+
+    Without a recovery sweep it would sit there until the customer wrote again, which for an
+    email conversation could be never.
+    """
+    baseline = await _uninterrupted(pack, engine)
+
+    dying = Recorder(crash_at="after_node", crash_after=1)
+    executor = Executor(pack, engine, hooks=dying.hooks())
+    conversation_id = await executor.start_conversation(
+        inputs={"amount": 250.0}, context={"customer": {"name": "Ada"}}
+    )
+    with pytest.raises(SimulatedCrash):
+        await executor.on_inbound(conversation_id, "hello")
+
+    stalled = await run_row(engine, conversation_id)
+    assert stalled["status"] == "running"
+    assert stalled["timeout_at"] is None, "a run in flight has no deadline to sweep"
+
+    survivor = Executor(pack, engine, hooks=Recorder().hooks())
+    assert await survivor.recover_stalled(older_than=timedelta(days=1)) == []
+    outcomes = await survivor.recover_stalled(older_than=timedelta(seconds=-1))
+
+    assert [outcome.conversation_id for outcome in outcomes] == [conversation_id]
+    assert await _signature(engine, conversation_id) == baseline
