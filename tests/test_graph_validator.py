@@ -7,6 +7,7 @@ The reference pack ``tests/packs/refund_pack`` (DESIGN.md's own section 6.4 refu
 the positive case: it must validate with no errors.
 """
 
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from textwrap import dedent
@@ -454,12 +455,111 @@ nodes:
 """
         },
     ),
+    # -- end outputs -------------------------------------------------------------------
+    (
+        "graph.end_output_unknown",
+        {
+            "main": """
+id: main
+outputs: { outcome: str }
+state: { charge_id: str | None }
+start: finish
+nodes:
+  finish: { type: end, outputs: { outcome: "done", surprise: "extra" } }
+"""
+        },
+    ),
+    (
+        "graph.end_output_missing",
+        {
+            "main": """
+id: main
+outputs: { outcome: str }
+state: { charge_id: str | None }
+start: finish
+nodes:
+  finish: { type: end }
+"""
+        },
+    ),
+    # -- expression notes on optional values -------------------------------------------
+    (
+        "expr.optional_filter_input",
+        {
+            "main": """
+id: main
+state: { charge_id: str | None }
+start: pick
+nodes:
+  pick:
+    type: router
+    edges:
+      state.charge_id | lower == "abc": finish
+    default: finish
+  finish: { type: end }
+"""
+        },
+    ),
+    (
+        "expr.optional_comparison",
+        {
+            "main": """
+id: main
+state: { amount: float | None }
+start: pick
+nodes:
+  pick:
+    type: router
+    edges:
+      state.amount > 10: finish
+    default: finish
+  finish: { type: end }
+"""
+        },
+    ),
+    # -- approval binding on a tool that needs none ------------------------------------
+    (
+        "graph.approval_not_needed",
+        {
+            "main": """
+id: main
+state: { charge_id: str | None }
+start: look
+nodes:
+  look:
+    type: tool
+    tool: read_tool
+    args: { charge_id: state.charge_id }
+    requires_approval: look
+    next: finish
+  finish: { type: end }
+"""
+        },
+    ),
 ]
 
 
 @pytest.mark.parametrize(("rule", "graphs"), CASES, ids=[case[0] for case in CASES])
 def test_rule_fires(pack_dir: Path, rule: str, graphs: dict[str, str]) -> None:
     assert rule in rules(pack_dir, graphs)
+
+
+_LITERAL_RULE_ID = re.compile(r'self\.error\(\s*\n?\s*"([a-z_]+\.[a-z_]+)"')
+
+
+def test_every_error_rule_id_in_rules_py_is_asserted_somewhere_in_this_file() -> None:
+    """Phase-1 review F2: five listed rule ids, two of them ERROR, had no test at all.
+
+    BACKLOG.md asks for "one failing fixture per rule" and the exit criterion for "the right
+    rule name", so a new ERROR rule in :mod:`support_core.graph.rules` must arrive with a case
+    here. Only rule ids written as literals are checked; the ``expr.*`` and ``template.*``
+    families are built from a note code and are covered by their own tests.
+    """
+    source = (REPO_ROOT / "support_core" / "graph" / "rules.py").read_text(encoding="utf-8")
+    declared = set(_LITERAL_RULE_ID.findall(source))
+    asserted = set(re.findall(r'"([a-z_]+\.[a-z_]+)"', Path(__file__).read_text(encoding="utf-8")))
+    missing = sorted(declared - asserted)
+    assert not missing, f"ERROR rule ids with no test asserting on them: {missing}"
 
 
 # --------------------------------------------------------------------------------------
