@@ -208,3 +208,162 @@ test harness promise to later phases:
 - Every engine in tests uses `NullPool` and is disposed per test, so no asyncpg connection
   outlives its event loop. This avoids the classic pytest-asyncio "attached to a different
   loop" failure but costs a connection per test; fine at this scale.
+
+## Independent review
+
+Reviewer: independent agent, 2026-09-05. Did not write any of the phase-0 code. Read DESIGN.md
+(3, 4.1, 5, 5.1, 5.2, 7, 8.2, 9, 14, 17, 18, 22), PLAN.md, BACKLOG.md, README.md, this file, every
+file under `support_core/`, `packs/`, `tests/`, `scripts/`, `.github/`, `pyproject.toml`,
+`docker-compose.yml`, `alembic.ini`, and the seven phase-0 commits (`55f2cb0..9b42814`).
+
+### Verdict
+
+Phase 0 is sound and the exit criterion holds: every command the implementer listed reproduces
+exactly (ruff, format, mypy strict, 55 tests green twice in a row and from a fresh volume,
+downgrade/upgrade/check clean, `support pack validate packs/acme_billing` exits 0 with
+`empty but well-formed`). The schema matches DESIGN.md section 17 column for column with only
+additive, sensible extras; the package tree is exactly section 18; the sample pack is the section
+5 layout and the manifest is the 5.1 example. The one rule (no tool execution without an
+`ActionApproval`) is trivially satisfied: there is no code path that executes anything. One
+finding must be fixed before close: the CI workflow triggers on `branches: [main]` but the
+repository branch is `master`, so the delivered "CI config running ruff, mypy, pytest" would never
+run on push. The remaining findings are guard rails and forward-compatibility notes that phases
+2, 4 and 5 should pick up; two of them (the test suite silently destroying whatever database
+`SUPPORT_DATABASE_URL` points at, and the validator crashing with a raw `UnicodeDecodeError`
+instead of reporting) are cheap enough to fix now.
+
+### Findings
+
+| id | severity | location | finding | suggested fix |
+|----|----------|----------|---------|---------------|
+| F1 | must-fix | `.github/workflows/ci.yml:5` | `on.push.branches: [main]` but `git branch --show-current` is `master`. Push CI never runs; only `pull_request` would. The backlog item "CI config running ruff, mypy, pytest" is therefore not true as delivered. | Change to `branches: [main, master]` or rename the branch before the first push. Record which in this file. |
+| F2 | should-fix | `tests/conftest.py:52-67` | `migrated_database` runs `alembic downgrade base` against whatever `SUPPORT_DATABASE_URL` points at, with no guard. The default URL is the same one README tells developers to `alembic upgrade head` and work against; DESIGN 4.1 is "one Postgres database" per service. Running `pytest` silently drops every table, including a mis-pointed staging database. | Refuse to rebuild unless the database name ends in `_test` or a `SUPPORT_TEST_DATABASE_URL` is set; or at minimum print a loud banner naming the database before dropping it. Add the test database to docker-compose (init script creating `support_test`). |
+| F3 | should-fix | `support_core/graph/manifest.py:116`, `support_core/graph/validator.py:256,275,323` | `validate_pack` docstring promises it "never raises for a bad pack", but a non-UTF-8 `pack.yaml`, `policies.md`, `sources.yaml` or `tools/__init__.py` raises `UnicodeDecodeError` (verified with bytes `ff fe`), which the CLI turns into a traceback. | Catch `UnicodeDecodeError`/`OSError` in the four `read_text` calls and emit `*.unreadable` error findings. One test with a latin-1 byte. |
+| F4 | should-fix | `support_core/graph/manifest.py:88` | `core: ""` is accepted (`SpecifierSet("")` is valid) and `core_compatible()` returns `True` for every version, so a pack can opt out of the compatibility check the manifest exists to enforce. | Reject an empty or whitespace-only specifier (`if not SpecifierSet(value): raise`). Add a case to `test_manifest_core_compatibility`. |
+| F5 | should-fix (defer to phase 2) | `support_core/storage/models.py:145` | `trace_step` has no ordering column. `started_at` defaults to `now()`, which is transaction start time: two steps inserted in one transaction get identical timestamps (verified via psql: `count(distinct started_at) = 1` with a 50 ms sleep between inserts). Section 7.3 replay "from the trace" needs a total order per run; `ORDER BY started_at` cannot provide it. | Phase 2's checkpoint migration adds `trace_step.seq integer not null` (the run's `checkpoint_seq` at write time) with a unique `(run_id, seq)`, and the executor sets `started_at` from the application clock, not the default. Record as a deferred finding. |
+| F6 | should-fix (defer to phase 4) | `support_core/storage/models.py:170-190` | `tool_call` has no `run_id`, `conversation_id` or `step_id`; its only link to a conversation is by parsing the `idempotency_key` string. This matches section 17 literally, but the handoff packet (13) and replay (15) both need "tool calls for this conversation", and the audit question "which approval covered which call for whom" needs a join. | Phase 4's migration adds `run_id` (FK, indexed) and `step_id` to `tool_call`. Record as a deferred finding so it is not re-discovered. |
+| N1 | nit (note for phase 4) | `support_core/storage/models.py:149-167` | `action_approval` has no single-use marker or expiry: nothing prevents one approval row from satisfying two `tool_call`s with the same `args_hash` (a second refund of the same amount in the same conversation would pass the hash check). Section 8.2 does not demand single use, so this is a design gap, not a phase-0 defect. | Phase 4 adds `consumed_by_tool_call_id`/`consumed_at` and treats a consumed approval as absent; add it to the adversarial tests. |
+| N2 | nit | `support_core/storage/migrations/versions/0001_initial_schema.py:45,254` | `CREATE EXTENSION vector` requires superuser on this image (pgvector 0.8.6 control file has no `trusted` flag; verified). Works because the compose user is a superuser. The downgrade also `DROP EXTENSION`s, which fails or removes a shared extension if a DBA pre-installed it. | Document that the migrating role must be superuser or the extension pre-created; consider not dropping the extension on downgrade. |
+| N3 | nit | `support_core/cli/main.py:45` | `--strict` suppresses INFO findings, so strict mode prints less than lenient mode (`pack.empty` disappears). Surprising; README does not mention it. | Print INFO in both modes; `--strict` should only change the exit status. |
+| N4 | nit (admitted) | `support_core/graph/validator.py:257` | `TOOLS` check is a `startswith` on a line: `TOOLSET = 5` passes, `TOOLS = "oops"` passes, `TOOLS` at the start of a docstring line passes. | Acceptable until phase 4 imports the module; tighten to a regex `^TOOLS\s*[:=]` meanwhile. |
+| N5 | nit | `support_core/graph/manifest.py:38,69` | `interrupts.allowed_from: [root, root]` and `language: ''` are accepted, while `channels` duplicates are rejected. Inconsistent strictness. | Same uniqueness validator on both interrupt lists; `language: str = Field(min_length=2)`. |
+| N6 | nit | `support_core/graph/validator.py:134` | A directory named `graphs/root.yaml` is skipped by `is_file()` and the pack is reported `empty but well-formed`. | Report `layout.not_a_file` for non-file entries with a graph suffix. |
+| N7 | nit | `BACKLOG.md:35` vs `reviews/phase-0.md` "Implementation notes" | Backlog says "52 tests green"; this file and reality say 55. | Correct the backlog number when closing. |
+| N8 | nit | `scripts/*.sh` (git mode `100644`) | Not executable in the index, so `./scripts/db-up.sh` fails on Linux. README and Makefile use `sh scripts/...`, so nothing breaks, but the shebang is decorative. | `git update-index --chmod=+x scripts/*.sh`. |
+| N9 | nit (admitted) | `tests/conftest.py:52-77`, `README.md:80` | Two concurrent `pytest` processes: verified one run finishes with 47 passed, 8 errors (`table "eval_run" does not exist` from the other process's downgrade). README warns, nothing enforces. | `pg_try_advisory_lock` held for the session in `migrated_database`; fail fast with a message instead of a mid-run `UndefinedTableError`. |
+| N10 | nit (forward-compat) | `pyproject.toml:64` | `files = [..., "packs"]` maps `packs/acme_billing/tools/__init__.py` to top-level module `tools` (no `__init__.py` above it). A second pack, or phase 9's split, gives mypy "Duplicate module named 'tools'". | Add `packs/__init__.py` and `packs/acme_billing/__init__.py`, or use `explicit_package_bases` with `namespace_packages`. |
+| N11 | nit | `docker-compose.yml:6` | Fixed `container_name: support-core-db` means two checkouts (or CI and a dev box on the same host) cannot both bring up a database. | Drop `container_name`; the compose project name already namespaces it. |
+| N12 | nit (admitted, now measured) | `support_core/storage/models.py:262` | Untyped `vector`: verified that `CREATE INDEX ... USING hnsw (embedding vector_l2_ops)` fails with `column does not have dimensions`, that 2-d and 3-d rows coexist, and that a distance query then fails at runtime with `different vector dimensions 2 and 3`. | Phase 5's migration must `ALTER COLUMN embedding TYPE vector(N)` while `doc_chunk` is empty (or delete rows first), then add the HNSW index. Already recorded by the implementer; this confirms the failure mode. |
+
+Severity counts: 1 must-fix, 5 should-fix (F2, F3, F4 to fix now; F5 and F6 to defer to
+phases 2 and 4 as backlog "Deferred findings"), 12 nits.
+
+### Design conformance
+
+- **Section 17, column by column.** `conversation`, `message`, `run`, `trace_step`,
+  `action_approval`, `handoff`, `customer_memory`, `eval_run`: every listed column is present
+  with the listed name; extras are `id` (where the design omits it), `created_at`/`updated_at`
+  and the implementer's documented additions. `tool_call`: exactly the listed columns plus
+  `id`, `created_at`, `updated_at` (see F6 for what is missing in practice). `doc_source`,
+  `doc_chunk`, `kg_entity`, `kg_relation`: the design gives only a purpose; the columns chosen
+  are adequate for sections 9.1 to 9.3 (`source_version` on chunks, `locator`, `stale`,
+  generated `tsv`). Both unique keys the design names exist and are tested. `message.status`
+  default `received` instead of a `pending`-only vocabulary: acceptable, phase 2 owns it.
+  `text` for enum-like columns: acceptable and well argued. All deviations are additive; none
+  removes or renames a designed column.
+- **Section 18.** Fourteen subpackages, exactly the list, each with a section-naming docstring
+  (enforced by `tests/test_package_layout.py`). `storage/repositories` absent: acceptable,
+  phase 2. Public API names absent rather than stubbed: correct choice.
+- **Section 5 / 5.1.** Layout matches (optional `nodes/` absent, allowed). Manifest matches the
+  5.1 example except `version: 0.1.0` and `core: ">=0.0.1,<1"`; the test
+  `test_manifest_core_compatibility` shows the literal `">=1.4,<2"` is correctly rejected.
+  `channels` limited to `web_chat`/`email` per section 12: correct. Two extra validator rules
+  (`policies.too_long`, `manifest.interrupts_conflict`) are derived from the design text and
+  acceptable.
+- **Section 5.2.** None of the graph rules exist; `validate_graphs` emits `graph.not_validated`
+  so a pack with graphs cannot pass silently. Acceptable for phase 0 as the backlog scopes it.
+
+### Forward compatibility
+
+- **Phase 1 (loader/validator).** `validate_graphs(pack_path, manifest, graph_files) -> list[Finding]`
+  is a clean seam; `Finding.location` is a free string, so `file:node` locations fit. The
+  `ValidationReport` already carries the manifest. No rework needed.
+- **Phase 2 (locks, checkpoints, pending queue).** `run` and `trace_step` support the
+  design's checkpoint transaction; `uq_trace_step_step_id` gives the retry semantics 7.3 needs.
+  Concrete problems: F5 (no total order on `trace_step`); `run.conversation_id` is non-unique
+  with nothing marking the current run, so "load Run" needs a partial unique index or a
+  status filter (implementer flagged this). The `message (conversation_id, created_at)` index
+  is enough for the pending queue. `updated_at` is client-side (`onupdate`), verified stale
+  after a raw `UPDATE`; harmless until something reads it.
+- **Phase 4 (approvals, tool calls).** `ix_action_approval_conversation_hash` supports the hash
+  lookup. Problems: F6, N1.
+- **Phase 5 (pgvector).** N12: rework is confined to one migration on an empty table. `tsv`
+  hard-codes `english`; a per-source language needs a column and a regenerated expression.
+  `CREATE EXTENSION` needs superuser in production (N2).
+
+### Commands run and results
+
+All from the repository root with `.venv/Scripts/python.exe`, Windows 11, Docker 29.7.2,
+Postgres 16 `pgvector/pgvector:pg16` (pgvector 0.8.6).
+
+| Command | Result |
+|---------|--------|
+| `python -m ruff check .` | `All checks passed!` (exit 0) |
+| `python -m ruff format --check .` | `31 files already formatted` (exit 0) |
+| `python -m mypy` | `Success: no issues found in 31 source files` (exit 0) |
+| `python -m pytest -q` (run 1) | `55 passed in 3.15s` |
+| `python -m pytest -q` (run 2, immediately after) | `55 passed in 3.01s` |
+| `python -m pytest -q -p no:randomly` | `55 passed in 3.18s` (pytest-randomly is not installed; the flag is a no-op) |
+| `pytest tests/test_db_smoke.py::test_tables_are_truncated_between_tests` alone | `1 passed` (proves nothing, as the self-critique says) |
+| `pytest` with the four smoke tests in reverse order | `4 passed` |
+| `python -m alembic downgrade base` | `Running downgrade 0001 -> ` (exit 0) |
+| `python -m alembic upgrade head` | `Running upgrade  -> 0001` (exit 0) |
+| `python -m alembic check` | `No new upgrade operations detected.` (exit 0) |
+| `python -m alembic current` | `0001 (head)` |
+| `python -m alembic upgrade base:head --sql` | valid SQL inside one `BEGIN`/`COMMIT`; `CREATE EXTENSION IF NOT EXISTS vector` at line 10; `embedding VECTOR` untyped |
+| `support pack validate packs/acme_billing` (console script and `python -m support_core.cli.main`) | `INFO pack.empty [graphs/] ...` then `acme-billing: empty but well-formed`, exit 0 |
+| `support pack validate --strict packs/acme_billing` | `acme-billing: empty but well-formed`, exit 0, INFO line suppressed (N3) |
+| `support pack validate -q packs/acme_billing` | summary only, exit 0 |
+| Two `pytest -p no:cacheprovider` processes started simultaneously | A: `47 passed, 8 errors` (`UndefinedTableError: table "eval_run" does not exist`); B: `55 passed` (N9) |
+| `docker compose down -v`, `sh scripts/db-up.sh`, `pytest -q` (no `alembic_version` table yet) | container healthy; `55 passed in 3.99s`; `alembic check` clean afterwards |
+| `docker compose down -v`, `sh scripts/db-up.sh`, `alembic upgrade head`, `alembic check` | upgrade applied, check clean |
+| `psql`: `select rolsuper from pg_roles where rolname='support'`; grep `trusted` in `vector.control` | `t`; no `trusted` line (N2) |
+| `psql`: `create index ... using hnsw (embedding vector_l2_ops)` in a rolled-back txn | `ERROR: column does not have dimensions` (N12) |
+| `psql`: insert 3-d and 2-d embeddings, then `embedding <-> '[1,2,3]'` | both rows stored; query `ERROR: different vector dimensions 2 and 3` (N12) |
+| `psql`: two `trace_step` inserts in one txn with `pg_sleep(0.05)` between | identical `started_at`, `count(distinct started_at) = 1` (F5) |
+| `psql`: raw `UPDATE run SET checkpoint_seq = 1` | `updated_at` unchanged (admitted) |
+| `git ls-files --eol` on `scripts/`, `Makefile`, `ci.yml` | `i/lf w/lf attr/text eol=lf`; a Linux checkout will be LF. Modes are `100644` (N8) |
+| `git branch --show-current` | `master` (F1) |
+| Adversarial `validate_pack` cases (scratch script, deleted) | `core: ""` accepted (F4); non-UTF-8 files raise (F3); `TOOLSET = 5` and `TOOLS = "oops"` pass (N4); `language: ''` and duplicate `allowed_from` pass (N5); `graphs/root.yaml` as a directory reads as empty (N6); `channels: []`, `max_nodes_per_turn: 0`, `sla_minutes: -1`, `id: Acme Billing`, `version: banana`, `core: "*"`, a path-traversal `entry_graph`, and list-shaped or empty `pack.yaml` are all correctly rejected |
+| `grep` for `approval`, `execute(`, `subprocess`, `importlib`, `exec(`, `eval(` under `support_core/` excluding models and migrations | only `def pack_eval` (a CLI stub that exits 3). No tool execution path exists; the every-phase rule passes |
+
+Scratch files were created under `reviews/scratch-phase-0/` and deleted. No source, test or
+config file was modified; nothing was committed. The database was left at `0001 (head)`.
+
+### Self-critique assessment
+
+Every admitted weakness is acceptable for phase 0 except that the CI section understates the
+problem (F1): the workflow not only has not run, it could not run on push. The admissions about
+the dimensionless vector, client-side `updated_at`, the textual `TOOLS` check, the
+order-dependent truncation test and the single-process test harness are accurate; the vector
+and concurrency ones are now measured (N12, N9) rather than asserted. "Migrations run in one
+transaction" is confirmed by the `--sql` output.
+
+### Missed by self-critique
+
+1. CI workflow branch filter does not match the repository branch (F1).
+2. The test suite drops every table in the configured database with no guard, and README
+   points developers at that same database (F2).
+3. `validate_pack` violates its own "never raises" contract on non-UTF-8 input (F3).
+4. `core: ""` disables the compatibility check entirely (F4).
+5. `trace_step` has no ordering column, and `now()` ties inside one transaction defeat
+   `started_at` ordering (F5).
+6. `tool_call` cannot be joined to a run or conversation without parsing the idempotency key (F6).
+7. `action_approval` has no single-use or expiry semantics; approvals are reusable (N1).
+8. `CREATE EXTENSION vector` needs superuser on this image; downgrade drops the extension (N2).
+9. `--strict` prints fewer findings than non-strict (N3).
+10. Inconsistent strictness across manifest lists and `language` (N5); a directory with a
+    graph suffix is silently ignored (N6).
+11. Backlog and review disagree on the test count, 52 vs 55 (N7).
+12. mypy module naming under `packs/` will collide with a second pack (N10); fixed
+    `container_name` collides across checkouts (N11); scripts lack the executable bit (N8).
