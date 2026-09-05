@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 from support_core.graph.context import ConversationContext
 from support_core.graph.expr import ParseError, TypeError_, infer, model_type_env, parse
-from support_core.graph.expr.syntax import Expr, unparse
+from support_core.graph.expr.syntax import Expr, literal_source, unparse
 from support_core.graph.expr.typecheck import TypeEnv, TypeInfo, TypeNote, from_annotation
 from support_core.graph.findings import Finding, Severity
 from support_core.graph.manifest import PackManifest
@@ -1172,17 +1172,28 @@ def _incompatible(source: TypeInfo, target: TypeInfo) -> str | None:
 
 
 def _canonical_args(args: dict[str, Scalar]) -> str:
-    """Canonical text for an argument mapping, so whitespace differences are not a mismatch."""
+    """Canonical text for an argument mapping, so whitespace differences are not a mismatch.
+
+    Classification goes through :func:`parse_value`, the *same* decision the engine will make
+    when it evaluates the node, so ``{amount: 100}`` (a YAML int) and ``{amount: "100"}`` (a
+    string literal) do not canonicalise alike. Comparing them by a different rule than the one
+    the run time uses would pass here and then fail DESIGN.md 8.2's hash check at run time,
+    which is the failure the static rule exists to prevent (phase-1 review finding F7).
+    """
     parts = []
     for name in sorted(args):
         raw = args[name]
-        if not isinstance(raw, str):
-            parts.append(f"{name}={raw!r}")
-            continue
         try:
-            parts.append(f"{name}={unparse(parse(raw))}")
-        except ParseError:
-            parts.append(f"{name}={raw!r}")
+            value = parse_value(raw)
+        except (ParseError, ValueLooksLikeExpression):
+            # Already reported as expr.parse_error / expr.looks_like_expression by the node
+            # rules; fall back to the raw text so the comparison stays deterministic.
+            parts.append(f"{name}=<unparsable {raw!r}>")
+            continue
+        if value.expression is not None:
+            parts.append(f"{name}={unparse(value.expression)}")
+        else:
+            parts.append(f"{name}={literal_source(value.literal)}")
     return "{" + ", ".join(parts) + "}"
 
 

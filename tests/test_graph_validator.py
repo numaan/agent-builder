@@ -869,6 +869,32 @@ def test_approval_mismatch_on_arguments(pack_dir: Path) -> None:
     assert "graph.approval_mismatch" in rules(pack_dir, {"main": graph})
 
 
+@pytest.mark.parametrize(
+    ("approved", "called"),
+    [
+        ("amount: 100", 'amount: "100"'),
+        ("amount: 100.0", 'amount: "100.0"'),
+    ],
+)
+def test_a_literal_and_a_string_that_look_alike_are_not_the_same_approval(
+    pack_dir: Path, approved: str, called: str
+) -> None:
+    """F7: the canonical form must classify scalars the way the engine will evaluate them.
+
+    ``{amount: 100}`` is a YAML int and ``{amount: "100"}`` is a string literal, so their
+    ``canonical_json`` differs and DESIGN.md 8.2's run-time hash check would refuse the call.
+    Comparing them by a different rule here would let the pack load and fail in production.
+    """
+    graph = CONFIRMED.replace(
+        "args: { charge_id: state.charge_id, amount: state.amount }\n    prompt",
+        f"args: {{ charge_id: state.charge_id, {approved} }}\n    prompt",
+    ).replace(
+        "args: { charge_id: state.charge_id, amount: state.amount }\n    requires_approval",
+        f"args: {{ charge_id: state.charge_id, {called} }}\n    requires_approval",
+    )
+    assert "graph.approval_mismatch" in rules(pack_dir, {"main": graph})
+
+
 def test_approval_mismatch_on_tool(pack_dir: Path) -> None:
     graph = confirmed("tool: high_tool\n    args", "tool: write_tool\n    args")
     assert "graph.approval_mismatch" in rules(pack_dir, {"main": graph})
