@@ -667,3 +667,121 @@ fixed two of its own findings rather than recording them. What it missed:
    two-versions rule.
 6. **R5, R8, R9, R10.** Smaller: the over-broad `except DBAPIError`, the cascading delete in the
    migration back-fill, an assertion that can never fail, and three dead exported symbols.
+
+## Resolution
+
+Resolver: a fresh agent that wrote none of the phase-2 code, 2026-09-06 (PLAN.md step 5). Both
+must-fix findings are fixed, each with a regression test confirmed to fail against the code as
+reviewed. Every should-fix is fixed except R7, which is deferred to phase 7 with a checklist
+line, and every nit is fixed except the per-pack half of R6, deferred to phase 9. The review
+itself was committed first as `cb6300c` (it was sitting uncommitted, as in phases 0 and 1).
+
+**R1 and R2 are one seam, and both are closed by eliminating the window, not by detecting it.**
+Both live where the implementer's self-critique said the phase was fragile - "the interaction of
+*event still pending* with *stack changed* is the one piece of state that lives in two places at
+once" - and both lost a customer message in the phase whose purpose is that no message is lost.
+
+*R1: the claim window is gone, because it could not be swept.* The suggested belt-and-braces -
+letting `recover_stalled` also pick up a conversation holding a `received` message that no run
+is awaiting - was considered and rejected as unsound: a `received` row a node has already
+consumed looks exactly like an orphaned one, so a sweep built on that predicate either misses
+the orphan or redelivers a consumed message. The claim, the `running` status and the turn event
+are therefore one transaction (`repositories.claim_and_begin_turn`). Everything that needs the
+message text but must not sit inside that transaction - the resume-or-new-root-frame decision,
+and the interrupt check, which from phase 6 is a model call - runs first against
+`peek_next_pending`, which claims nothing. A process that dies anywhere before the commit leaves
+the message `pending`; after it, the run is `running` and carries the event, which `drain`,
+`on_inbound` and `recover_stalled` all see. There is no third state.
+
+*R2: the resume target is durable, and is never derived from the stack.* The suspend checkpoint
+records `frame_seq` beside `node` in `run.awaiting` - the same transaction that writes the frame
+stack - the turn event carries that address, and `_loop` delivers on the event's own target.
+Nothing computes "where to deliver" from the stack top any more, so it does not matter how far
+the stack has moved since: a gate re-check today, a phase-6 interrupt push tomorrow. Consistent
+with how the step id is already derived, every field comes from the row.
+
+| id | severity | action | commit |
+|----|----------|--------|--------|
+| R1 | must-fix | **Fixed by removing the window.** `claim_and_begin_turn` commits the claim, `status = running` and `awaiting.turn_event` together; `peek_next_pending` is what the pre-claim decisions read. `claim_next_pending` is deleted - there is no longer a claim that is not also a turn start. Two regression tests: a crash at the new `after_claim` probe (the exact window), which requires the recovery sweep to find the conversation, and a crash at `claim_before_commit`, which must leave the message `pending`. **Confirmed failing first**: against the reviewed code the first leaves the run `waiting_customer` with the reply lost for ever and no recovery path. | bb8311a |
+| R2 | must-fix | **Fixed by deriving resume entirely from durable state.** `ResumeEvent` gains `target_frame_seq`/`target_node_id`, filled from `run.awaiting` when the event is created and stored with it; the suspend record gains `frame_seq`; `_loop`'s `delivering` test compares the event's target with the frame, and the stack-top `resume_target` local is gone. `_resume` (human, async tool, timer) takes the same target, so this is not a gate special case. Regression test: the reviewer's exact scenario - gate passes, frame suspends, precondition lapses, reply arrives - killed at five points and compared against the uninterrupted run, including the inbound message statuses. **Confirmed failing first**: three of the four loop kill points diverged with `node_error: tell: a 'say' node does not suspend`, exactly as measured, and the fifth (`after_claim`) failed on R1. | bb8311a |
+| R3 | should-fix | Fixed, both halves. `recover_stalled` calls `_recover_one` per conversation, which catches every exception; `run.recovery_attempts` (migration `0003`) counts failures and the run is parked `waiting_human` with reason `engine_error` after three, so a poisoned conversation neither aborts the batch nor is retried for ever. A handoff sink that is itself down cannot re-poison the batch either. Success clears the counter. Two tests: two conversations that reach an `llm` node are both swept three times and both parked, and a fourth sweep sees neither; and a genuinely recoverable run's counter is reset. | 182b08d |
+| R4 | should-fix | Fixed. `message.ordinal` (migration `0003`) is the position within the checkpoint that wrote the row, and both the transcript read and `pending_outbound` order by `(created_at, ordinal, id)`. Test writes eight messages in one checkpoint and requires them back in order; mutation-checked by removing `ordinal` from the `ORDER BY`, which fails it. | 182b08d |
+| R5 | should-fix | Fixed. Only SQLSTATE `55P03` (`lock_not_available`, which is what `lock_timeout` raises) is treated as a busy lock; every other SQLSTATE is re-raised. Test cancels the lock statement with a `statement_timeout` shorter than the lock wait and requires the `57014` to reach the caller, while still requiring a genuinely busy lock to report busy. | 182b08d |
+| R6 | should-fix (part deferred) | Half fixed, half deferred. `register_node_type` refuses a second registration of a name under a different spec or factory (re-registering the identical pair stays a no-op, because loading the same pack twice is not an error), so two packs can no longer silently overwrite each other. Scoping the registry *per pack*, so both packs may have their own `verify_identity`, needs the loader and the validator to carry the registry too - `NODE_TYPES` is what parses the YAML - and is deferred to phase 9, which owns DESIGN.md 6.7's two-versions-side-by-side and the core/pack split. BACKLOG entry and phase 9 checklist line added. | 182b08d |
+| R7 | should-fix | **Deferred to phase 7**, with a BACKLOG entry and a checklist line. The mechanism already exists: `lock_wait_seconds=0` returns `queued=True` immediately and `drain` is the poller's entry point. What R7 asks for is a *default* for channel webhooks and something that polls, and phase 2 has neither a channel adapter nor a scheduler to hang it on - the same reason `sweep_timeouts` and `recover_stalled` are methods rather than a daemon. Choosing the default here would be choosing it for a caller that does not exist yet. | c97a549 |
+| R8 | should-fix | Fixed by failing loudly rather than deleting. Migration `0002` refuses to create `uq_run_conversation` if any conversation has more than one run, naming them, instead of deleting the loser and cascading its `trace_step` rows (and, from phase 4, its `tool_call` rows) away. | 182b08d |
+| R9 | nit | Fixed: `assert ... or True` is now the monotonic-`frame_seq` assertion it was meant to be - each new frame's number exceeds every number seen before it. | 182b08d |
+| R10 | nit | Fixed: `LockTimeout`, `pending_count` and `step_exists` deleted. `LockTimeout` was not repurposed for R5: a busy lock is reported by returning `False`, and the errors R5 stops swallowing should reach the caller as themselves. | 182b08d |
+| R11 | nit | Fixed: a `NodeResult` model validator rejects more than one of `suspend`, `push_graph` and `pop`, so `_advance`'s priority order can no longer silently discard a phase-3 or phase-4 node's intent. | 182b08d |
+| R12 | nit | Fixed: an output mapping into a field the caller's state does not declare raises a `NodeError` naming both graphs, checked before the pop so it routes through DESIGN.md 7.3 like any node failure. The test redeploys a pack with the caller's state field renamed while a run is suspended inside the callee - the only way to reach this, since the validator refuses it statically - and requires `node_error` rather than `pack_incompatible`. | 182b08d |
+| R13 | nit | Fixed as the reviewer suggested: the migration's docstring says the `seq` back-fill invents an order from a random UUID for exactly the rows finding F5 is about, and why no better answer exists after the fact. | 182b08d |
+| R14 | nit | Fixed: the crash matrix computes its baseline once per module (nothing in the signature carries a run or conversation id, so one conversation's outcome is every conversation's). `tests/test_engine_durability.py` fell from about 165 s to about 110 s while gaining seven tests. | 182b08d |
+
+### Durability and concurrency proofs, before and after
+
+The review's crash and concurrency log was written under a scratch directory and deleted, so
+none of it could be re-run against a change. It is now `tests/verify_phase_2_resolution.py`,
+which a plain `pytest` run does not collect - it duplicates, expensively, what the default suite
+covers - and which CI runs as a step of its own so it cannot rot.
+
+| proof | reviewed code | after the resolution |
+|-------|---------------|----------------------|
+| Implementer's crash matrix (4 points x 7 nodes, `deterministic_pack`) | 28 pass | 28 pass |
+| Real `os._exit` child killed mid-transaction | pass | pass |
+| Reviewer's suspend-and-resume matrix (#4: 4 points x 7 occurrences, `engine_pack`) | 28 pass | 28 pass |
+| Crash during a gate re-check (#5) | **3 of 4 fail** | 5 of 5 pass (the 4 loop points plus the claim window) |
+| Crash in the claim window (#6, #7) | **fails, message lost for ever** | passes; the recovery sweep finds it |
+| Three successive deaths during recovery (#9) | pass | pass |
+| Concurrency #14 to #21 (five processes, ten coroutines, killed lock holder with a waiter queued, duplicate message, resume racing inbound, four coroutines, two conversations, requeue order) | 8 pass | 8 pass |
+| Step ids #22 to #26 | 5 pass | 5 pass |
+| Mutation #27 (checkpoint split into two transactions) | caught | caught |
+| Mutation #28 (turn event forgotten) | caught | caught |
+| Mutation #29 (lock replaced by a no-op) | caught, by an `IntegrityError` in three of four concurrent turns | **no longer caught in that shape** - see below |
+
+Nothing that held before fails now. One thing changed direction, and it is recorded rather than
+smoothed over: **mutation #29 no longer produces a collision.** R1's atomic claim added a second
+serialisation point *below* the advisory lock - the claim is one transaction whose
+`WHERE status = 'pending'` makes two callers contend for the row rather than both proceeding -
+so four concurrent callers with the lock neutered now produce a correct transcript, unique step
+ids and a contiguous `seq` instead of three `IntegrityError`s. That is a strengthening, but it
+does mean that particular shape no longer demonstrates that the lock is load-bearing. Checked
+directly instead: with `conversation_lock` neutered in source, **four of the five tests in
+`tests/test_engine_concurrency.py` fail**, including
+`test_two_processes_send_at_once_and_the_turns_run_in_order`, which is two real OS processes and
+the assertion the reviewer's mutation was aimed at. The harness now asserts what the mutation
+still costs in that shape, and its docstring says why the answer changed.
+
+### Commands run after the fixes
+
+From the repository root with `.venv/Scripts/python.exe`; Windows 11, Postgres 16 in
+`customer-support-agent-db-1`, database `support_test`.
+
+| Command | Result |
+|---------|--------|
+| `python -m ruff check .` | `All checks passed!` (exit 0) |
+| `python -m ruff format --check .` | `79 files already formatted` (exit 0) |
+| `python -m mypy` (strict) | `Success: no issues found in 79 source files` |
+| `python -m pytest -q` | `477 passed in 139.26s` |
+| `python -m pytest tests/verify_phase_2_resolution.py -q` | `39 passed in 136.15s` |
+| `support pack validate packs/acme_billing` | `acme-billing: empty but well-formed`, exit 0 |
+| `python -m alembic downgrade base` then `upgrade head` | all three revisions apply from base and roll back cleanly |
+| `python -m alembic check` | `No new upgrade operations detected.` |
+
+The 477 are the 463 the reviewer ran plus 14: two for the claim window, five for the gate
+re-check matrix, two for the recovery sweep, and one each for message ordering, the lock's
+SQLSTATE handling, duplicate node-type registration, contradictory node results, and the output
+mapping. The 39 in the proof harness are not part of that count.
+
+### What a later phase inherits from this resolution
+
+- **Phase 3** gets R4 fixed before its `llm` node emits two messages from one node, and R11
+  before node results get richer than phase 2's.
+- **Phase 4** gets R2 fixed before a `confirm` answer can be routed to the wrong node after a
+  crash, which for an approval is a safety property and not only a correctness one, and R12
+  before a `tool` node's mapping meets a redeployed pack.
+- **Phase 6** gets R2 fixed before it starts, which is what the reviewer asked for: every
+  interrupt pushes a frame while a customer message is pending, and delivery is now addressed by
+  the event rather than by the stack. R3 matters to it too, because three of `interrupt_check`'s
+  four answers still raise, and a raise inside a sweep no longer poisons the batch.
+- **Phase 7** owns R7 and the scheduler that calls `recover_stalled` and `sweep_timeouts`.
+- **Phase 9** owns the per-pack node-type registry, R6's other half.
