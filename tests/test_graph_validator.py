@@ -977,3 +977,102 @@ def test_cli_strict_fails_on_warnings_only() -> None:
 def test_deterministic_pack_validates() -> None:
     report = validate_pack(DETERMINISTIC_PACK)
     assert report.ok, [f.render() for f in report.errors]
+
+
+# --------------------------------------------------------------------------------------
+# Adversarial input: the validator's contract is a report, never an exception.
+# --------------------------------------------------------------------------------------
+
+
+def test_deeply_nested_yaml_is_a_finding_not_a_recursion_error(pack_dir: Path) -> None:
+    """PyYAML recurses per nesting level, so this reached the interpreter's stack limit."""
+    deep = "a: " + "[" * 20_000 + "]" * 20_000 + "\n"
+    (pack_dir / "graphs" / "main.yaml").write_text(deep, encoding="utf-8")
+    _parsed, findings = read_graphs(pack_dir, ["graphs/main.yaml"])
+    assert {f.rule for f in findings} == {"graph.invalid_yaml"}
+    assert "nested too deeply" in findings[0].message
+
+
+def test_a_yaml_anchor_bomb_does_not_hang(pack_dir: Path) -> None:
+    """Alias expansion is bounded here because the result must still be a graph mapping."""
+    bomb = (
+        "a: &a [x,x,x,x,x,x,x,x,x]\n"
+        "b: &b [*a,*a,*a,*a,*a,*a,*a,*a,*a]\n"
+        "c: &c [*b,*b,*b,*b,*b,*b,*b,*b,*b]\n"
+        "d: [*c,*c,*c,*c,*c,*c,*c,*c,*c]\n"
+    )
+    assert "graph.invalid" in rules(pack_dir, {"main": bomb})
+
+
+@pytest.mark.parametrize(
+    ("literal", "expected_rule"),
+    [
+        ("Mr. Smith", None),
+        ("abandoned", None),
+        ("3.5", None),
+        ("stat.charge_id", "expr.looks_like_expression"),
+        ("statee.charge_id", "expr.looks_like_expression"),
+        ("state.charge_id == ", "expr.parse_error"),
+    ],
+)
+def test_literal_versus_expression_classification(
+    pack_dir: Path, literal: str, expected_rule: str | None
+) -> None:
+    graph = f"""
+    id: main
+    outputs:
+      outcome: str
+    state:
+      charge_id: str | None
+    start: finish
+    nodes:
+      finish: {{ type: end, outputs: {{ outcome: "{literal}" }} }}
+    """
+    found = rules(pack_dir, {"main": graph})
+    if expected_rule is None:
+        assert "expr.looks_like_expression" not in found
+        assert "expr.parse_error" not in found
+    else:
+        assert expected_rule in found
+
+
+def test_expressions_cannot_reach_pydantic_internals(pack_dir: Path) -> None:
+    graph = MAIN.replace("state.charge_id != none: finish", "state.model_config == none: finish")
+    assert "expr.type_error" in rules(pack_dir, {"main": graph})
+
+
+def test_a_node_named_with_a_dunder_is_rejected(pack_dir: Path) -> None:
+    graph = MAIN.replace("  finish: { type: end }", "  __init__: { type: end }")
+    assert "graph.node_id_invalid" in rules(pack_dir, {"main": graph})
+
+
+def test_a_high_risk_tool_cannot_be_confirm_exempt(tmp_path: Path) -> None:
+    """DESIGN.md 8.2 offers the exemption for write-tier tools only."""
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "tools.yaml").write_text(
+        TOOLS_YAML.replace(
+            "  - name: high_tool\n    description: Move money.\n    risk: high\n",
+            "  - name: high_tool\n    description: Move money.\n    risk: high\n"
+            "    confirm_exempt: true\n",
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "graphs").mkdir()
+    graph = """
+    id: main
+    state:
+      charge_id: str | None
+      amount: float | None
+    start: ask_which
+    nodes:
+      ask_which: { type: ask, slots: [charge_id], prompt: "which?", next: do_it }
+      do_it:
+        type: tool
+        tool: high_tool
+        args: { charge_id: state.charge_id, amount: state.amount }
+        next: finish
+      finish: { type: end }
+    """
+    found = rules(tmp_path, {"main": graph})
+    assert "tools.high_risk_exempt" in found
+    assert "graph.unconfirmed_write" in found

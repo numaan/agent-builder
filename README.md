@@ -10,10 +10,12 @@ plan, self-critique and independent review live in `reviews/`.
 ```
 support_core/        the library; one subpackage per DESIGN.md section 18 entry
   storage/           SQLAlchemy models, Alembic migrations (support_core/storage/migrations)
-  graph/             pack manifest and validator (graphs arrive in phase 1)
+  graph/             pack manifest, graph schema, expression language, templates, validator
   cli/               the `support` command
 packs/acme_billing/  sample domain pack (DESIGN.md section 5 layout)
 tests/               pytest suite; database tests run against real Postgres
+  packs/             reference packs the validator and stepper tests load
+  stepper.py         test-only in-memory graph stepper (the engine is phase 2)
 scripts/             db-up.sh, db-down.sh, db-psql.sh (POSIX sh, Git Bash and Linux)
 docker-compose.yml   Postgres 16 + pgvector
 ```
@@ -106,14 +108,44 @@ parallel against one database.
 support pack validate packs/acme_billing
 ```
 
-Prints one line per finding (`ERROR`, `WARNING`, `INFO` with a stable rule id such as
-`layout.missing_file`) and a summary. Exit status is 0 when the pack is well-formed, 1 when it has
-errors; `--strict` also fails on warnings, `--quiet` prints only the summary. In phase 0 the checks
-cover the manifest (`pack.yaml`, DESIGN.md 5.1) and the directory layout (5); graph validation
-(5.2) is phase 1 and the sample pack currently reports `empty but well-formed`.
+Prints one line per finding and a summary. A finding is a severity (`ERROR`, `WARNING`, `INFO`),
+a stable rule id (`layout.missing_file`, `graph.unconfirmed_write`), the file it points at and,
+for graph rules, the node id:
+
+```
+ERROR   graph.unconfirmed_write [graphs/refund.yaml:issue_refund]: tool 'issue_refund' is high risk but ...
+```
+
+Exit status is 0 when the pack is well-formed, 1 when it has errors; `--strict` also fails on
+warnings, `--quiet` prints only the summary. The checks cover the manifest (`pack.yaml`,
+DESIGN.md 5.1), the directory layout (5), and every graph rule in 5.2. `packs/acme_billing` has no
+graphs yet, so it reports `empty but well-formed`; `tests/packs/refund_pack` is the worked
+DESIGN.md 6.4 example and reports `well-formed` with warnings.
 
 `support pack knowledge sync`, `support pack eval` and `support replay` exist but exit with
 status 3 and name the phase that delivers them.
+
+## Writing a pack's graphs
+
+A graph file declares `id`, `start`, `nodes`, and optionally `description`, `inputs`, `outputs`
+and `state` (DESIGN.md 6.4). Edges live inside the nodes (`next`, `edges`, `on_error`, `default`).
+Three things are worth knowing before the first one:
+
+- **Expressions** (`state.x`, `ctx.customer.y`, `result.z`) are a small sandboxed language, not
+  Python: attribute access, `== != < <= > >=`, `and` / `or` / `not`, literals, parentheses, and
+  the four filters `money`, `lower`, `len`, `default`. Anything else is a load-time error naming
+  the offending token and its position. There is no `eval` anywhere in the implementation.
+- **Templates** in `say`, `ask` and `confirm` are sandboxed Jinja with the same four filters.
+  `{% if %}` is allowed; loops, assignment, calls and subscripts are not. Every variable is
+  type-checked against the graph's declared `state` at load time.
+- **Tools** are declared as data in `tools/tools.yaml` (name, `risk`, `input`, `output`,
+  `confirm_exempt`, ...) so the validator can enforce DESIGN.md 5.2's confirm-on-all-paths rule
+  before the phase 4 tool registry exists. Phase 4 replaces this file as the source of truth.
+
+The rule that matters most: a `write` or `high` risk tool node must have a `confirm` node on every
+path from the last customer input, and must name that confirm in `requires_approval` with matching
+arguments (DESIGN.md 5.2 and 8.2). The validator proves this with a dataflow analysis over the
+graph, across sub-graph calls, not with a pattern match.
 
 ## Conventions
 

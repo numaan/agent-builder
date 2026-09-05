@@ -144,6 +144,11 @@ def load_manifest(path: Path) -> PackManifest:
     except yaml.YAMLError as exc:
         msg = f"{manifest_path}: invalid YAML: {exc}"
         raise ManifestError(msg) from exc
+    except RecursionError as exc:
+        # PyYAML recurses per nesting level; a pathological file must be a validation failure,
+        # not an exception escaping the loader.
+        msg = f"{manifest_path}: YAML is nested too deeply to parse"
+        raise ManifestError(msg) from exc
     if not isinstance(raw, dict):
         msg = f"{manifest_path}: top level must be a mapping"
         raise ManifestError(msg)

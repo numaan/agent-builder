@@ -962,6 +962,15 @@ class _Rules:
     def exemptions_notice(self) -> None:
         """DESIGN.md section 8.2: "The validator lists every exemption in its report"."""
         for spec in self.tools.exemptions:
+            if spec.risk is Risk.HIGH:
+                self.error(
+                    "tools.high_risk_exempt",
+                    f"tool {spec.name!r} is high risk and marked confirm_exempt; DESIGN.md "
+                    "section 8.2 offers the exemption for write-tier tools only, and a high-tier "
+                    "tool moves money or access. Reclassify the tool or drop the exemption",
+                    location="tools/tools.yaml",
+                )
+                continue
             self.info(
                 "graph.confirm_exempt",
                 f"tool {spec.name!r} is {spec.risk.value} risk and marked confirm_exempt, so no "

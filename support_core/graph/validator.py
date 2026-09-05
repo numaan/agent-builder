@@ -302,6 +302,15 @@ def _check_knowledge_sources(pack_path: Path) -> list[Finding]:
                 location=location,
             )
         ]
+    except RecursionError:
+        return [
+            Finding(
+                severity=Severity.ERROR,
+                rule="knowledge.sources_invalid",
+                message="YAML is nested too deeply to parse",
+                location=location,
+            )
+        ]
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):

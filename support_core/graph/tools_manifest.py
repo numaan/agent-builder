@@ -34,7 +34,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from support_core.graph.types import BuiltModel, build_model
-from support_core.tools.risk import Risk
+from support_core.tools.risk import REQUIRES_CONFIRM, Risk
 
 MANIFEST_NAME = "tools/tools.yaml"
 
@@ -84,9 +84,15 @@ class ToolSpec(BaseModel):
 
     @property
     def needs_confirm(self) -> bool:
-        """WRITE and HIGH need a confirm unless the pack deliberately exempted the tool."""
-        from support_core.tools.risk import REQUIRES_CONFIRM
+        """WRITE and HIGH need a confirm; only WRITE may be exempted.
 
+        DESIGN.md section 8.2 offers ``confirm_exempt`` for "a WRITE tool ... such as sending a
+        one-time passcode". It is not offered for HIGH, which is "money, access, irreversible",
+        so a HIGH tool still needs a confirm however it is declared. The validator reports the
+        declaration itself as ``tools.high_risk_exempt``.
+        """
+        if self.risk is Risk.HIGH:
+            return True
         return self.risk in REQUIRES_CONFIRM and not self.declaration.confirm_exempt
 
 
@@ -123,6 +129,9 @@ def load_tool_manifest(pack_path: Path) -> ToolManifest:
         raise ToolManifestError(msg) from exc
     except yaml.YAMLError as exc:
         msg = f"{MANIFEST_NAME}: invalid YAML: {exc}"
+        raise ToolManifestError(msg) from exc
+    except RecursionError as exc:
+        msg = f"{MANIFEST_NAME}: YAML is nested too deeply to parse"
         raise ToolManifestError(msg) from exc
     if raw is None:
         raw = {}

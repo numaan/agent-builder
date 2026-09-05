@@ -6,7 +6,7 @@ Each phase follows the five-step workflow in [PLAN.md](PLAN.md). Design referenc
 | Phase | Title | Status | Review file |
 |-------|-------|--------|-------------|
 | 0 | Skeleton, tooling, database | done | reviews/phase-0.md |
-| 1 | Graph model, loader, validator, expression language | todo | reviews/phase-1.md |
+| 1 | Graph model, loader, validator, expression language | self-critique | reviews/phase-1.md |
 | 2 | Execution engine and durability | todo | reviews/phase-2.md |
 | 3 | LLM layer and prompted nodes | todo | reviews/phase-3.md |
 | 4 | Tool runtime and safety nodes | todo | reviews/phase-4.md |
@@ -38,17 +38,17 @@ Exit criterion: `support pack validate packs/acme_billing` runs and reports the 
 
 Design: sections 5.2, 6.1 to 6.4, 6.7.
 
-- [ ] Pydantic schema for graph files: id, description, inputs, outputs, state, start, nodes, edges.
-- [ ] Node type registry with core types `router`, `say`, `end`, `subgraph`; `llm`, `ask`, `tool`, `gate`, `confirm`, `handoff` registered as declared-but-not-executable stubs so the validator can check them now.
-- [ ] Sandboxed expression language: attribute access on `state`, `ctx`, `result`; comparisons; `and`, `or`, `not`; literals; a fixed filter set (`money`, `lower`, `len`, `default`). Parser plus evaluator plus type inference against Pydantic models. No `eval`.
-- [ ] Jinja2 templates for `say`, `ask`, and `confirm` prompts with a sandboxed environment.
-- [ ] Loader: `load_pack(path)` reads `pack.yaml`, all graphs, persona, policies; resolves sub-graph references.
-- [ ] Validator implementing every rule in section 5.2, including the confirm-on-all-paths rule (implemented now against declared tool risk tiers, tools may be stubs).
-- [ ] Graph version pinning data structure (section 6.7) recorded on the pack object.
-- [ ] `support pack validate` prints findings with file and node locations.
-- [ ] Tests: expression language property tests, validator tests with one failing fixture per rule, loader round-trip.
+- [x] Pydantic schema for graph files: id, description, inputs, outputs, state, start, nodes, edges. (`support_core/graph/schema.py`; edges live inside nodes as DESIGN.md 6.4 writes them. `support_core/graph/types.py` turns declared type strings into real Pydantic models without `eval`.)
+- [x] Node type registry with core types `router`, `say`, `end`, `subgraph`; `llm`, `ask`, `tool`, `gate`, `confirm`, `handoff` registered as declared-but-not-executable stubs so the validator can check them now. (`support_core/graph/nodes.py`; each spec records `executable_phase`.)
+- [x] Sandboxed expression language: attribute access on `state`, `ctx`, `result`; comparisons; `and`, `or`, `not`; literals; a fixed filter set (`money`, `lower`, `len`, `default`). Parser plus evaluator plus type inference against Pydantic models. No `eval`. (`support_core/graph/expr/`: lexer, recursive-descent parser, evaluator, static type checker; hypothesis property tests.)
+- [x] Jinja2 templates for `say`, `ask`, and `confirm` prompts with a sandboxed environment. (`support_core/graph/templates.py`; templates are translated into the expression AST and type-checked at load time.)
+- [x] Loader: `load_pack(path)` reads `pack.yaml`, all graphs, persona, policies; resolves sub-graph references. (`support_core/graph/loader.py`, exported as `support_core.load_pack`.)
+- [x] Validator implementing every rule in section 5.2, including the confirm-on-all-paths rule (implemented now against declared tool risk tiers, tools may be stubs). (`support_core/graph/rules.py`; risk tiers come from a declarative `tools/tools.yaml`, which phase 4 replaces with the real registry.)
+- [x] Graph version pinning data structure (section 6.7) recorded on the pack object. (`support_core/graph/pack.py`: `PackPin` with a content hash and a state-shape hash per graph. Data only, no run-time behaviour.)
+- [x] `support pack validate` prints findings with file and node locations. (`Finding.node`; rendered as `[graphs/refund.yaml:issue_refund]`.)
+- [x] Tests: expression language property tests, validator tests with one failing fixture per rule, loader round-trip.
 
-Exit criterion: a deterministic graph using only `router`, `say`, `subgraph`, `end` executes in a unit test through a minimal in-memory stepper, and the validator rejects each malformed fixture with the right rule name.
+Exit criterion: a deterministic graph using only `router`, `say`, `subgraph`, `end` executes in a unit test through a minimal in-memory stepper, and the validator rejects each malformed fixture with the right rule name. Met on 2026-09-05: `tests/test_stepper.py` runs `tests/packs/deterministic_pack` through `tests/stepper.py` (a test utility, not the engine; phase 2 owns that), and `tests/test_graph_validator.py` asserts a rule id per malformed fixture. 343 tests green; `tests/packs/refund_pack` (the DESIGN.md 6.4 refund workflow) validates with no errors.
 
 ## Phase 2: Execution engine and durability
 

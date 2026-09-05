@@ -43,7 +43,8 @@ EXPRESSION_START = re.compile(r"^\s*(state|ctx|result)\b")
 """A scalar that starts with a root is an expression and must parse as one."""
 
 LOOKS_LIKE_EXPRESSION = re.compile(
-    r"(==|!=|<=|>=|\s<\s|\s>\s|\s\|\s|\bnot\s|\sand\s|\sor\s)|^\s*[A-Za-z_][A-Za-z_0-9]*\s*\."
+    r"(==|!=|<=|>=|\s<\s|\s>\s|\s\|\s|\bnot\s|\sand\s|\sor\s)"
+    r"|^\s*[A-Za-z_][A-Za-z_0-9]*\.[A-Za-z_]"
 )
 """A scalar that resembles an expression but does not start with a root is almost certainly a
 typo (``stat.charge_id``), not a literal. DESIGN.md section 6.4 uses the same key for both
@@ -151,6 +152,18 @@ def parse_graph(text: str, *, file: str) -> tuple[Graph | None, list[Finding]]:
                 severity=Severity.ERROR,
                 rule="graph.invalid_yaml",
                 message=f"invalid YAML: {exc}",
+                location=file,
+            )
+        ]
+    except RecursionError:
+        # PyYAML recurses per nesting level, so a file of ten thousand open brackets is a
+        # RecursionError rather than a parse error. The validator's contract is a report, not
+        # an exception, so it becomes a finding like any other malformed file.
+        return None, [
+            Finding(
+                severity=Severity.ERROR,
+                rule="graph.invalid_yaml",
+                message="YAML is nested too deeply to parse",
                 location=file,
             )
         ]
