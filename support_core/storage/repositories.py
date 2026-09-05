@@ -42,6 +42,24 @@ class RunUpdate:
 
 
 @dataclass(slots=True)
+class TurnStart:
+    """The run row the moment a turn begins (DESIGN.md section 7.1, before the first node).
+
+    Written by :func:`claim_and_begin_turn` in the same transaction as the claim. It carries no
+    ``checkpoint_seq``: starting a turn executes no node, so the last committed checkpoint is
+    still the last committed checkpoint.
+    """
+
+    run_id: uuid.UUID
+    frames: list[dict[str, Any]]
+    next_frame_seq: int
+    updated_at: datetime
+    awaiting: dict[str, Any] | None = None
+    pack_fingerprint: str | None = None
+    status: str = "running"
+
+
+@dataclass(slots=True)
 class StepWrite:
     """One ``trace_step`` row (DESIGN.md sections 7.1, 17)."""
 
@@ -146,32 +164,77 @@ async def enqueue_inbound(
     return message
 
 
-async def claim_next_pending(session: AsyncSession, conversation_id: uuid.UUID) -> Message | None:
-    """Claim the oldest pending inbound message, or ``None``.
+async def peek_next_pending(session: AsyncSession, conversation_id: uuid.UUID) -> Message | None:
+    """The oldest pending inbound message, without claiming it.
 
-    The claim is a single statement so that it is atomic even though the caller already holds
-    the conversation's advisory lock: defence in depth costs one ``SKIP LOCKED``.
+    The engine reads the message before it claims it, because everything it must decide before
+    the claim - whether this is a resume or a new root frame, and (from phase 6) what the
+    interrupt check says - needs the text, and none of it may happen inside the transaction that
+    claims. Safe under the conversation's advisory lock, which is the only thing that may claim.
     """
-    statement = text(
-        """
-        UPDATE message SET status = 'received'
-        WHERE id = (
-            SELECT id FROM message
-            WHERE conversation_id = :conversation_id
-              AND direction = 'inbound'
-              AND status = 'pending'
-            ORDER BY created_at, id
-            LIMIT 1
-            FOR UPDATE SKIP LOCKED
+    result = await session.execute(
+        select(Message)
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.direction == "inbound",
+            Message.status == "pending",
         )
-        RETURNING id
-        """
+        .order_by(Message.created_at, Message.id)
+        .limit(1)
     )
-    result = await session.execute(statement, {"conversation_id": conversation_id})
-    row = result.first()
-    if row is None:
-        return None
-    return await session.get(Message, row[0])
+    return result.scalar_one_or_none()
+
+
+async def claim_and_begin_turn(
+    session: AsyncSession,
+    *,
+    message_id: uuid.UUID,
+    run: TurnStart,
+    before_commit: Callable[[], Awaitable[None]] | None = None,
+) -> bool:
+    """Claim one inbound message and start the turn that will consume it, in one transaction.
+
+    This is the durable act that makes a customer message impossible to lose. Claiming marks
+    the row ``received``, which takes it out of the pending queue for ever; the run row is the
+    only place that can then say what it was claimed for. Doing the two in separate
+    transactions leaves a window - the claim committed, the run still ``waiting_customer`` and
+    unaware - in which a dead process loses the message with no way back, because a ``received``
+    row is indistinguishable from one a node has already consumed (independent review finding
+    R1). Committing both together means a crash either leaves the message pending, or leaves a
+    ``running`` run carrying the event, and both are recoverable.
+
+    Returns whether the message was still pending. ``False`` means somebody else claimed it and
+    nothing was written; under the conversation's advisory lock that cannot happen, and the
+    ``status = 'pending'`` predicate on the claim is defence in depth against the day it can.
+    """
+    async with session.begin():
+        claimed = await session.execute(
+            text(
+                "UPDATE message SET status = 'received' "
+                "WHERE id = :id AND status = 'pending' RETURNING id"
+            ),
+            {"id": message_id},
+        )
+        if claimed.first() is None:
+            return False
+        await session.execute(
+            update(Run)
+            .where(Run.id == run.run_id)
+            .values(
+                status=run.status,
+                frames=run.frames,
+                next_frame_seq=run.next_frame_seq,
+                turn_nodes=0,
+                suspended_at=None,
+                timeout_at=None,
+                awaiting=run.awaiting,
+                pack_fingerprint=run.pack_fingerprint,
+                updated_at=run.updated_at,
+            )
+        )
+        if before_commit is not None:
+            await before_commit()
+        return True
 
 
 async def requeue(session: AsyncSession, message_id: uuid.UUID) -> None:

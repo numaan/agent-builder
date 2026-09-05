@@ -24,6 +24,7 @@ import json
 import subprocess
 import sys
 import uuid
+from collections.abc import Iterator
 from datetime import timedelta
 from typing import Any
 
@@ -44,6 +45,7 @@ from tests.engine_support import (
     SimulatedCrash,
     outbound_texts,
     run_row,
+    set_context,
     trace_rows,
 )
 
@@ -323,6 +325,86 @@ async def test_a_crash_between_claiming_a_message_and_delivering_it_keeps_the_me
     assert [message["status"] for message in inbound] == ["received", "received"]
 
 
+async def test_a_crash_between_claiming_a_message_and_starting_the_turn_keeps_the_message(
+    engine: AsyncEngine,
+) -> None:
+    """Independent review finding R1.
+
+    Claiming a message marks the row ``received`` in a transaction of its own; the run does not
+    learn about it until the turn starts. A process that died in between left the row claimed,
+    the run ``waiting_customer`` and nothing anywhere pointing at the message: ``drain`` sees an
+    empty queue and ``recover_stalled`` only looks at runs that are ``running``. A ``received``
+    row is indistinguishable from one a node has already consumed, so no sweep can find it
+    afterwards - the claim and the run's record of what it was claimed for have to be one act.
+    """
+    from tests.engine_support import ENGINE_PACK, messages
+
+    pack = load_pack(ENGINE_PACK)
+    executor = Executor(pack, engine, hooks=Recorder().hooks())
+    conversation_id = await executor.start_conversation(
+        context={"customer": {"identity_verified": True}}
+    )
+    await executor.on_inbound(conversation_id, "hi")
+
+    dying = Recorder(crash_at="after_claim", crash_after=0)
+    doomed = Executor(pack, engine, hooks=dying.hooks())
+    with pytest.raises(SimulatedCrash):
+        await doomed.on_inbound(conversation_id, "40")
+
+    # Nobody writes to this conversation again: the recovery sweep is the only way back.
+    survivor = Executor(pack, engine, hooks=Recorder().hooks())
+    outcomes = await survivor.recover_stalled(older_than=timedelta(seconds=-1))
+
+    assert [outcome.conversation_id for outcome in outcomes] == [conversation_id], (
+        "the conversation is not visible to any recovery path"
+    )
+    assert outcomes[0].status == "done"
+    assert (await outbound_texts(engine, conversation_id))[-1] == "Settled."
+    inbound = [
+        message
+        for message in await messages(engine, conversation_id)
+        if message["direction"] == "inbound"
+    ]
+    assert [(message["text"], message["status"]) for message in inbound] == [
+        ("hi", "received"),
+        ("40", "received"),
+    ]
+
+
+async def test_a_crash_inside_the_claim_transaction_leaves_the_message_pending(
+    engine: AsyncEngine,
+) -> None:
+    """The other side of R1: killed before the claim commits, nothing was claimed at all."""
+    from tests.engine_support import ENGINE_PACK, messages
+
+    pack = load_pack(ENGINE_PACK)
+    executor = Executor(pack, engine, hooks=Recorder().hooks())
+    conversation_id = await executor.start_conversation(
+        context={"customer": {"identity_verified": True}}
+    )
+    await executor.on_inbound(conversation_id, "hi")
+
+    dying = Recorder(crash_at="claim_before_commit", crash_after=0)
+    doomed = Executor(pack, engine, hooks=dying.hooks())
+    with pytest.raises(SimulatedCrash):
+        await doomed.on_inbound(conversation_id, "40")
+
+    inbound = [
+        message
+        for message in await messages(engine, conversation_id)
+        if message["direction"] == "inbound"
+    ]
+    assert [(message["text"], message["status"]) for message in inbound] == [
+        ("hi", "received"),
+        ("40", "pending"),
+    ]
+
+    survivor = Executor(pack, engine, hooks=Recorder().hooks())
+    outcome = await survivor.drain(conversation_id)
+    assert outcome.status == "done"
+    assert (await outbound_texts(engine, conversation_id))[-1] == "Settled."
+
+
 async def test_a_run_whose_graph_changed_underneath_it_hands_off(
     engine: AsyncEngine, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
@@ -358,6 +440,87 @@ async def test_a_run_whose_graph_changed_underneath_it_hands_off(
     assert outcome.status == "waiting_human"
     assert [request.reason for request in recorder.handoffs] == ["pack_incompatible"]
     assert "state shape" in (recorder.handoffs[0].detail or "")
+
+
+GATE_PACK = DETERMINISTIC_PACK.parent / "custom_pack"
+GATE_CRASH_POINTS = ["after_claim", *CRASH_POINTS]
+
+
+def _gate_context(*, verified: bool) -> dict[str, Any]:
+    return {"customer": {"identity_verified": verified, "attributes": {"mode": "gate"}}}
+
+
+@pytest.fixture
+def gate_pack() -> Iterator[Pack]:
+    from tests.engine_support import custom_node_types
+
+    with custom_node_types():
+        yield load_pack(GATE_PACK)
+
+
+async def _gate_signature(engine: AsyncEngine, conversation_id: uuid.UUID) -> dict[str, Any]:
+    """The uninterrupted signature plus what the customer's own messages did.
+
+    A crash during a gate re-check can swallow the reply - leaving it ``received`` where the
+    uninterrupted run leaves it ``pending`` for redelivery - without changing the trace, so the
+    message statuses are part of "the same outcome".
+    """
+    from tests.engine_support import messages
+
+    signature = await _signature(engine, conversation_id)
+    signature["inbound"] = [
+        (message["text"], message["status"])
+        for message in await messages(engine, conversation_id)
+        if message["direction"] == "inbound"
+    ]
+    return signature
+
+
+async def _up_to_the_recheck(pack: Pack, engine: AsyncEngine) -> uuid.UUID:
+    """A frame that passed a gate, suspended after it, and whose precondition then lapsed."""
+    executor = Executor(pack, engine, hooks=Recorder().hooks())
+    conversation_id = await executor.start_conversation(context=_gate_context(verified=True))
+    outcome = await executor.on_inbound(conversation_id, "go")
+    assert outcome.status == "waiting_customer"
+    await set_context(engine, conversation_id, _gate_context(verified=False))
+    return conversation_id
+
+
+@pytest.mark.parametrize("point", GATE_CRASH_POINTS)
+async def test_a_crash_during_a_gate_recheck_resumes_to_the_same_outcome(
+    gate_pack: Pack, engine: AsyncEngine, point: str
+) -> None:
+    """Independent review finding R2.
+
+    The customer replies, the gate's precondition has lapsed, and the re-check pushes the
+    redirect *while the reply is still undelivered*. That is the one moment when the stack moves
+    with an event pending, so a resumed process that works out where to deliver the event from
+    the stack top hands the reply to the redirect's first node - a ``say``, which cannot be
+    resumed - and turns a re-check into a ``node_error`` handoff with the reply swallowed.
+
+    Every kill point must reach the same place as the uninterrupted run: the redirect suspended
+    for a human, and the reply back on the queue.
+    """
+    baseline_conversation = await _up_to_the_recheck(gate_pack, engine)
+    control = Executor(gate_pack, engine, hooks=Recorder().hooks())
+    assert (await control.on_inbound(baseline_conversation, "42")).status == "waiting_human"
+    baseline = await _gate_signature(engine, baseline_conversation)
+
+    conversation_id = await _up_to_the_recheck(gate_pack, engine)
+    dying = Recorder(crash_at=point, crash_after=0)
+    doomed = Executor(gate_pack, engine, hooks=dying.hooks())
+    with pytest.raises(SimulatedCrash):
+        await doomed.on_inbound(conversation_id, "42")
+
+    recorder = Recorder()
+    survivor = Executor(gate_pack, engine, hooks=recorder.hooks())
+    outcome = await survivor.drain(conversation_id)
+
+    assert [request.reason for request in recorder.handoffs] == [], (
+        "the resumed turn invented a failure the uninterrupted one does not have"
+    )
+    assert outcome.status == "waiting_human"
+    assert await _gate_signature(engine, conversation_id) == baseline
 
 
 async def test_a_conversation_nobody_touches_again_is_still_recovered(

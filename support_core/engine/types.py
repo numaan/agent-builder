@@ -19,7 +19,7 @@ interrupt *behaviour* without changing the frame shape or migrating stored stack
 import uuid
 from typing import Any, Literal, Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from support_core.graph.context import ConversationContext
 from support_core.graph.manifest import SuspendStatus
@@ -84,6 +84,18 @@ class ResumeEvent(BaseModel):
 
     message_id: uuid.UUID | None = None
 
+    target_frame_seq: int | None = None
+    target_node_id: str | None = None
+    """The node that suspended, and therefore the only node this event may be delivered to.
+
+    Read from ``run.awaiting`` when the event is created and stored *with* the event, so it is
+    durable state rather than a property of the stack as it happens to be when the loop runs.
+    The stack moves inside a turn - a gate re-check pushes its redirect, and from phase 6 an
+    interrupt pushes a workflow - so a process that resumed a crashed turn and looked at the
+    stack top would deliver the customer's reply to whatever was pushed since (independent
+    review finding R2). An event with no target is delivered to nobody and put back on the
+    queue."""
+
 
 class GraphInvocation(BaseModel):
     """A frame a node asks the engine to push (DESIGN.md section 6.3 ``push_graph``)."""
@@ -124,6 +136,29 @@ class NodeResult(BaseModel):
     llm_response: dict[str, Any] | None = None
     """Recorded on the trace step, so a replay of a completed step does not call a model
     again (DESIGN.md section 7.3). Phase 3 fills it."""
+
+    @model_validator(mode="after")
+    def _one_way_out(self) -> "NodeResult":
+        """At most one of ``suspend``, ``push_graph`` and ``pop``.
+
+        The executor has to pick an order when a node asks for two of them, and whichever it
+        picks silently discards the other. A node that returns richer results than phase 2's -
+        an ``llm`` node that both pushes and suspends, say - would then lose half its intent
+        with nothing to show for it (independent review finding R11).
+        """
+        chosen = [
+            name
+            for name, asked in (
+                ("suspend", self.suspend is not None),
+                ("push_graph", self.push_graph is not None),
+                ("pop", self.pop),
+            )
+            if asked
+        ]
+        if len(chosen) > 1:
+            msg = f"a node result may ask for only one of suspend, push_graph or pop, not {chosen}"
+            raise ValueError(msg)
+        return self
 
 
 class Frame(BaseModel):

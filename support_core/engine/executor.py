@@ -322,27 +322,35 @@ class Executor:
             run = await self._continue_interrupted(conversation, run, outcome)
 
         while run.status in RESUMABLE_BY_CUSTOMER:
-            message = await self._claim(conversation_id)
-            if message is None:
+            turn = await self._claim_turn(conversation, run, outcome)
+            if turn is None:
                 break
             outcome.messages_processed += 1
-            run = await self._turn(conversation, run, message, outcome)
+            run = await self._turn(conversation, turn)
         await self._flush_outbound(conversation_id)
         outcome.status = run.status  # type: ignore[assignment]
         return outcome
 
-    async def _turn(
-        self,
-        conversation: Conversation,
-        run: _RunRow,
-        message: tuple[uuid.UUID, str],
-        outcome: TurnOutcome,
-    ) -> _RunRow:
-        """One customer message (DESIGN.md section 7.1, the body of ``on_inbound``)."""
-        message_id, body = message
+    async def _claim_turn(
+        self, conversation: Conversation, run: _RunRow, outcome: TurnOutcome
+    ) -> _Turn | None:
+        """Claim the next customer message and start its turn, or ``None`` if the queue is empty.
+
+        The claim and the run row that records what was claimed commit **together**
+        (:func:`~support_core.storage.repositories.claim_and_begin_turn`). Everything that has
+        to happen before the claim and must not happen inside its transaction - deciding whether
+        this message resumes a suspended node or starts a fresh root frame, and the interrupt
+        check of DESIGN.md section 6.6, which from phase 6 is a model call - happens here,
+        against the message read without claiming it. A process that dies at any point in this
+        method therefore leaves the message ``pending``; once the transaction commits, the run
+        is ``running`` and carries the event, which every recovery path can see.
+        """
+        peeked = await self._peek(conversation.id)
+        if peeked is None:
+            return None
+        message_id, body = peeked
         ctx = self._context(conversation)
         turn = self._turn_state(run, outcome)
-        event: ResumeEvent | None = None
 
         if run.status == "waiting_customer":
             decision = await self.hooks.interrupt_check(ctx, body, list(turn.frames))
@@ -353,8 +361,17 @@ class Executor:
                     "and arrive in phase 6"
                 )
                 raise EngineError(msg)
-            event = ResumeEvent(kind="customer_message", text=body, message_id=message_id)
+            frame_seq, node_id = self._suspended_at(run, turn.frames)
+            turn.pending_event = ResumeEvent(
+                kind="customer_message",
+                text=body,
+                message_id=message_id,
+                target_frame_seq=frame_seq,
+                target_node_id=node_id,
+            )
         else:
+            # An idle or finished run: this message starts a new root frame rather than
+            # resuming a node, so there is no event for a node to consume.
             turn.frames = []
             self._push(
                 turn,
@@ -365,9 +382,17 @@ class Executor:
                 ),
             )
 
-        turn.pending_event = event
-        await self._begin_turn(turn)
-        undelivered = await self._loop(turn, ctx)
+        turn.status = "running"
+        turn.turn_nodes = 0
+        claimed = await self._claim(turn, message_id)
+        if not claimed:  # pragma: no cover - impossible while we hold the conversation lock
+            return None
+        await self.hooks.probe("after_claim", {"message_id": str(message_id)})
+        return turn
+
+    async def _turn(self, conversation: Conversation, turn: _Turn) -> _RunRow:
+        """One customer message (DESIGN.md section 7.1, the body of ``on_inbound``)."""
+        undelivered = await self._loop(turn, self._context(conversation))
         await self._requeue(turn, undelivered)
         return await self._run_for(conversation.id)
 
@@ -376,11 +401,14 @@ class Executor:
     ) -> _RunRow:
         """Re-enter a turn whose process died. The current node runs again under its own id."""
         turn = self._turn_state(run, outcome)
-        if not turn.frames:
-            await self._set(run.id, status="idle", turn_nodes=0, awaiting=None)
-            return await self._run_for(conversation.id)
         stored = (run.awaiting or {}).get(TURN_EVENT_KEY)
         turn.pending_event = ResumeEvent.model_validate(stored) if stored else None
+        if not turn.frames:
+            # A run marked in flight with nothing on the stack. Whatever put it there, the
+            # message that drove it goes back on the queue rather than down with it.
+            await self._requeue(turn, turn.pending_event)
+            await self._set(run.id, status="idle", turn_nodes=0, awaiting=None)
+            return await self._run_for(conversation.id)
         undelivered = await self._loop(turn, self._context(conversation))
         await self._requeue(turn, undelivered)
         return await self._run_for(conversation.id)
@@ -425,8 +453,13 @@ class Executor:
             # A run parked by the engine itself (a limit, a node failure, a timeout) has no
             # node waiting on an event: re-run the node the human unblocked.
             awaiting = run.awaiting or {}
-            resume_event = event if awaiting.get("kind") == "node" else None
-            turn.pending_event = resume_event
+            if awaiting.get("kind") == "node":
+                frame_seq, node_id = self._suspended_at(run, turn.frames)
+                turn.pending_event = event.model_copy(
+                    update={"target_frame_seq": frame_seq, "target_node_id": node_id}
+                )
+            else:
+                turn.pending_event = None
             await self._begin_turn(turn)
             undelivered = await self._loop(turn, self._context(conversation))
             await self._requeue(turn, undelivered)
@@ -508,10 +541,6 @@ class Executor:
         is lost by a gate firing.
         """
         check_gates = True
-        resume_target = (turn.frame.frame_seq, turn.frame.node_id) if turn.pending_event else None
-        """Where the run suspended. The event belongs to *that* node and to no other: a gate
-        firing on entry pushes a redirect whose first node has not been waiting for anything,
-        and handing it a resume event would call ``resume`` on a node that never suspended."""
         while turn.status == "running":
             frame = turn.frame
             try:
@@ -559,15 +588,22 @@ class Executor:
             started = self.hooks.clock()
             await self.hooks.probe("before_node", {"step_id": sid, "node_id": frame.node_id})
             event = turn.pending_event
-            delivering = event is not None and resume_target == (
-                frame.frame_seq,
-                frame.node_id,
+            # The event belongs to the node that suspended and to no other, and which node that
+            # is comes from the event itself rather than from the stack (finding R2): a gate
+            # firing on entry pushes a redirect whose first node has not been waiting for
+            # anything, and handing it a resume event would call ``resume`` on a node that never
+            # suspended - which after a crash is what "the stack top" would name.
+            delivering = (
+                event is not None
+                and event.target_frame_seq == frame.frame_seq
+                and event.target_node_id == frame.node_id
             )
             try:
                 if delivering and event is not None:
                     result = await runner.resume(state, ctx, runtime, event)
                 else:
                     result = await runner.run(state, ctx, runtime)
+                self._check_outputs(turn, frame, result)
             except NodeError as exc:
                 if delivering:
                     turn.pending_event = None
@@ -638,6 +674,7 @@ class Executor:
             suspend_detail=result.suspend.detail if result.suspend else None,
             suspend_status=result.suspend.status if result.suspend else None,
             suspend_node=node_id if result.suspend else None,
+            suspend_frame_seq=frame.frame_seq if result.suspend else None,
             channel=ctx.channel,
         )
         return stack_changed
@@ -751,6 +788,7 @@ class Executor:
             suspend_status="waiting_human",
             suspend_detail={"reason": reason, "detail": detail},
             suspend_node=node_id,
+            suspend_frame_seq=frame.frame_seq,
             handoff_reason=reason,
         )
         turn.outcome.handoff_reason = reason
@@ -808,6 +846,29 @@ class Executor:
         if frame.return_node is not None:
             caller.node_id = frame.return_node
 
+    def _check_outputs(self, turn: _Turn, frame: Frame, result: NodeResult) -> None:
+        """Refuse an output mapping the caller's state has no field for (finding R12).
+
+        Checked before the pop rather than after it, so it is routed like any other node failure
+        (DESIGN.md section 7.3) and names the mapping. Writing the value anyway produces an
+        ``IncompatiblePackError`` one node later, which is reported to the operator as
+        ``pack_incompatible`` - the wrong diagnosis for a mistake in a ``subgraph`` node's
+        ``outputs``.
+        """
+        if not result.pop or not frame.outputs_into or len(turn.frames) < 2:
+            return
+        caller = turn.frames[-2]
+        graph = self.pack.graphs.get(caller.graph_id)
+        if graph is None:  # pragma: no cover - _graph raises on the caller's next entry
+            return
+        unknown = sorted(set(frame.outputs_into) - set(graph.state.model.model_fields))
+        if unknown:
+            msg = (
+                f"{frame.node_id}: {frame.graph_id} returns into {unknown}, which "
+                f"{caller.graph_id} does not declare in its state"
+            )
+            raise NodeError(msg)
+
     def _failed_gate(
         self, graph: Graph, frame: Frame, state: BaseModel, ctx: ConversationContext
     ) -> str | None:
@@ -839,6 +900,7 @@ class Executor:
         suspend_status: SuspendStatus | None = None,
         suspend_detail: dict[str, Any] | None = None,
         suspend_node: str | None = None,
+        suspend_frame_seq: int | None = None,
         handoff_reason: str | None = None,
         channel: Channel | None = None,
     ) -> None:
@@ -850,7 +912,15 @@ class Executor:
         if suspend_status is not None:
             suspended_at = now
             kind = "handoff" if handoff_reason else "node"
-            awaiting = {"kind": kind, "status": suspend_status, "node": suspend_node}
+            # ``frame_seq`` beside ``node``: together they are the address the next resume event
+            # is delivered to, and it has to survive in durable state rather than be re-derived
+            # from a stack that may have moved (finding R2).
+            awaiting = {
+                "kind": kind,
+                "status": suspend_status,
+                "node": suspend_node,
+                "frame_seq": suspend_frame_seq,
+            }
             if handoff_reason:
                 awaiting["reason"] = handoff_reason
             if suspend_detail:
@@ -940,12 +1010,52 @@ class Executor:
         async with self.sessions() as session, session.begin():
             await repo.set_run_fields(session, run_id, **values)
 
-    async def _claim(self, conversation_id: uuid.UUID) -> tuple[uuid.UUID, str] | None:
+    async def _peek(self, conversation_id: uuid.UUID) -> tuple[uuid.UUID, str] | None:
         async with self.sessions() as session, session.begin():
-            message = await repo.claim_next_pending(session, conversation_id)
+            message = await repo.peek_next_pending(session, conversation_id)
             if message is None:
                 return None
             return message.id, message.text
+
+    async def _claim(self, turn: _Turn, message_id: uuid.UUID) -> bool:
+        """Claim a message and begin its turn in one transaction (finding R1)."""
+
+        async def before_commit() -> None:
+            await self.hooks.probe("claim_before_commit", {"message_id": str(message_id)})
+
+        async with self.sessions() as session:
+            return await repo.claim_and_begin_turn(
+                session,
+                message_id=message_id,
+                run=repo.TurnStart(
+                    run_id=turn.run_id,
+                    frames=[frame.model_dump(mode="json") for frame in turn.frames],
+                    next_frame_seq=turn.next_frame_seq,
+                    awaiting=self._with_turn_event(turn, None),
+                    pack_fingerprint=self.pack.pin.fingerprint,
+                    updated_at=self.hooks.clock(),
+                ),
+                before_commit=before_commit,
+            )
+
+    def _suspended_at(self, run: _RunRow, frames: list[Frame]) -> tuple[int, str]:
+        """Where the run suspended, from durable state (independent review finding R2).
+
+        The suspend checkpoint records the frame and node it suspended at in ``run.awaiting``,
+        which is the same place - and written in the same transaction - as the frame stack
+        itself. Deriving the target from the stack *top* instead works only until something
+        pushes a frame during the turn, and a gate re-check does exactly that while the reply is
+        still undelivered. ``frames[-1]`` is the fall-back for a run suspended by an older
+        version of the engine, whose ``awaiting`` has no ``frame_seq``; it is the same frame,
+        because nothing has run since the suspension.
+        """
+        awaiting = run.awaiting or {}
+        node_id = awaiting.get("node")
+        frame_seq = awaiting.get("frame_seq")
+        if isinstance(node_id, str) and isinstance(frame_seq, int):
+            return frame_seq, node_id
+        top = frames[-1]
+        return top.frame_seq, top.node_id
 
     async def _conversation(self, conversation_id: uuid.UUID) -> Conversation:
         async with self.sessions() as session, session.begin():

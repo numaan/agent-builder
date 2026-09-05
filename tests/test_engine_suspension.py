@@ -85,6 +85,9 @@ async def test_an_ask_node_suspends_waiting_for_the_customer(
         "kind": "node",
         "status": "waiting_customer",
         "node": "collect",
+        # The address the next resume event is delivered to, in durable state so that a crash
+        # cannot make the engine guess it from a stack that has moved (review finding R2).
+        "frame_seq": 0,
         "detail": {"node": "collect", "slots": ["amount"]},
     }
     assert row["suspended_at"] is not None
