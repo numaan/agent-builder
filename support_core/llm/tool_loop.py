@@ -119,8 +119,12 @@ class ReadOnlyToolGateway:
     async def call(self, call: ToolCall) -> ToolOutcome:
         """Run one model-requested tool call, or refuse it."""
         if len(self.calls) >= self.max_calls:
-            return self._refuse(
-                call.name, f"the tool budget for this node ({self.max_calls}) is spent"
+            # Not counted: the budget is already spent, and counting a refusal against a spent
+            # budget would make ``calls`` grow without bound on a model that keeps asking.
+            self.refusals.append(call.name)
+            return ToolOutcome(
+                content=f"refused: the tool budget for this node ({self.max_calls}) is spent",
+                is_error=True,
             )
         spec = (self._specs or {}).get(call.name)
         if spec is None:

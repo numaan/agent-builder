@@ -75,6 +75,11 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# The `live` group calls a real provider and costs money, so it is opt in: `pytest -m live`.
+# PLAN.md: "Phases 3+ use a recorded-response fake provider in tests; live calls only in a
+# marked `live` test group."
+addopts = ["-m", "not live"]
+markers = ["live: calls a real LLM provider; needs ANTHROPIC_API_KEY and is never run by default"]
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = ["error::DeprecationWarning:support_core.*"]
 

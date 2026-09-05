@@ -363,9 +363,16 @@ class AskRunner(_Runner):
             raise NodeError(
                 f"{self.id}: slot extraction failed: {exc}", reason="llm_invalid_output"
             ) from exc
-        unknown = set(patch) - set(type(state).model_fields)
+        # Restricted to the node's *declared slots*, not merely to the state's fields: an ask
+        # node asks for specific values (DESIGN.md section 6.2), and an extractor that writes
+        # some other field is writing something the customer was never asked about. Phase 2
+        # checked the wider set because its extractor could only ever fill the first slot.
+        unknown = set(patch) - set(self.node.slots)
         if unknown:
-            msg = f"{self.id}: slot extraction produced unknown state fields {sorted(unknown)}"
+            msg = (
+                f"{self.id}: slot extraction produced state fields this node did not ask for: "
+                f"{sorted(unknown)}; its slots are {sorted(self.node.slots)}"
+            )
             raise NodeError(msg)
         return NodeResult(state_patch=dict(patch))
 

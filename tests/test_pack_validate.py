@@ -1,7 +1,11 @@
 """``support pack validate`` and the layout validator behind it (DESIGN.md sections 5, 5.2).
 
-Phase 0 exit criterion: the sample pack is reported as "empty but well-formed". The other tests
-pin the finding rule names so phase 1 can extend the validator without breaking the CLI contract.
+Phase 0's exit criterion was that the sample pack is reported "empty but well-formed"; phase 3's
+requires a ``root.yaml`` in it, so the sample pack now validates *with* graphs and the wording
+those three tests pinned is gone. What they were really protecting - the CLI's output contract:
+rule ids printed, a summary line, exit codes, ``--strict`` changing only the status - is asserted
+here as it stands now. The other tests pin the finding rule names so a later phase can extend the
+validator without breaking the CLI contract.
 """
 
 import shutil
@@ -29,33 +33,36 @@ def _rules(pack: Path, severity: Severity | None = None) -> set[str]:
     return {f.rule for f in report.findings if severity is None or f.severity is severity}
 
 
-def test_sample_pack_is_empty_but_well_formed_via_cli() -> None:
+def test_sample_pack_validates_with_its_graphs_via_cli() -> None:
+    """The sample pack has a root graph from phase 3 on, and still validates."""
     result = CliRunner().invoke(cli, ["pack", "validate", str(SAMPLE_PACK)])
     assert result.exit_code == EXIT_OK, result.output
-    assert "acme-billing: empty but well-formed" in result.output
-    assert "pack.empty" in result.output
+    assert "acme-billing: well-formed" in result.output
+    assert "empty" not in result.output
+    # The four warnings are the workflows phase 4 adds, named in `interrupts` already.
+    assert result.output.count("manifest.interrupt_graph_unknown") == 4
 
-    # --strict only changes the exit status; it must not hide INFO findings (review N3).
+    # --strict fails on a warning but must not hide any finding (phase 0 review N3).
     strict = CliRunner().invoke(cli, ["pack", "validate", "--strict", str(SAMPLE_PACK)])
-    assert strict.exit_code == EXIT_OK, strict.output
-    assert "pack.empty" in strict.output
+    assert strict.exit_code == EXIT_INVALID, strict.output
+    assert strict.output.count("manifest.interrupt_graph_unknown") == 4
 
     quiet = CliRunner().invoke(cli, ["pack", "validate", "--quiet", str(SAMPLE_PACK)])
     assert quiet.exit_code == EXIT_OK
-    assert quiet.output.strip() == "acme-billing: empty but well-formed"
+    assert quiet.output.strip() == "acme-billing: well-formed (4 warning(s))"
 
 
 def test_sample_pack_report() -> None:
     report = validate_pack(SAMPLE_PACK)
     assert report.ok
-    assert report.empty
+    assert not report.empty
     assert report.manifest is not None
     assert report.manifest.id == "acme-billing"
     assert report.manifest.entry_graph == "root"
     assert report.manifest.channels == ["web_chat", "email"]
     assert report.manifest.handoff.queue == "billing-tier-1"
     assert report.manifest.limits.max_nodes_per_turn == 25
-    assert {f.rule for f in report.findings} == {"pack.empty"}
+    assert {f.rule for f in report.findings} == {"manifest.interrupt_graph_unknown"}
 
 
 def test_sample_manifest_matches_design_section_5_1() -> None:
@@ -67,6 +74,9 @@ def test_sample_manifest_matches_design_section_5_1() -> None:
     assert manifest.handoff.sla_minutes == 30
     assert manifest.limits.max_llm_cost_per_conversation_usd == 2.0
     assert manifest.core_compatible()
+    # Phase 3 additions (DESIGN.md sections 10, 11.3).
+    assert manifest.llm.confidence_threshold == 0.45
+    assert manifest.memory.summarize_every_turns == 2
 
 
 def test_missing_path_is_an_error(tmp_path: Path) -> None:
@@ -286,7 +296,8 @@ def test_graph_files_are_validated(pack_copy: Path) -> None:
 
 
 def test_directory_with_graph_suffix_is_reported(pack_copy: Path) -> None:
-    """A directory named root.yaml is not silently skipped as 'empty' (review N6)."""
+    """A directory named like a graph is not silently skipped (phase 0 review N6)."""
+    (pack_copy / "graphs" / "root.yaml").unlink()
     (pack_copy / "graphs" / "root.yaml").mkdir()
     report = validate_pack(pack_copy)
     assert not report.ok
@@ -297,6 +308,7 @@ def test_directory_with_graph_suffix_is_reported(pack_copy: Path) -> None:
 
 
 def test_entry_graph_must_exist_once_graphs_are_present(pack_copy: Path) -> None:
+    (pack_copy / "graphs" / "root.yaml").unlink()
     (pack_copy / "graphs" / "refund.yaml").write_text("id: refund\n", encoding="utf-8")
     assert "graph.entry_missing" in _rules(pack_copy, Severity.ERROR)
 

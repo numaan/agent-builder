@@ -355,7 +355,10 @@ def _state(state: Mapping[str, Any], budget: int) -> str:
     """
     if not state:
         return ""
-    kept = dict(state)
+    # Defuse the *values* before YAML re-wraps them: a dumped multi-line string is re-indented,
+    # so a fence line inside a value could come back at the start of a line. Neutralising first
+    # and again after the dump means neither shape survives.
+    kept = {name: _defuse(value) for name, value in state.items()}
     dropped: list[str] = []
     while True:
         body = yaml.safe_dump(kept, sort_keys=True, allow_unicode=True, default_flow_style=False)
@@ -371,6 +374,17 @@ def _state(state: Mapping[str, Any], budget: int) -> str:
         victim = max(kept, key=lambda name: len(str(kept[name])))
         dropped.append(victim)
         del kept[victim]
+
+
+def _defuse(value: Any) -> Any:
+    """Neutralise every string inside a state value, however deeply nested."""
+    if isinstance(value, str):
+        return neutralise(value)
+    if isinstance(value, dict):
+        return {key: _defuse(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_defuse(item) for item in value]
+    return value
 
 
 def _knowledge(passages: Sequence[Passage], budget: int) -> str:

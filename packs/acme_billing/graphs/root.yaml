@@ -1,0 +1,74 @@
+id: root
+description: >
+  Acme Billing's entry graph (DESIGN.md section 6.5). An llm node classifies the customer's
+  intent against the edges the graph declares, small talk is handled here, and every workflow
+  that needs a tool - refunds, address changes, identity verification - is acknowledged and
+  escalated until phase 4 gives them their sub-graphs.
+outputs:
+  outcome: str | None
+state:
+  intent: str | None
+  anything_else: str | None
+  outcome: str | None
+start: classify
+nodes:
+  classify:
+    type: llm
+    description: Decide which of the graph's paths this message belongs on.
+    instructions: |
+      Read the customer's most recent message and decide which path it belongs on.
+
+      - small_talk: greetings, thanks, pleasantries, anything with no billing question in it.
+      - account_question: a question about a charge, an invoice, a refund, or the account
+        itself. These need account access, which this step does not have.
+      - finished: the customer has said they need nothing further.
+      - unclear: you cannot tell, or the message is empty, or it asks for something that is
+        neither of the above.
+
+      Set intent to the label you chose. Do not answer the customer's question here; another
+      step does that.
+    output_schema:
+      intent: str | None
+    edges:
+      small_talk: chat
+      account_question: escalate
+      finished: done_finished
+      unclear: puzzled
+
+  chat:
+    type: llm
+    description: Ordinary conversation - no account data and no action behind it.
+    instructions: |
+      Reply to the customer's small talk in one or two short sentences, in the persona's voice.
+      Do not discuss charges, refunds, balances or account details here, and do not promise
+      that anything will be done: this step has no access to the account and takes no action.
+    edges:
+      done: anything_else
+
+  puzzled:
+    type: say
+    message: >-
+      I did not quite follow that. Could you tell me in a sentence what you would like help
+      with?
+    next: anything_else
+
+  escalate:
+    type: say
+    message: >-
+      That one needs a look at your account, so I am passing it to a billing specialist. They
+      will pick this conversation up.
+    next: done_escalated
+
+  anything_else:
+    type: ask
+    slots: [anything_else]
+    prompt: Is there anything else I can help you with?
+    next: classify
+
+  done_finished:
+    type: end
+    outputs: { outcome: "finished" }
+
+  done_escalated:
+    type: end
+    outputs: { outcome: "escalated" }

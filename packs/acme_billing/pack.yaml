@@ -10,6 +10,8 @@ channels: [web_chat, email]
 llm:
   default_model: claude-sonnet-5
   escalation_model: claude-opus-5     # used for handoff summaries and hard reasoning nodes
+  confidence_threshold: 0.45          # below this, `classify` takes its `unclear` edge (11.3)
+  max_tool_iterations: 5              # DESIGN.md 8.4's bounded read-only loop
 interrupts:
   allowed_from: [root, refund, update_address]
   blocked_in: [verify_identity, payment_capture]
@@ -20,3 +22,7 @@ limits:
   max_nodes_per_turn: 25
   max_tool_calls_per_turn: 10
   max_llm_cost_per_conversation_usd: 2.00
+memory:
+  summarize_every_turns: 2            # DESIGN.md 10's rolling summary, every K turns
+  window_messages: 10
+  max_summary_chars: 600
