@@ -124,3 +124,23 @@ def test_customer_text_containing_template_syntax_is_inert() -> None:
     """DESIGN.md principle 7: untrusted text is data. A rendered value is never re-rendered."""
     out = render("Customer said: {{ state.name }}", scope(name="{{ ctx.customer.email }}"))
     assert out == "Customer said: {{ ctx.customer.email }}"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "{% include 'other' %}",
+        "{{ state.count ** 99999 }}",
+        "{% import 'x' as y %}",
+        "{% extends 'base' %}",
+    ],
+)
+def test_render_only_ever_raises_template_error(source: str) -> None:
+    """Phase-1 review nit N1: Jinja leaks TypeError and ValueError out of these.
+
+    Unreachable from a validated pack - ``validate`` rejects all four - but DESIGN.md 7.3 wants
+    a node failure rather than a crash, and phase 2's hot reload may render before validating.
+    """
+    assert validate(source, env())[0], source
+    with pytest.raises(TemplateError):
+        render(source, scope())

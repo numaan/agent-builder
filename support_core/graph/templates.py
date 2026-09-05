@@ -56,7 +56,6 @@ class TemplateIssue:
 
     message: str
     line: int
-    fatal: bool = True
 
 
 def make_environment() -> SandboxedEnvironment:
@@ -88,21 +87,29 @@ ENVIRONMENT = make_environment()
 
 
 def render(source: str, scope: dict[str, Any]) -> str:
-    """Render ``source`` with the roots in ``scope``. Raises :class:`TemplateError`."""
+    """Render ``source`` with the roots in ``scope``. Raises :class:`TemplateError`, only.
+
+    Jinja does not keep every failure inside its own exception hierarchy: ``{% include %}``
+    raises ``TypeError`` ("no loader for this environment specified") and ``{{ x ** 99999 }}``
+    raises ``ValueError`` from CPython's integer-conversion limit. Neither is reachable from a
+    validated pack, but DESIGN.md section 7.3 wants node failures rather than crashes and phase
+    2's hot reload may render before validating, so every exception is normalised here
+    (phase-1 review nit N1). ``BaseException`` is deliberately not caught.
+    """
     try:
         template = ENVIRONMENT.from_string(source)
         return template.render(**scope)
     except TemplateError:
         raise
-    except jinja2.TemplateError as exc:
-        raise TemplateError(str(exc)) from exc
+    except Exception as exc:
+        raise TemplateError(f"{type(exc).__name__}: {exc}") from exc
 
 
 def validate(source: str, env: TypeEnv) -> tuple[list[TemplateIssue], list[TypeNote]]:
     """Parse ``source``, reject anything outside the allowed subset, and type-check it.
 
-    Returns ``(issues, notes)``. Issues with ``fatal`` are validator errors; notes become
-    warnings (an attribute read through an optional value, for example).
+    Returns ``(issues, notes)``. Every issue is a validator error; notes become warnings (an
+    attribute read through an optional value, for example).
     """
     issues: list[TemplateIssue] = []
     notes: list[TypeNote] = []
