@@ -105,18 +105,46 @@ class Message(Base):
 
 
 class Run(Base):
-    """Durable execution state: the frame stack and checkpoint sequence (sections 7.1, 17)."""
+    """Durable execution state: the frame stack and checkpoint sequence (sections 7.1, 17).
+
+    One run per conversation, for the life of the conversation: DESIGN.md section 7.1 says
+    "load Run" for the conversation being locked, and keeping the id stable is what keeps the
+    ``run_id:frame_seq:node_id:attempt`` step ids of section 7.1 stable across turns. A run
+    that reaches the end of its root frame goes to ``done`` and the next inbound message pushes
+    a fresh root frame onto the same run (phase 0 review left this open for phase 2).
+
+    Columns beyond section 17's list carry the suspension bookkeeping of section 7.2 and the
+    per-turn limit of section 7.3, which have to survive a crash like everything else.
+    """
 
     __tablename__ = "run"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", name="uq_run_conversation"),
+        Index("ix_run_timeout_at", "timeout_at"),
+    )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     conversation_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("conversation.id", ondelete="CASCADE"), nullable=False, index=True
+        ForeignKey("conversation.id", ondelete="CASCADE"), nullable=False
     )
     pack_version: Mapped[str] = mapped_column(nullable=False)
+    pack_fingerprint: Mapped[str | None] = mapped_column()
+    """``PackPin.fingerprint`` the run started on (section 6.7); ``None`` for a run that has
+    never executed a node."""
+
     status: Mapped[str] = mapped_column(nullable=False, server_default="idle")
     frames: Mapped[JsonArray] = mapped_column(nullable=False, server_default=_EMPTY_ARRAY)
     checkpoint_seq: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    turn_nodes: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    """Nodes executed in the current turn, for ``max_nodes_per_turn`` (section 7.3)."""
+
+    suspended_at: Mapped[datetime | None] = mapped_column()
+    timeout_at: Mapped[datetime | None] = mapped_column()
+    """When the per-status timeout of section 7.2 expires; ``None`` means never."""
+
+    awaiting: Mapped[JsonObject | None] = mapped_column()
+    """What the run is waiting for, for example ``{"kind": "async_tool", "step_id": ...}``."""
+
     updated_at: Mapped[datetime] = _updated_at()
 
 
@@ -124,13 +152,15 @@ class TraceStep(Base):
     """One node execution.
 
     ``step_id`` is the deterministic ``run_id:frame_seq:node_id:attempt`` key from
-    section 7.1 and is unique.
+    section 7.1 and is unique. ``seq`` is the run's ``checkpoint_seq`` at write time and gives
+    replay (section 7.3) a total order per run: ``started_at`` cannot, because it is a
+    timestamp and several steps can share one (phase 0 review finding F5).
     """
 
     __tablename__ = "trace_step"
     __table_args__ = (
         UniqueConstraint("step_id", name="uq_trace_step_step_id"),
-        Index("ix_trace_step_run_started", "run_id", "started_at"),
+        UniqueConstraint("run_id", "seq", name="uq_trace_step_run_seq"),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -138,11 +168,18 @@ class TraceStep(Base):
         ForeignKey("run.id", ondelete="CASCADE"), nullable=False
     )
     step_id: Mapped[str] = mapped_column(nullable=False)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
     node_id: Mapped[str] = mapped_column(nullable=False)
     edge: Mapped[str | None] = mapped_column()
     state_patch: Mapped[JsonObject] = mapped_column(nullable=False, server_default=_EMPTY_OBJECT)
     llm_response: Mapped[JsonObject | None] = mapped_column()
+    error: Mapped[str | None] = mapped_column()
+    """The failure this step recorded, if it failed (section 7.3)."""
+
     started_at: Mapped[datetime] = mapped_column(nullable=False, server_default=_NOW)
+    """Written from the engine's clock, never left to the server default: ``now()`` is
+    transaction start, so two steps in one transaction would share it (finding F5)."""
+
     ended_at: Mapped[datetime | None] = mapped_column()
 
 
