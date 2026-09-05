@@ -1144,18 +1144,21 @@ class Executor:
         turn.status = "running"
         turn.turn_nodes = 0
         async with self.sessions() as session, session.begin():
+            # One transaction, not two: a crash between counting the turn and marking the run
+            # running would count a turn that never started, and "every K turns" would drift.
+            await repo.set_run_fields(
+                session,
+                turn.run_id,
+                status="running",
+                turn_nodes=0,
+                awaiting=self._with_turn_event(turn, None),
+                timeout_at=None,
+                suspended_at=None,
+                frames=[frame.model_dump(mode="json") for frame in turn.frames],
+                next_frame_seq=turn.next_frame_seq,
+                updated_at=self.hooks.clock(),
+            )
             await repo.count_turn(session, turn.conversation_id)
-        await self._set(
-            turn.run_id,
-            status="running",
-            turn_nodes=0,
-            awaiting=self._with_turn_event(turn, None),
-            timeout_at=None,
-            suspended_at=None,
-            frames=[frame.model_dump(mode="json") for frame in turn.frames],
-            next_frame_seq=turn.next_frame_seq,
-            updated_at=self.hooks.clock(),
-        )
 
     def _with_turn_event(
         self, turn: _Turn, awaiting: dict[str, Any] | None
