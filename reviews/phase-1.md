@@ -689,3 +689,85 @@ All from the repository root with `.venv/Scripts/python.exe`, Windows 11, Docker
 Scratch files were created under `reviews/scratch-phase-1/` and deleted. No source, test or config
 file was modified; the only repository changes are this section and the Phase 1 status cell in
 BACKLOG.md, set to `in-review`. Nothing was committed. The database was left at `0001 (head)`.
+
+## Resolution
+
+Resolver: a fresh agent that wrote none of the phase-1 code, 2026-09-05 (PLAN.md step 5). Both
+must-fix findings are fixed. Every should-fix is fixed; the reviewer marked none for deferral.
+Two nits are fixed, one is deferred with a checklist line in the phase that will own it, and one
+is closed as no change on the reviewer's own recommendation. The review itself was committed
+first as `05693dc` (it was sitting uncommitted, as in phase 0).
+
+**F1 is a design decision, not only a bug fix.** DESIGN.md 5.2 ("a confirm on all paths") and
+8.2 (an approval bound to `sha256(tool_name + canonical_json(args))`) were ambiguous together:
+the interprocedural coverage analysis accepted a caller-side confirm while `requires_approval`
+could only name a confirm in the tool node's own graph, so a WRITE or HIGH tool inside a
+sub-graph had no valid spelling. Resolved in favour of the **same-graph rule**: the confirm that
+authorises a WRITE or HIGH tool node must be a node in the same graph as that tool node, because
+the hash covers the argument values the callee's own frame computes and a caller-side confirm
+never saw them, so a cross-graph approval could not be verified at run time whatever the
+validator said. Recorded in BACKLOG.md's Decisions log and in one added sentence in DESIGN.md
+8.2 (the only DESIGN.md change made).
+
+| id | severity | action | commit |
+|----|----------|--------|--------|
+| F1 | must-fix | Fixed by tightening the analysis, not by loosening the binding. `confirm_coverage` grows a third must-lattice over *graph ids*: a `confirm` contributes only its own graph, meet is intersection, so a tool node is discharged only when its own graph certainly confirms on every path. `graph.unconfirmed_write` gains a second message naming the graphs whose confirms were found, stating the same-graph requirement and its reason, and saying to move the confirm; `graph.approval_unknown` and `graph.approval_missing` quote the same reason. The contradictory test is replaced by five: the caller-side confirm is rejected (case R), naming a caller's confirm is rejected, the prescribed shape (confirm and call both in the callee) validates clean, a confirm before an intervening sub-graph call still covers a later call *in the caller* (same-graph is not "no intervening call"), and an `ask` inside the callee still invalidates the caller's approval. | 72825d7 |
+| F2 | must-fix | Fixed by adding fixtures, not by deleting ids. One minimal failing fixture each for `graph.end_output_unknown`, `graph.end_output_missing`, `graph.approval_not_needed`, `expr.optional_filter_input` and `expr.optional_comparison`. A new test cross-checks every literal rule id passed to `self.error()` in `rules.py` against the ids the file asserts, so the gap cannot reopen silently; it is what caught the new `graph.approval_reused` needing a fixture too. | a04c298 |
+| F3 | should-fix | Fixed as the reviewer proposed. `entries` promotes a callee whose call sites are all unreachable back to an entry, iterated to a fixpoint because promoting one graph can make another's call sites reachable. Hostile case G2 now reports `graph.unconfirmed_write`; a test pins it. | 72825d7 |
+| F4 | should-fix | Fixed. New ERROR `graph.approval_reused`: a `needs_confirm` tool node reachable from itself without passing a `confirm` or an `ask` means one `ActionApproval` authorises every call the loop makes, and the phase-4 hash check cannot see it because the arguments never change. The search is intra-graph, which is sufficient under the same-graph rule just adopted. Hostile case E is caught; a loop that re-enters through the confirm still validates. Phase-0 finding N1 (single-use approvals) already carries its phase-4 checklist line and is cross-referenced from this one. | 6aff0d9 |
+| F5 | should-fix | Fixed. `postfix` counts every attribute and filter link against `MAX_DEPTH`, so total AST depth is bounded at 32 rather than incidentally at ~249 links by `MAX_TOKENS`. A test finds the deepest accepted chain and parses, unparses, walks, infers and evaluates it inside a 120-frame recursion budget, which pins the frame cost the reviewer measured at 749. | d99e910 |
+| F6 | should-fix | Fixed, both halves. A numeric literal that overflows to `inf` is a `ParseError` ("number is too large to represent"), and a raw control character inside a string literal is a `ParseError` naming the escape to use instead. `unparse` renders strings through a new `literal_source`, which emits only the six escapes the lexer accepts, so its output always re-parses. The property generator now draws quoted text from the whole character space and builds exponent forms, which is what falsified the old property. | d99e910 |
+| F7 | should-fix | Fixed as suggested. `_canonical_args` classifies through `parse_value`, the same literal-versus-expression decision the engine will make, so `{amount: 100}` and `{amount: "100"}` no longer canonicalise alike; an unparsable scalar canonicalises to a distinct marker rather than silently to its raw text. Parametrised test over the int and float spellings. | afcfb52 |
+| F8 | should-fix | Fixed by teaching the checker rather than removing evaluator support: a `dict[str, X]` read types as `X`, a bare `dict` or `dict[str, Any]` as unknown, and a mapping keyed by anything but `str` is still a type error, because an attribute name is always a string. `ctx.customer.attributes`, DESIGN.md 10's CRM record, is now readable from a graph; a validator test pins that, and the re-run sandbox script confirms no attribute outside a declared field became reachable. | 1d298c4 |
+| N1 | nit | Fixed. `render` normalises every exception to `TemplateError` (`BaseException` deliberately not caught) and the docstring says why. A parametrised test covers the four templates that leaked `TypeError`/`ValueError`. | 39023ea |
+| N2 | nit | Fixed: `TemplateIssue.fatal` deleted and the docstring that promised the distinction corrected. | 39023ea |
+| N3 | nit | Deferred to phase 6, with a BACKLOG "Deferred findings" entry and a phase 6 checklist line. Making `graph.subgraph_cycle` path-sensitive needs a cross-graph reachability model that phase 6 has to rebuild anyway for the interrupt push and resume edges; it is not a few safe lines. Hostile case T is still accepted, as recorded. | this commit |
+| N4 | nit | Fixed: the BACKLOG exit criterion says 389 tests, the number after resolution. | this commit |
+| N5 | nit | Wontfix, as the reviewer recommended: `subgraph.inputs` keyed by the callee's name and `subgraph.outputs` by the caller's is consistent under "target: source" and the docstrings say so. Recorded so phase 2 does not re-litigate it. | - |
+
+Beyond the numbered findings, the reviewer's "Test quality" section asked for the dataflow
+differential test to be in the suite. `tests/test_confirm_analysis.py` (`d78e40b`) compares the
+fixpoint analysis against a brute-force enumeration of every path over 300 seeded random acyclic
+graphs, with a second test proving the generator produces both verdicts so the comparison is not
+vacuous. It was mutation-checked: neutering both confirm lattices at once fails it. Six
+forward-compatibility items the reviewer raised for phases 2 and 4 (hostile cases H, I and J,
+the run-time half of F7, the process-wide Jinja environment, and `load_pack` reading each graph
+twice) are recorded under "Deferred findings" with checklist lines in the owning phase.
+
+New rule ids added by this resolution: `graph.approval_reused` (ERROR). `graph.unconfirmed_write`
+gained a second message for the cross-graph case; no rule id was renamed or removed.
+
+### Commands run after the fixes
+
+All from the repository root with `.venv/Scripts/python.exe`, Windows 11, Docker container
+`customer-support-agent-db-1` healthy, database `support_test`.
+
+| Command | Result |
+|---------|--------|
+| `python -m ruff check .` | `All checks passed!` (exit 0) |
+| `python -m ruff format --check .` | `59 files already formatted` (exit 0) |
+| `python -m mypy` (strict) | `Success: no issues found in 59 source files` (exit 0) |
+| `python -m pytest -q` | `389 passed` |
+| `support pack validate packs/acme_billing` | `acme-billing: empty but well-formed`, exit 0 |
+| `support pack validate tests/packs/refund_pack` | `refund-pack: well-formed (5 warning(s))`, exit 0 |
+| `python -m alembic upgrade head && python -m alembic check` | `No new upgrade operations detected.` |
+
+### Adversarial fixtures re-run
+
+The reviewer's scratch scripts were deleted with the review, so they were rebuilt from the tables
+above and run against the resolved code (in scratch, outside the repository).
+
+| Fixture set | Reviewer's result | After resolution |
+|-------------|-------------------|------------------|
+| Expression sandbox, 118 of the reviewer's adversarial inputs: dunders, calls, subscripts, arithmetic, homoglyphs, zero-width and RTL characters, NUL bytes, comment syntax, huge and malformed literals, deep nesting, filter-argument smuggling, reserved attribute names | 0 unexpected exception types; 3 `unparse` round-trip failures | 0 unexpected exception types; **0 round-trip failures**; no attribute outside a declared model field reachable |
+| Templates, 42 escape attempts plus the two inert-text cases | every escape rejected at load and at render; 3 render calls raised something other than `TemplateError` | every escape still rejected at load *and* at render; **0** non-`TemplateError` exceptions; `{{ '{{ ... }}' }}` and `{% raw %}` still render as inert text |
+| Hostile confirm packs A, B, C, D, E, F, G, G2, H, I, J, K, N, R, T | 11 caught, 5 accepted (E, G2, H, I, J) | **13 caught**: E is now `graph.approval_reused` and G2 is now `graph.unconfirmed_write`; A, B, C, D, F, G, K, N and R are unchanged. H, I and J are the three admitted holes, now deferred with named owners; T is N3. |
+| R2, the shape the same-graph decision prescribes (confirm and call both inside the callee) | not tried | accepted with no errors, so F1's unsatisfiable pair really does have a valid spelling now |
+| DESIGN.md 6.4 `refund.yaml` as `tests/packs/refund_pack` | 0 errors, 7 warnings | 0 errors, same warnings; the same-graph rule required no fixture change |
+
+No existing fixture had to change to accommodate the same-graph rule: `refund_pack` already puts
+`confirm_refund` and `issue_refund` in one graph, and `send_otp` in the `verify_identity`
+sub-graph is `confirm_exempt`. The only test that changed is the one the reviewer identified as
+encoding the contradiction.
+
+Phase 1 is closed: BACKLOG.md status `done`.

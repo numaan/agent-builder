@@ -6,7 +6,7 @@ Each phase follows the five-step workflow in [PLAN.md](PLAN.md). Design referenc
 | Phase | Title | Status | Review file |
 |-------|-------|--------|-------------|
 | 0 | Skeleton, tooling, database | done | reviews/phase-0.md |
-| 1 | Graph model, loader, validator, expression language | in-review | reviews/phase-1.md |
+| 1 | Graph model, loader, validator, expression language | done | reviews/phase-1.md |
 | 2 | Execution engine and durability | todo | reviews/phase-2.md |
 | 3 | LLM layer and prompted nodes | todo | reviews/phase-3.md |
 | 4 | Tool runtime and safety nodes | todo | reviews/phase-4.md |
@@ -48,7 +48,7 @@ Design: sections 5.2, 6.1 to 6.4, 6.7.
 - [x] `support pack validate` prints findings with file and node locations. (`Finding.node`; rendered as `[graphs/refund.yaml:issue_refund]`.)
 - [x] Tests: expression language property tests, validator tests with one failing fixture per rule, loader round-trip.
 
-Exit criterion: a deterministic graph using only `router`, `say`, `subgraph`, `end` executes in a unit test through a minimal in-memory stepper, and the validator rejects each malformed fixture with the right rule name. Met on 2026-09-05: `tests/test_stepper.py` runs `tests/packs/deterministic_pack` through `tests/stepper.py` (a test utility, not the engine; phase 2 owns that), and `tests/test_graph_validator.py` asserts a rule id per malformed fixture. 343 tests green; `tests/packs/refund_pack` (the DESIGN.md 6.4 refund workflow) validates with no errors.
+Exit criterion: a deterministic graph using only `router`, `say`, `subgraph`, `end` executes in a unit test through a minimal in-memory stepper, and the validator rejects each malformed fixture with the right rule name. Met on 2026-09-05: `tests/test_stepper.py` runs `tests/packs/deterministic_pack` through `tests/stepper.py` (a test utility, not the engine; phase 2 owns that), and `tests/test_graph_validator.py` asserts a rule id per malformed fixture, now for every ERROR rule id in `rules.py` with a test that keeps it that way (review finding F2). 389 tests green after review resolution; `tests/packs/refund_pack` (the DESIGN.md 6.4 refund workflow) validates with no errors. Resolution recorded in reviews/phase-1.md.
 
 ## Phase 2: Execution engine and durability
 
@@ -63,6 +63,8 @@ Design: sections 6.3, 7.1 to 7.3, 17.
 - [ ] Suspend and resume for `waiting_customer`, `waiting_human`, `waiting_async_tool`, `waiting_timer`; per-status timeouts.
 - [ ] Per-turn limits (`max_nodes_per_turn`) with handoff fallback hook.
 - [ ] Crash recovery: re-execute the current step on resume; replay completed steps from trace.
+- [ ] Hot reload and `PackPin` coherence: `load_pack` reads and parses every graph twice, so a pack edited on disk mid-load can produce a pin describing a mix of two versions; snapshot the directory or hash the bytes actually parsed (phase 1 deferred finding P1).
+- [ ] Make `support_core.graph.templates.ENVIRONMENT` per-pack before anything varies per pack or two pack versions are loaded side by side (phase 1 deferred finding P2).
 - [ ] Tests: kill-and-resume test that interrupts the executor between checkpoint and advance and verifies identical outcome; concurrent inbound test verifying single-writer ordering.
 
 Exit criterion: the kill-and-resume test passes under Postgres, and two concurrent inbound messages are processed in order with no lost state.
@@ -97,6 +99,10 @@ Design: sections 8.1 to 8.4, 6.2 (`tool`, `confirm`, `gate`), 6.4.
 - [ ] MCP adapter with mandatory risk map, unknown tools default HIGH.
 - [ ] Sample pack tools: `list_recent_charges`, `get_charge`, `check_refund_eligibility`, `issue_refund`, `send_otp`, `verify_otp`, backed by an in-memory fake billing system.
 - [ ] `verify_identity.yaml` and `refund.yaml` graphs from section 6.4.
+- [ ] The registry built from the imported `TOOLS` is authoritative for risk tiers; the validator reports drift against `tools/tools.yaml` (phase 1 deferred finding I: a HIGH tool declared `read` removes every check today).
+- [ ] The engine's approval hash classifies scalars with the same `parse_value` rule the validator canonicalises with, so a static pass is not followed by a run-time refusal (phase 1 review F7, run-time half).
+- [ ] Reject a state write, between a `confirm` and the call it approves, to any field the approved arguments read; today the comparison is textual and identical text that evaluates differently passes (phase 1 deferred finding H).
+- [ ] Decide whether `confirm_exempt` on a WRITE tool stays an INFO or gains a required reason string now that the registry is authoritative (phase 1 deferred finding J).
 - [ ] Adversarial tests: approval hash mismatch refused; WRITE tool from llm loop refused; gate bypass by direct sub-graph entry refused; confirmed amount changed before execution refused.
 
 Exit criterion: adversarial approval tests pass and the refund graph runs with the fake provider through confirm and issue_refund.
@@ -127,6 +133,7 @@ Design: sections 6.5, 6.6, 13, 7.3.
 - [ ] `HandoffPacket` builder using the escalation model; `handoff` node; `HandoffSink` protocol with webhook and Postgres queue sinks.
 - [ ] Desk API: list handoffs, reply, resume with state patch, close.
 - [ ] All failure paths from section 7.3 route to handoff with the right reason.
+- [ ] Revisit the confirm-coverage control-flow graph for interrupts: model the interrupt push and the return-and-resume, and make `graph.subgraph_cycle` check the cycle path rather than the whole graph (phase 1 deferred finding N3).
 - [ ] `update_address.yaml` graph in the sample pack.
 
 Exit criterion: the section 19 worked example runs end to end with the fake provider as an integration test, including the interrupt at step 7 and the secondary intent at step 15.
@@ -190,6 +197,12 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
 - [phase 0] N1: `action_approval` has no single-use marker or expiry, so one approval row could satisfy two tool calls with the same args hash, nit (a design gap: DESIGN 8.2 does not demand single use), deferred to phase 4 (checklist line added there).
 - [phase 0] N2 (downgrade half): the initial migration's downgrade drops the `vector` extension, which fails or removes a shared extension if an administrator pre-installed it, nit, deferred to phase 5 which owns pgvector; editing the initial migration for a shared-instance concern is not a risk-free few lines. The superuser requirement is documented in README.
 - [phase 0] N9: two concurrent `pytest` processes against one database corrupt each other's fixtures (reviewer measured 47 passed, 8 errors); README warns but nothing enforces it, nit, deferred because a session-long advisory lock needs a connection that outlives the per-test event loops, which the fixture design avoids on purpose. The dedicated `support_test` database (F2) removes the developer-database half of the risk.
+- [phase 1] N3: `graph.subgraph_cycle` fires only when *no* graph in the cycle contains a suspending node anywhere, not one on the cycle path, so mutual recursion through a graph with an unrelated `ask` on an untaken branch is missed (reviewer's hostile case T, reproduced after resolution), nit, deferred to phase 6, which owns interrupts and has to rebuild the cross-graph control-flow model for the push and resume edges anyway; a path-sensitive cross-graph cycle check is not a few safe lines (checklist line added there).
+- [phase 1] H: the approval-argument comparison is textual, so a `tool` node that rewrites a field the approved arguments read, between the confirm and the call, passes `graph.approval_mismatch` (reviewer's hostile case H, still accepted after resolution), should-fix, deferred to phase 4, which owns the run-time hash check DESIGN.md 8.2 says exists for exactly this and can enforce the static half beside it (checklist line added there).
+- [phase 1] I: risk tiers come from the pack-authored `tools/tools.yaml`, so declaring `issue_refund` as `read` removes every confirm check and makes it callable from an `llm` loop (reviewer's hostile case I), should-fix, deferred to phase 4, which replaces the manifest with the registry built from the imported `TOOLS` and must report drift; phase 1 cannot import pack code (checklist line added there).
+- [phase 1] J: a WRITE tool marked `confirm_exempt` is reported as INFO only, which does not fail `--strict` and forces no human to look (reviewer's hostile case J), nit (DESIGN.md 8.2 asks for exactly this reporting), deferred to phase 4, which owns the registry and can require a reason string (checklist line added there).
+- [phase 1] P1: `load_pack` reads and parses every graph twice, so a pack edited on disk while it runs can produce a `PackPin` whose hashes describe a mix of two versions, nit, deferred to phase 2, which owns hot reload (checklist line added there).
+- [phase 1] P2: `templates.ENVIRONMENT` is a process-wide Jinja environment with a shared template cache; harmless while nothing varies per pack, a concurrency bug the moment a pack supplies a filter or two pack versions load side by side, nit, deferred to phase 2 (checklist line added there).
 - [phase 0] N12: `doc_chunk.embedding` is dimensionless, so no HNSW index is possible and mixed-dimension rows fail only at query time, nit (admitted by the implementer, measured by the reviewer), deferred to phase 5 which picks the embedding model (checklist line added there).
 
 ---
