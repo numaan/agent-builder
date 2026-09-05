@@ -72,3 +72,139 @@ Written before any code, per PLAN.md step 1.
 - **No repositories yet.** Section 18 lists "repositories" under `storage/`; phase 2 is the
   first consumer, so the module is a docstring stub only.
 - **No advisory locking, no pending-message handling.** Both are phase 2 (section 7.1).
+
+## Implementation notes
+
+Environment: Windows 11, Python 3.13.14, Docker 29.7.2 / Compose v5.5.0 (Docker Desktop took
+265 s to become ready), Postgres 16.15 from `pgvector/pgvector:pg16`. Installed versions that
+matter: SQLAlchemy 2.0.52, Alembic 1.19.2, asyncpg 0.31.0, pgvector 0.5.0, pydantic 2.13.5,
+pytest 9.1.1, pytest-asyncio 1.4.0, mypy 2.3.1, ruff 0.16.6, click 8.5.0.
+
+Commands run at the end of the phase, all from the repository root with the `.venv` interpreter:
+
+| Command | Result |
+|---------|--------|
+| `python -m ruff check .` | All checks passed |
+| `python -m ruff format --check .` | 31 files already formatted |
+| `python -m mypy` (strict; `support_core`, `tests`, `packs`) | Success: no issues found in 31 source files |
+| `python -m pytest -q` | 55 passed |
+| `python -m alembic downgrade base && python -m alembic upgrade head && python -m alembic check` | "No new upgrade operations detected" |
+| `support pack validate packs/acme_billing` | `INFO pack.empty [graphs/] ...` then `acme-billing: empty but well-formed`, exit 0 |
+
+Things worth knowing that came up while building:
+
+- **ruff 0.16 reformats Python code blocks inside Markdown.** The first `ruff format .` rewrote
+  the snippets in DESIGN.md. Reverted, and `*.md` is now in `extend-exclude`. Reviewers: if
+  DESIGN.md ever shows a diff you did not make, this is why.
+- **Alembic's `compare_metadata` has blind spots.** Probed by mutating the models on purpose:
+  it caught a changed `ON DELETE` and (once `compare_server_default=True` was set) a changed
+  server default, but not a dropped GIN access method or a changed generated-column
+  expression. `tests/test_migrations.py::test_doc_chunk_search_indexes` covers those two
+  through `pg_indexes` and `information_schema`.
+- **The generated column expression must be written as Postgres stores it**
+  (`to_tsvector('english'::regconfig, text)`), otherwise reflection differs from the model.
+- **Models have no `relationship()`s**, so the unit of work does not order inserts across
+  tables. The smoke test flushes `doc_source` before `doc_chunk`. Phase 5's ingestion code
+  must do the same or add relationships.
+- **Migrations run through the test engine.** `env.py` accepts `config.attributes["connection"]`;
+  `conftest.py` passes a sync connection from `AsyncConnection.run_sync`. That keeps one code
+  path for CLI and tests and avoids a second engine or event loop.
+- **`make` is not on PATH in Git Bash on Windows.** The shell scripts are canonical; the
+  Makefile only wraps them. `.gitattributes` forces LF on `*.sh` so Linux CI can execute them
+  even when checked out from a `core.autocrlf=true` machine.
+
+## Self-critique
+
+Written after re-reading DESIGN.md sections 4.1, 5, 17 and 18 and PLAN.md.
+
+### What did I skip or simplify?
+
+- **All graph validation.** `validate_graphs` is a hook that emits `graph.not_validated` and
+  nothing else. None of the section 5.2 rules exist. This is the plan, but it means
+  `support pack validate` currently says "well-formed" about a pack whose graphs could be
+  nonsense, as long as one is named after `entry_graph`.
+- **`tools/__init__.py` is checked textually**, not imported: a line starting with `TOOLS`
+  passes, even `TOOLS = "oops"`. Importing pack code belongs with the registry (phase 4),
+  which will also validate types. Until then the check is a reminder, not a guarantee.
+- **The public API surface from section 18 does not exist** (`Tool`, `Risk`, `Node`,
+  `NodeResult`, `load_pack`, `create_app`). `support_core/__init__.py` says so rather than
+  exporting placeholders.
+- **`support pack knowledge sync`, `support pack eval`, `support replay`** exit 3 with a
+  message naming the phase. They exist only to fix the command shape.
+- **No repositories, no advisory lock, no pending-message queue** (phase 2).
+- **`doc_chunk.embedding` is dimensionless and has no ANN index.** Rows with different
+  dimensions can coexist and only fail at query time. Phase 5 must fix the dimension in a
+  migration and add the HNSW index; this is recorded in the Plan section too.
+- **No CHECK constraints on `status`, `direction`, `author`, `risk`, `approved_by`.** Any
+  string is accepted until the owning phases define vocabularies.
+- **`updated_at` is maintained client-side** (`onupdate=func.now()`), so a raw SQL `UPDATE`
+  leaves it stale. A trigger would be stricter; deferred until something reads the column.
+- **`persona.md` and `policies.md` are placeholders**, as the backlog asks.
+- **The CI workflow has not run.** It mirrors the local commands and uses the same Postgres
+  image, but nothing has been pushed to GitHub, so "CI green" is not a claim I can make.
+- **`scripts/db-up.sh` was run only in Git Bash on Windows**, not on Linux.
+
+### Where does the code diverge from the design?
+
+Everything in the Plan section's deviation list, plus these that only became visible while coding:
+
+- `message.status` has server default `received`; section 17 only names `pending` (for
+  messages that arrive while the conversation is locked). Phase 2 owns the vocabulary and may
+  change the default.
+- `kg_entity.source_id` and `kg_relation.source_id` are plain text, not foreign keys to
+  `doc_source`, because `sources.yaml` lists knowledge-graph sources separately from document
+  sources. Phase 9 decides whether one source table serves both.
+- `customer_memory.value` is JSONB; section 17 gives no type.
+- Two validator rules are additions not listed in section 5.2: `policies.too_long` (warning,
+  from section 5's "max ~40 lines") and `manifest.interrupts_conflict` (a graph listed in both
+  `allowed_from` and `blocked_in`). Both are cheap and clearly derived from the design.
+- `channels` is restricted to `web_chat` and `email`. Section 12 also describes the human desk
+  but calls it "not a customer channel", so it is deliberately not allowed in `pack.yaml`.
+- The sample `pack.yaml` pins `core: ">=0.0.1,<1"` instead of the section 5.1 literal
+  `">=1.4,<2"`, so the compatibility check passes against `support_core.__version__ = 0.0.1`.
+  The test `test_manifest_core_compatibility` shows the literal value is (correctly) rejected.
+- PLAN.md allows `mypy --strict` to start in phase 1; it is on from phase 0 (stricter, not looser).
+
+### Which tests are weak?
+
+- `test_tables_are_truncated_between_tests` depends on file order and on the preceding insert
+  test having run. Selected on its own it proves nothing. A better test would insert in one
+  fixture scope and observe in another; deferred because the truncation itself is one line.
+- `test_models_match_migrations` is only as good as Alembic's comparison. Verified blind spots:
+  index access method and generated expressions (covered by `test_doc_chunk_search_indexes`),
+  and anything client-side such as `onupdate`. Unverified: comment and collation changes.
+- `test_manifest_required_keys` deletes YAML blocks with a home-made helper keyed on
+  indentation. If someone reformats the sample `pack.yaml` with a different style, the helper,
+  not the code under test, breaks. The `assert mutated != original` guard at least makes that
+  failure loud.
+- Most validator tests call `validate_pack` directly; only four go through `CliRunner`.
+  `--quiet` is untested.
+- The vector test uses 3-dimensional vectors and two rows. It proves the operators work through
+  SQLAlchemy, not anything about search quality or the (absent) index.
+- The Alembic downgrade path is exercised only inside the session fixture. If it breaks, every
+  database test errors with a fixture traceback rather than one targeted failure.
+- Nothing tests `scripts/*.sh`, the Makefile, or the CI workflow file.
+
+### What would break under concurrency or a crash mid-step?
+
+Nothing executes conversation turns yet, so the honest answer is about what the schema and the
+test harness promise to later phases:
+
+- The two crash-safety primitives the design relies on exist and are tested:
+  `uq_trace_step_step_id` (deterministic step ids, section 7.1) and
+  `uq_tool_call_idempotency_key` (at-most-once tool calls, section 8.1). A retried step that
+  re-inserts either row will get a unique violation, which is the behaviour phase 2 and 4 must
+  catch and treat as "already done".
+- There is no advisory lock and nothing enforces a single writer on `run.frames` or
+  `run.checkpoint_seq`. Two processes could interleave checkpoints today. Phase 2 adds
+  `pg_advisory_xact_lock`; until then the `run` table must not be written by application code.
+- The initial migration runs in one transaction (Postgres DDL is transactional and
+  `CREATE EXTENSION` participates), so a crash mid-migration leaves either the old or the new
+  schema, never half of it. The same holds for the test fixture's downgrade/upgrade.
+- The test harness assumes one pytest process per database: `TRUNCATE ... CASCADE` takes
+  `ACCESS EXCLUSIVE` locks and the session fixture rebuilds the schema. Two concurrent runs
+  (for example `pytest -n auto`, or CI and a developer sharing one instance) would corrupt each
+  other's fixtures. README says so; nothing enforces it.
+- Every engine in tests uses `NullPool` and is disposed per test, so no asyncpg connection
+  outlives its event loop. This avoids the classic pytest-asyncio "attached to a different
+  loop" failure but costs a connection per test; fine at this scale.

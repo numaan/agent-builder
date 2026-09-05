@@ -5,7 +5,7 @@ Each phase follows the five-step workflow in [PLAN.md](PLAN.md). Design referenc
 
 | Phase | Title | Status | Review file |
 |-------|-------|--------|-------------|
-| 0 | Skeleton, tooling, database | todo | reviews/phase-0.md |
+| 0 | Skeleton, tooling, database | self-critique | reviews/phase-0.md |
 | 1 | Graph model, loader, validator, expression language | todo | reviews/phase-1.md |
 | 2 | Execution engine and durability | todo | reviews/phase-2.md |
 | 3 | LLM layer and prompted nodes | todo | reviews/phase-3.md |
@@ -23,16 +23,16 @@ Each phase follows the five-step workflow in [PLAN.md](PLAN.md). Design referenc
 
 Design: sections 4.1, 17, 18.
 
-- [ ] `pyproject.toml` with dependencies from PLAN.md conventions; `ruff` and `mypy` configured.
-- [ ] `support_core/` package with the module directories from section 18, each with a docstring stub.
-- [ ] `docker-compose.yml` with Postgres 16 and pgvector; `make db-up` or equivalent script.
-- [ ] Alembic configured; initial migration creating every table in section 17.
-- [ ] `support` CLI entry point with `pack validate` stub.
-- [ ] `packs/acme_billing/` with `pack.yaml`, empty `persona.md`, `policies.md`, `graphs/`, `tools/__init__.py`, `knowledge/`, `evals/`.
-- [ ] `tests/conftest.py` providing an async Postgres session fixture with per-test schema reset.
-- [ ] CI config (GitHub Actions) running ruff, mypy, pytest with a Postgres service.
+- [x] `pyproject.toml` with dependencies from PLAN.md conventions; `ruff` and `mypy` configured.
+- [x] `support_core/` package with the module directories from section 18, each with a docstring stub.
+- [x] `docker-compose.yml` with Postgres 16 and pgvector; `make db-up` or equivalent script (`scripts/db-up.sh`).
+- [x] Alembic configured; initial migration creating every table in section 17.
+- [x] `support` CLI entry point with `pack validate` stub.
+- [x] `packs/acme_billing/` with `pack.yaml`, empty `persona.md`, `policies.md`, `graphs/`, `tools/__init__.py`, `knowledge/`, `evals/`.
+- [x] `tests/conftest.py` providing an async Postgres session fixture with per-test schema reset.
+- [x] CI config (GitHub Actions) running ruff, mypy, pytest with a Postgres service. (Workflow file written and mirrors the local commands; it has not yet executed on GitHub because nothing has been pushed.)
 
-Exit criterion: `support pack validate packs/acme_billing` runs and reports the pack is empty but well-formed; `pytest` runs one database smoke test green.
+Exit criterion: `support pack validate packs/acme_billing` runs and reports the pack is empty but well-formed; `pytest` runs one database smoke test green. Met locally on 2026-09-05 (52 tests green, see reviews/phase-0.md).
 
 ## Phase 1: Graph model, loader, validator, expression language
 

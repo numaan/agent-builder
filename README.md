@@ -39,6 +39,9 @@ Start Postgres 16 with pgvector and wait until it accepts connections:
 sh scripts/db-up.sh        # or: make db-up
 ```
 
+The `scripts/*.sh` files are the canonical way to do things; the `Makefile` only wraps them for
+convenience and needs GNU make, which Git Bash on Windows does not ship.
+
 The container listens on `localhost:5432` with user, password and database all `support`. Every
 component reads the connection string from one place:
 
