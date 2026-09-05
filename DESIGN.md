@@ -477,6 +477,8 @@ class Tool(BaseModel):
 
 Approval binding: `confirm` computes `sha256(tool_name + canonical_json(args))` and stores an `ActionApproval`. The tool node presents the same hash. Mismatch means refuse and route to `on_error`. This closes the gap where a model confirms one amount and then calls with another.
 
+The `confirm` node that authorises a WRITE or HIGH tool node must be a node in the same graph as that tool node, because the hash is taken over the argument values the tool node's own frame computes and a `confirm` in a calling graph cannot see them, so a cross-graph approval could never be verified at run time.
+
 A pack may mark a WRITE tool `confirm_exempt: true` for side effects the customer cannot reasonably be asked about, such as sending a one-time passcode. The validator lists every exemption in its report so they are reviewed deliberately.
 
 ### 8.3 Registry and MCP adapter

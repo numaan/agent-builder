@@ -58,6 +58,17 @@ from support_core.tools.risk import MODEL_CALLABLE, Risk
 Point = tuple[str, str]
 """``(graph id, node id)``: one node of the interprocedural control-flow graph."""
 
+SAME_GRAPH_REASON = (
+    "DESIGN.md section 8.2 hashes the tool name together with the canonical argument values, "
+    "and a confirm in a calling graph cannot see the values the callee computes, so a "
+    "cross-graph approval could never be verified at run time."
+)
+"""Why an approval must be bound to a confirm in the tool node's own graph.
+
+Recorded as a decision in BACKLOG.md (2026-09-05) and stated in DESIGN.md section 8.2. Every
+message that rejects a cross-graph approval quotes it, so a pack author is not left guessing.
+"""
+
 
 def validate_graph_set(
     graphs: dict[str, Graph], tools: ToolManifest, manifest: PackManifest | None
@@ -528,7 +539,8 @@ class _Rules:
             self.error(
                 "graph.approval_missing",
                 f"tool {spec.name!r} is {spec.risk.value} risk, so the node must name the confirm "
-                "node whose ActionApproval binds it (DESIGN.md section 8.2: requires_approval)",
+                f"node whose ActionApproval binds it (DESIGN.md section 8.2: requires_approval). "
+                f"That confirm must be a node in this graph ({graph.id!r}); {SAME_GRAPH_REASON}",
                 graph=graph,
                 node=node_id,
             )
@@ -538,7 +550,8 @@ class _Rules:
             self.error(
                 "graph.approval_unknown",
                 f"requires_approval names {node.requires_approval!r}, which is not a confirm node "
-                "in this graph",
+                f"in this graph ({graph.id!r}). A confirm in a calling graph cannot be named here: "
+                f"{SAME_GRAPH_REASON} Move the confirm into this graph",
                 graph=graph,
                 node=node_id,
             )
@@ -581,7 +594,15 @@ class _Rules:
             needs, because an approval is bound to one action's arguments: a confirm for a
             different action does not authorise this call.
 
-        Transfer function, identical for both:
+        ``confirming_graphs`` (a set of graph ids)
+            "every such path passes a confirm belonging to *each of these graphs*". A WRITE or
+            HIGH tool node is discharged only when its own graph is in that set, because
+            DESIGN.md section 8.2 requires the approving confirm to be a node in the same graph
+            as the tool node (see :data:`SAME_GRAPH_REASON`). A confirm in a calling graph
+            therefore no longer discharges a callee's tool node, even though the analysis is
+            interprocedural and can see it.
+
+        Transfer function, identical for all three:
 
         * graph entry contributes nothing (a conversation begins with a customer message),
         * an ``ask`` node clears it (the customer spoke again since any earlier approval),
@@ -605,37 +626,51 @@ class _Rules:
         universe = frozenset(
             point for point in successors if isinstance(self.node_at(point), ConfirmNode)
         )
+        graph_universe = frozenset(point[0] for point in universe)
         covered: dict[Point, frozenset[Point]] = {
             point: (frozenset() if point in entries else universe) for point in successors
+        }
+        confirming_graphs: dict[Point, frozenset[str]] = {
+            point: (frozenset() if point in entries else graph_universe) for point in successors
         }
         guarded: dict[Point, bool] = {point: point not in entries for point in successors}
         reachable = self.reachable_points(successors, entries)
 
         changed = True
         rounds = 0
-        limit = len(successors) * (len(universe) + 2) + 2
+        limit = len(successors) * (len(universe) + len(graph_universe) + 3) + 2
         while changed and rounds < limit:
             changed = False
             rounds += 1
             for point in successors:
                 at_entry = point in entries
                 incoming: frozenset[Point] | None = frozenset() if at_entry else None
+                incoming_graphs: frozenset[str] | None = frozenset() if at_entry else None
                 incoming_guard: bool | None = False if at_entry else None
                 for pred, label in predecessors.get(point, []):
                     if pred not in reachable:
                         continue
                     out = self.covered_out(pred, covered[pred], label)
                     incoming = out if incoming is None else (incoming & out)
+                    out_graphs = self.confirming_graphs_out(pred, confirming_graphs[pred], label)
+                    incoming_graphs = (
+                        out_graphs if incoming_graphs is None else (incoming_graphs & out_graphs)
+                    )
                     out_guard = self.guarded_out(pred, guarded[pred], label)
                     incoming_guard = (
                         out_guard if incoming_guard is None else (incoming_guard and out_guard)
                     )
                 if incoming is None:
                     incoming = frozenset() if at_entry else universe
+                if incoming_graphs is None:
+                    incoming_graphs = frozenset() if at_entry else graph_universe
                 if incoming_guard is None:
                     incoming_guard = not at_entry
                 if incoming != covered[point]:
                     covered[point] = incoming
+                    changed = True
+                if incoming_graphs != confirming_graphs[point]:
+                    confirming_graphs[point] = incoming_graphs
                     changed = True
                 if incoming_guard != guarded[point]:
                     guarded[point] = incoming_guard
@@ -658,6 +693,22 @@ class _Rules:
                     graph=graph,
                     node=point[1],
                 )
+            elif point[0] not in confirming_graphs[point]:
+                elsewhere = ", ".join(sorted(confirming_graphs[point]))
+                where = (
+                    f"the confirm(s) that do cover it live in graph(s) {elsewhere}"
+                    if elsewhere
+                    else "the confirms that cover it are in other graphs and differ per path"
+                )
+                self.error(
+                    "graph.unconfirmed_write",
+                    f"tool {node.tool!r} is {spec.risk.value} risk and every path to it passes a "
+                    f"confirm, but none of those confirms is a node in this graph "
+                    f"({point[0]!r}): {where}. {SAME_GRAPH_REASON} Move the confirm into "
+                    f"{point[0]!r}, next to the call it authorises",
+                    graph=graph,
+                    node=point[1],
+                )
             elif (
                 node.requires_approval is not None
                 and (point[0], node.requires_approval) not in covered[point]
@@ -676,6 +727,21 @@ class _Rules:
             # The customer's "yes" is itself the last customer input, and it approves exactly
             # this action: earlier approvals do not survive it.
             return frozenset({point}) if label == "yes" else frozenset()
+        if isinstance(node, AskNode):
+            return frozenset()
+        return incoming
+
+    def confirming_graphs_out(
+        self, point: Point, incoming: frozenset[str], label: str
+    ) -> frozenset[str]:
+        """The graph-id twin of :meth:`covered_out`.
+
+        A confirm contributes only *its own* graph, so intersecting over predecessors leaves a
+        graph id in the set exactly when every path passes a confirm defined in that graph.
+        """
+        node = self.node_at(point)
+        if isinstance(node, ConfirmNode):
+            return frozenset({point[0]}) if label == "yes" else frozenset()
         if isinstance(node, AskNode):
             return frozenset()
         return incoming
@@ -744,16 +810,34 @@ class _Rules:
                         successors[end_point].append(_Edge("return", call_site))
 
         entries: set[Point] = set()
-        called = {graph_id for graph_id in returns}
-        for graph_id, graph in self.graphs.items():
-            if graph.start not in graph.nodes:
-                continue
-            entry_graph = self.manifest.entry_graph if self.manifest else None
-            if graph_id == entry_graph or graph_id not in called:
+        entry_graph = self.manifest.entry_graph if self.manifest else None
+        starts: dict[str, Point] = {
+            graph_id: (graph_id, graph.start)
+            for graph_id, graph in self.graphs.items()
+            if graph.start in graph.nodes
+        }
+        for graph_id, start in starts.items():
+            if graph_id == entry_graph or graph_id not in returns:
                 # The pack's entry graph always starts from a customer message; a graph nobody
                 # calls is checked on its own terms rather than skipped.
-                entries.add((graph_id, graph.start))
-        return successors, entries
+                entries.add(start)
+
+        # A graph whose only call sites are themselves unreachable would otherwise be analysed
+        # by nothing at all: it is not an entry (it *is* called) and no reachable path enters
+        # it. Promote such a callee to an entry and repeat, because promoting one graph can
+        # make another graph's call sites reachable. Entries only grow, so this terminates.
+        while True:
+            reachable = self.reachable_points(successors, entries)
+            promoted = {
+                starts[callee_id]
+                for callee_id, call_sites in returns.items()
+                if callee_id in starts
+                and starts[callee_id] not in entries
+                and not any(site in reachable for site in call_sites)
+            }
+            if not promoted:
+                return successors, entries
+            entries |= promoted
 
     def reachable_points(
         self, successors: dict[Point, list[_Edge]], entries: set[Point]

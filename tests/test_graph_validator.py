@@ -821,8 +821,16 @@ nodes:
     assert "graph.unconfirmed_write" not in found
 
 
-def test_a_confirm_in_the_calling_graph_covers_a_call_in_the_sub_graph(pack_dir: Path) -> None:
-    """The analysis is interprocedural, so a confirm before a subgraph call still counts."""
+def test_a_confirm_in_the_calling_graph_does_not_cover_a_call_in_the_sub_graph(
+    pack_dir: Path,
+) -> None:
+    """DESIGN.md 8.2: the approving confirm must be a node in the tool node's own graph.
+
+    The analysis is interprocedural and *can see* the caller's confirm, but the approval hash
+    is computed over the argument values the callee evaluates, which the caller's confirm never
+    saw. Accepting this shape would produce a pack that cannot execute (BACKLOG decision,
+    2026-09-05).
+    """
     caller_graph = """
 id: main
 state:
@@ -861,10 +869,255 @@ nodes:
     next: finish
   finish: { type: end }
 """
+    found = check(pack_dir, {"main": caller_graph, "worker": worker})
+    ids = {f.rule for f in found}
+    assert "graph.unconfirmed_write" in ids
+    # It also has no requires_approval, which DESIGN.md 8.2 demands separately.
+    assert "graph.approval_missing" in ids
+    messages = " ".join(f.message for f in found if f.rule == "graph.unconfirmed_write")
+    assert "none of those confirms is a node in this graph" in messages
+    assert "cannot see the values the callee computes" in messages
+
+
+def test_naming_a_confirm_in_the_calling_graph_is_rejected_with_the_same_graph_reason(
+    pack_dir: Path,
+) -> None:
+    """The other half of the same decision: the tool node may not name a caller's confirm."""
+    caller_graph = """
+id: main
+state:
+  charge_id: str | None
+  amount: float | None
+start: confirm_it
+nodes:
+  confirm_it:
+    type: confirm
+    action:
+      tool: high_tool
+      args: { charge_id: state.charge_id, amount: state.amount }
+    prompt: "Refund it?"
+    edges: { "yes": call, "no": finish }
+  call:
+    type: subgraph
+    graph: worker
+    inputs: { charge_id: state.charge_id, amount: state.amount }
+    next: finish
+  finish: { type: end }
+"""
+    worker = """
+id: worker
+inputs:
+  charge_id: str | None
+  amount: float | None
+state:
+  charge_id: str | None
+  amount: float | None
+start: do_it
+nodes:
+  do_it:
+    type: tool
+    tool: high_tool
+    args: { charge_id: state.charge_id, amount: state.amount }
+    requires_approval: confirm_it
+    next: finish
+  finish: { type: end }
+"""
+    found = check(pack_dir, {"main": caller_graph, "worker": worker})
+    unknown = [f for f in found if f.rule == "graph.approval_unknown"]
+    assert unknown, {f.rule for f in found}
+    assert "Move the confirm into this graph" in unknown[0].message
+
+
+def test_a_confirm_in_the_sub_graph_itself_covers_the_call(pack_dir: Path) -> None:
+    """The shape a pack author must use instead: confirm and call in one graph."""
+    caller_graph = """
+id: main
+state:
+  charge_id: str | None
+  amount: float | None
+start: call
+nodes:
+  call:
+    type: subgraph
+    graph: worker
+    inputs: { charge_id: state.charge_id, amount: state.amount }
+    next: finish
+  finish: { type: end }
+"""
+    worker = """
+id: worker
+inputs:
+  charge_id: str | None
+  amount: float | None
+state:
+  charge_id: str | None
+  amount: float | None
+start: confirm_it
+nodes:
+  confirm_it:
+    type: confirm
+    action:
+      tool: high_tool
+      args: { charge_id: state.charge_id, amount: state.amount }
+    prompt: "Refund it?"
+    edges: { "yes": do_it, "no": finish }
+  do_it:
+    type: tool
+    tool: high_tool
+    args: { charge_id: state.charge_id, amount: state.amount }
+    requires_approval: confirm_it
+    next: finish
+  finish: { type: end }
+"""
+    found = rules(pack_dir, {"main": caller_graph, "worker": worker}, Severity.ERROR)
+    assert found == set(), found
+
+
+def test_a_confirm_before_a_sub_graph_call_still_covers_a_later_call_in_the_caller(
+    pack_dir: Path,
+) -> None:
+    """Same-graph means "the same graph", not "no intervening call".
+
+    The confirm and the tool node are both in ``main``; the frame that runs in between returns
+    without asking the customer anything, so the approval still holds.
+    """
+    caller_graph = """
+id: main
+state:
+  charge_id: str | None
+  amount: float | None
+start: confirm_it
+nodes:
+  confirm_it:
+    type: confirm
+    action:
+      tool: high_tool
+      args: { charge_id: state.charge_id, amount: state.amount }
+    prompt: "Refund it?"
+    edges: { "yes": call, "no": finish }
+  call:
+    type: subgraph
+    graph: worker
+    inputs: { charge_id: state.charge_id }
+    next: do_it
+  do_it:
+    type: tool
+    tool: high_tool
+    args: { charge_id: state.charge_id, amount: state.amount }
+    requires_approval: confirm_it
+    next: finish
+  finish: { type: end }
+"""
+    worker = """
+id: worker
+inputs: { charge_id: str | None }
+state: { charge_id: str | None }
+start: look
+nodes:
+  look:
+    type: tool
+    tool: read_tool
+    args: { charge_id: state.charge_id }
+    next: finish
+  finish: { type: end }
+"""
+    found = rules(pack_dir, {"main": caller_graph, "worker": worker}, Severity.ERROR)
+    assert found == set(), found
+
+
+def test_an_ask_inside_the_called_sub_graph_invalidates_the_callers_approval(
+    pack_dir: Path,
+) -> None:
+    """The customer spoke again inside the callee, so the caller's approval is stale."""
+    caller_graph = """
+id: main
+state:
+  charge_id: str | None
+  amount: float | None
+start: confirm_it
+nodes:
+  confirm_it:
+    type: confirm
+    action:
+      tool: high_tool
+      args: { charge_id: state.charge_id, amount: state.amount }
+    prompt: "Refund it?"
+    edges: { "yes": call, "no": finish }
+  call:
+    type: subgraph
+    graph: worker
+    inputs: { charge_id: state.charge_id }
+    next: do_it
+  do_it:
+    type: tool
+    tool: high_tool
+    args: { charge_id: state.charge_id, amount: state.amount }
+    requires_approval: confirm_it
+    next: finish
+  finish: { type: end }
+"""
+    worker = """
+id: worker
+inputs: { charge_id: str | None }
+state: { charge_id: str | None }
+start: ask_more
+nodes:
+  ask_more:
+    type: ask
+    slots: [charge_id]
+    prompt: "which charge?"
+    next: finish
+  finish: { type: end }
+"""
+    assert "graph.unconfirmed_write" in rules(pack_dir, {"main": caller_graph, "worker": worker})
+
+
+def test_a_graph_called_only_from_an_unreachable_node_is_still_analysed(pack_dir: Path) -> None:
+    """F3: a callee whose only call sites are dead used to be checked by nothing at all."""
+    caller_graph = """
+id: main
+state: { charge_id: str | None }
+start: finish
+nodes:
+  orphan:
+    type: subgraph
+    graph: worker
+    inputs: { charge_id: state.charge_id }
+    next: finish
+  finish: { type: end }
+"""
+    worker = """
+id: worker
+inputs: { charge_id: str | None }
+state:
+  charge_id: str | None
+  amount: float | None
+  shortcut: bool | None
+start: pick
+nodes:
+  pick:
+    type: router
+    edges:
+      state.shortcut == true: do_it
+    default: confirm_it
+  confirm_it:
+    type: confirm
+    action:
+      tool: high_tool
+      args: { charge_id: state.charge_id, amount: state.amount }
+    prompt: "Refund it?"
+    edges: { "yes": do_it, "no": finish }
+  do_it:
+    type: tool
+    tool: high_tool
+    args: { charge_id: state.charge_id, amount: state.amount }
+    requires_approval: confirm_it
+    next: finish
+  finish: { type: end }
+"""
     found = rules(pack_dir, {"main": caller_graph, "worker": worker})
-    assert "graph.unconfirmed_write" not in found
-    # It still has no requires_approval, which DESIGN.md 8.2 demands separately.
-    assert "graph.approval_missing" in found
+    assert "graph.unconfirmed_write" in found
+    assert "graph.node_unreachable" in found
 
 
 def test_an_unconfirmed_second_caller_of_the_sub_graph_is_caught(pack_dir: Path) -> None:
