@@ -1,0 +1,933 @@
+"""The turn loop. Implements DESIGN.md section 7.1, with 7.2 (suspension and resumption) and
+the parts of 7.3 (failure handling) that do not need a tool runtime or a model.
+
+Section 7.1's pseudocode, line by line, and where each line is::
+
+    lock conversation                     locks.conversation_lock, taken in on_inbound/_resume
+    load Run                              _load
+    guardrails.inbound(message)           phase 7; deliberately not stubbed
+    append message to history             repositories.enqueue_inbound, before the lock
+    if waiting_customer: interrupt_check  hooks.interrupt_check (defaults to "continue")
+    elif idle: push root frame            _start_root_frame
+    loop until suspend or end or limits   _loop
+        result = node.run / node.resume   runners
+        apply patch; trace step; checkpt  _checkpoint, one transaction
+        guardrails.outbound               phase 7
+        send outbound                     hooks.send, after the commit
+        advance                           _advance
+    release lock
+
+The single invariant everything else rests on: **the executor holds no authoritative state.**
+Frames, status, sequence numbers and the per-turn counter live in the ``run`` row and are
+written with the trace step in one transaction. The in-memory :class:`_Turn` is a cache of the
+last committed checkpoint, so a process that dies at any point - before a node, after a node,
+inside the checkpoint transaction, or after it - resumes by re-reading the row.
+"""
+
+import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any
+
+from pydantic import BaseModel, ValidationError
+from pydantic_core import to_jsonable_python
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+from support_core.engine.errors import (
+    EngineError,
+    IncompatiblePackError,
+    NodeError,
+)
+from support_core.engine.hooks import EngineHooks, HandoffRequest
+from support_core.engine.locks import conversation_lock
+from support_core.engine.runners import (
+    GateRunner,
+    NodeRuntime,
+    build_runner,
+    resolve_edge,
+)
+from support_core.engine.types import (
+    SUSPEND_STATUSES,
+    Frame,
+    GraphInvocation,
+    NodeResult,
+    OutboundMessage,
+    ResumeEvent,
+    TurnOutcome,
+    step_id,
+)
+from support_core.graph.context import ConversationContext
+from support_core.graph.manifest import Channel, SuspendStatus
+from support_core.graph.nodes import GateNode, NodeBase
+from support_core.graph.pack import Pack
+from support_core.graph.schema import Graph
+from support_core.storage import repositories as repo
+from support_core.storage.models import Conversation, Run
+from support_core.storage.repositories import RunUpdate, StepWrite
+from support_core.storage.session import make_session_factory
+
+ENTRY_INPUTS_KEY = "inputs"
+"""Key inside ``conversation.context`` holding the entry graph's ``inputs``.
+
+DESIGN.md section 6.4 lets a graph declare ``inputs`` and section 17 gives the conversation a
+``context`` JSONB, but nothing says how the *entry* graph is invoked, because in the design's
+own example the root graph takes none. A channel that knows something up front - a web chat
+widget that opened on a charge, an email whose subject named an order - puts it here, and the
+root frame is seeded from it under the same rule the validator enforces for every other graph
+(``graph.input_not_in_state``): an input lands in the state field of the same name."""
+
+RESUMABLE_BY_CUSTOMER = frozenset(["idle", "done", "waiting_customer"])
+"""Statuses in which a customer message starts or continues a turn. A run waiting for a human,
+a tool or a timer keeps its queue: the message is stored and stays ``pending`` until the thing
+it is waiting for arrives, because resuming it early would drop that wait on the floor."""
+
+
+@dataclass(slots=True)
+class _Turn:
+    """The last committed checkpoint, in memory. Never the source of truth."""
+
+    run_id: uuid.UUID
+    conversation_id: uuid.UUID
+    status: str
+    frames: list[Frame]
+    seq: int
+    next_frame_seq: int
+    turn_nodes: int
+    outcome: TurnOutcome
+
+    @property
+    def frame(self) -> Frame:
+        return self.frames[-1]
+
+
+@dataclass(slots=True)
+class _RunRow:
+    """A snapshot of the ``run`` row; the ORM object never leaves its session."""
+
+    id: uuid.UUID
+    conversation_id: uuid.UUID
+    status: str
+    frames: list[dict[str, Any]]
+    checkpoint_seq: int
+    next_frame_seq: int
+    turn_nodes: int
+    awaiting: dict[str, Any] | None
+    pack_fingerprint: str | None
+
+
+def _snapshot(run: Run) -> _RunRow:
+    return _RunRow(
+        id=run.id,
+        conversation_id=run.conversation_id,
+        status=run.status,
+        frames=[dict(frame) for frame in run.frames],
+        checkpoint_seq=run.checkpoint_seq,
+        next_frame_seq=run.next_frame_seq,
+        turn_nodes=run.turn_nodes,
+        awaiting=dict(run.awaiting) if run.awaiting else None,
+        pack_fingerprint=run.pack_fingerprint,
+    )
+
+
+class Executor:
+    """Runs conversations of one pack against one database (DESIGN.md sections 4.1, 7.1).
+
+    Stateless between calls apart from the pack and the runner cache, so any number of
+    processes may share a database: the advisory lock, not the object, is what makes a
+    conversation single-writer.
+    """
+
+    def __init__(
+        self,
+        pack: Pack,
+        engine: AsyncEngine,
+        *,
+        hooks: EngineHooks | None = None,
+        lock_wait_seconds: float = 30.0,
+    ) -> None:
+        self.pack = pack
+        self.engine = engine
+        self.hooks = hooks or EngineHooks()
+        self.lock_wait_seconds = lock_wait_seconds
+        self.sessions = make_session_factory(engine)
+        self._runners: dict[tuple[str, str], Any] = {}
+
+    # -- entry points --------------------------------------------------------------------
+
+    async def start_conversation(
+        self,
+        *,
+        channel: Channel = "web_chat",
+        customer_ref: str | None = None,
+        context: dict[str, Any] | None = None,
+        inputs: dict[str, Any] | None = None,
+    ) -> uuid.UUID:
+        """Create a conversation and its run. Returns the conversation id.
+
+        ``context`` is the :class:`~support_core.graph.context.ConversationContext` the pack's
+        expressions read as ``ctx``; ``inputs`` seeds the entry graph's state (see
+        :data:`ENTRY_INPUTS_KEY`).
+        """
+        stored = dict(context or {})
+        if inputs:
+            stored[ENTRY_INPUTS_KEY] = to_jsonable_python(inputs)
+        async with self.sessions() as session, session.begin():
+            conversation = await repo.create_conversation(
+                session, channel=channel, customer_ref=customer_ref, context=stored
+            )
+            await repo.create_run(
+                session,
+                conversation_id=conversation.id,
+                pack_version=self.pack.manifest.version,
+                pack_fingerprint=self.pack.pin.fingerprint,
+            )
+            return conversation.id
+
+    async def on_inbound(self, conversation_id: uuid.UUID, text: str) -> TurnOutcome:
+        """Accept a customer message and run whatever turns it makes possible.
+
+        The message row is written *before* the lock is attempted, always with
+        ``status = pending``: that is what makes it durable regardless of which process ends up
+        processing it, and what gives the pending queue its order (DESIGN.md section 17).
+        """
+        async with self.sessions() as session, session.begin():
+            conversation = await repo.get_conversation(session, conversation_id)
+            if conversation is None:
+                msg = f"no conversation {conversation_id}"
+                raise EngineError(msg)
+            await repo.enqueue_inbound(session, conversation_id=conversation_id, text_=text)
+
+        async with conversation_lock(
+            self.engine, conversation_id, wait_seconds=self.lock_wait_seconds
+        ) as acquired:
+            if not acquired:
+                return TurnOutcome(conversation_id=conversation_id, queued=True)
+            return await self._drain(conversation_id)
+
+    async def resume_human(
+        self,
+        conversation_id: uuid.UUID,
+        *,
+        text: str | None = None,
+        patch: dict[str, Any] | None = None,
+        close: bool = False,
+    ) -> TurnOutcome:
+        """The desk returning control, or closing (DESIGN.md section 7.2, "Desk API")."""
+        if close:
+            return await self._close(conversation_id)
+        return await self._resume(
+            conversation_id,
+            ResumeEvent(kind="human", text=text, payload=patch or {}),
+            expected="waiting_human",
+            patch=patch,
+        )
+
+    async def resume_async_tool(
+        self, conversation_id: uuid.UUID, *, payload: dict[str, Any] | None = None
+    ) -> TurnOutcome:
+        """A long-running tool calling back (DESIGN.md section 7.2)."""
+        return await self._resume(
+            conversation_id,
+            ResumeEvent(kind="async_tool", payload=payload or {}),
+            expected="waiting_async_tool",
+        )
+
+    async def resume_timer(self, conversation_id: uuid.UUID) -> TurnOutcome:
+        """The scheduler firing a follow-up (DESIGN.md section 7.2)."""
+        return await self._resume(
+            conversation_id, ResumeEvent(kind="timer"), expected="waiting_timer"
+        )
+
+    async def sweep_timeouts(self, now: datetime | None = None) -> list[TurnOutcome]:
+        """Apply expired per-status timeouts (DESIGN.md section 7.2).
+
+        Called by a scheduler; there is no thread inside the engine. Each conversation is
+        handled under its own lock, and a run whose timeout moved while we waited is skipped.
+        """
+        moment = now or self.hooks.clock()
+        async with self.sessions() as session, session.begin():
+            due = [_snapshot(run) for run in await repo.due_runs(session, moment)]
+        outcomes: list[TurnOutcome] = []
+        for run in due:
+            async with conversation_lock(
+                self.engine, run.conversation_id, wait_seconds=self.lock_wait_seconds
+            ) as acquired:
+                if not acquired:
+                    continue
+                outcomes.append(await self._apply_timeout(run.conversation_id, moment))
+        return outcomes
+
+    # -- turn management -----------------------------------------------------------------
+
+    async def _drain(self, conversation_id: uuid.UUID) -> TurnOutcome:
+        """Process the pending queue in order. Called with the conversation lock held."""
+        outcome = TurnOutcome(conversation_id=conversation_id)
+        conversation = await self._conversation(conversation_id)
+        run = await self._run_for(conversation_id)
+        outcome.run_id = run.id
+
+        if run.status == "running":
+            # A process died mid-turn: nothing else could hold the lock we now hold. Finish
+            # that turn from its last checkpoint before touching the queue, so messages stay
+            # in order (DESIGN.md section 7.3, "Engine crash mid-node").
+            run = await self._continue_interrupted(conversation, run, outcome)
+
+        while run.status in RESUMABLE_BY_CUSTOMER:
+            message = await self._claim(conversation_id)
+            if message is None:
+                break
+            outcome.messages_processed += 1
+            run = await self._turn(conversation, run, message, outcome)
+        await self._flush_outbound(conversation_id)
+        outcome.status = run.status  # type: ignore[assignment]
+        return outcome
+
+    async def _turn(
+        self,
+        conversation: Conversation,
+        run: _RunRow,
+        message: tuple[uuid.UUID, str],
+        outcome: TurnOutcome,
+    ) -> _RunRow:
+        """One customer message (DESIGN.md section 7.1, the body of ``on_inbound``)."""
+        message_id, body = message
+        ctx = self._context(conversation)
+        turn = self._turn_state(run, outcome)
+        event: ResumeEvent | None = None
+
+        if run.status == "waiting_customer":
+            decision = await self.hooks.interrupt_check(ctx, body, list(turn.frames))
+            if decision.kind != "continue":
+                msg = (
+                    f"interrupt check returned {decision.kind!r}: pushing a new intent, "
+                    "cancelling and the return-to-workflow prompt are DESIGN.md section 6.6 "
+                    "and arrive in phase 6"
+                )
+                raise EngineError(msg)
+            event = ResumeEvent(kind="customer_message", text=body, message_id=message_id)
+        else:
+            turn.frames = []
+            self._push(
+                turn,
+                GraphInvocation(
+                    graph=self.pack.manifest.entry_graph,
+                    kind="root",
+                    inputs=dict(conversation.context or {}).get(ENTRY_INPUTS_KEY) or {},
+                ),
+            )
+
+        await self._begin_turn(turn)
+        await self._loop(turn, ctx, event)
+        return await self._run_for(conversation.id)
+
+    async def _continue_interrupted(
+        self, conversation: Conversation, run: _RunRow, outcome: TurnOutcome
+    ) -> _RunRow:
+        """Re-enter a turn whose process died. The current node runs again under its own id."""
+        turn = self._turn_state(run, outcome)
+        if not turn.frames:
+            await self._set(run.id, status="idle", turn_nodes=0)
+            return await self._run_for(conversation.id)
+        await self._loop(turn, self._context(conversation), None)
+        return await self._run_for(conversation.id)
+
+    async def _resume(
+        self,
+        conversation_id: uuid.UUID,
+        event: ResumeEvent,
+        *,
+        expected: SuspendStatus,
+        patch: dict[str, Any] | None = None,
+    ) -> TurnOutcome:
+        outcome = TurnOutcome(conversation_id=conversation_id)
+        async with conversation_lock(
+            self.engine, conversation_id, wait_seconds=self.lock_wait_seconds
+        ) as acquired:
+            if not acquired:
+                outcome.queued = True
+                return outcome
+            conversation = await self._conversation(conversation_id)
+            run = await self._run_for(conversation_id)
+            outcome.run_id = run.id
+            if run.status != expected:
+                msg = f"run is {run.status!r}, not {expected!r}; nothing to resume"
+                raise EngineError(msg)
+            turn = self._turn_state(run, outcome)
+            if patch:
+                turn.frame.state.update(to_jsonable_python(patch))
+            # A run parked by the engine itself (a limit, a node failure, a timeout) has no
+            # node waiting on an event: re-run the node the human unblocked.
+            awaiting = run.awaiting or {}
+            resume_event = event if awaiting.get("kind") == "node" else None
+            await self._begin_turn(turn)
+            await self._loop(turn, self._context(conversation), resume_event)
+            await self._flush_outbound(conversation_id)
+            outcome.status = (await self._run_for(conversation_id)).status  # type: ignore[assignment]
+        return outcome
+
+    async def _close(self, conversation_id: uuid.UUID) -> TurnOutcome:
+        async with conversation_lock(
+            self.engine, conversation_id, wait_seconds=self.lock_wait_seconds
+        ) as acquired:
+            if not acquired:
+                return TurnOutcome(conversation_id=conversation_id, queued=True)
+            return await self._close_locked(conversation_id)
+
+    async def _close_locked(self, conversation_id: uuid.UUID) -> TurnOutcome:
+        """Close the conversation. The caller already holds the lock."""
+        now = self.hooks.clock()
+        run = await self._run_for(conversation_id)
+        async with self.sessions() as session, session.begin():
+            await repo.set_run_fields(
+                session,
+                run.id,
+                status="done",
+                awaiting=None,
+                timeout_at=None,
+                suspended_at=None,
+                updated_at=now,
+            )
+            await repo.close_conversation(session, conversation_id, when=now)
+        return TurnOutcome(conversation_id=conversation_id, run_id=run.id, status="done")
+
+    async def _apply_timeout(self, conversation_id: uuid.UUID, now: datetime) -> TurnOutcome:
+        conversation = await self._conversation(conversation_id)
+        run = await self._run_for(conversation_id)
+        outcome = TurnOutcome(conversation_id=conversation_id, run_id=run.id)
+        outcome.status = run.status  # type: ignore[assignment]
+        if run.status not in SUSPEND_STATUSES:
+            return outcome
+        rule = self.pack.manifest.timeouts.rule(
+            run.status,  # type: ignore[arg-type]
+            self._channel(conversation),
+        )
+        if rule.action == "close":
+            return await self._close_locked(conversation_id)
+        if rule.action == "handoff":
+            await self._set(
+                run.id,
+                status="waiting_human",
+                timeout_at=None,
+                suspended_at=now,
+                awaiting={"kind": "handoff", "reason": "timeout", "from": run.status},
+                updated_at=now,
+            )
+            await self.hooks.handoff(
+                HandoffRequest(
+                    conversation_id=conversation_id,
+                    run_id=run.id,
+                    reason="timeout",
+                    detail=f"timed out in {run.status}",
+                    frames=[Frame.model_validate(frame) for frame in run.frames],
+                )
+            )
+            outcome.status = "waiting_human"
+            outcome.handoff_reason = "timeout"
+            return outcome
+        # action "none": clear the deadline so the sweep does not see it again.
+        await self._set(run.id, timeout_at=None, updated_at=now)
+        return outcome
+
+    # -- the loop ------------------------------------------------------------------------
+
+    async def _loop(self, turn: _Turn, ctx: ConversationContext, event: ResumeEvent | None) -> None:
+        """Run nodes until the run suspends, ends, or hits a limit (DESIGN.md section 7.1)."""
+        check_gates = True
+        while turn.status == "running":
+            frame = turn.frame
+            try:
+                graph = self._graph(frame)
+                state = self._state(graph, frame)
+            except IncompatiblePackError as exc:
+                await self._handoff(turn, frame.node_id, "pack_incompatible", str(exc))
+                return
+
+            if check_gates:
+                check_gates = False
+                try:
+                    gate_id = self._failed_gate(graph, frame, state, ctx)
+                except NodeError as exc:
+                    await self._handoff(turn, frame.node_id, "node_error", str(exc))
+                    return
+                if gate_id is not None:
+                    await self._run_gate_recheck(turn, graph, frame, gate_id)
+                    check_gates = True
+                    continue
+
+            limit = self.pack.manifest.limits.max_nodes_per_turn
+            if turn.turn_nodes >= limit:
+                await self._handoff(
+                    turn,
+                    frame.node_id,
+                    "limit_exceeded",
+                    f"max_nodes_per_turn ({limit}) reached",
+                )
+                return
+
+            node = graph.nodes[frame.node_id]
+            attempt = frame.attempts.get(frame.node_id, 0)
+            sid = step_id(turn.run_id, frame.frame_seq, frame.node_id, attempt)
+            runtime = NodeRuntime(
+                graph=graph,
+                frame=frame,
+                step_id=sid,
+                run_id=turn.run_id,
+                conversation_id=turn.conversation_id,
+                hooks=self.hooks,
+                environment=self.pack.environment,
+            )
+            runner = self._runner(graph, frame.node_id, node)
+            started = self.hooks.clock()
+            await self.hooks.probe("before_node", {"step_id": sid, "node_id": frame.node_id})
+            try:
+                if event is not None:
+                    result = await runner.resume(state, ctx, runtime, event)
+                else:
+                    result = await runner.run(state, ctx, runtime)
+            except NodeError as exc:
+                event = None
+                if not await self._route_error(turn, graph, frame, node, sid, started, exc):
+                    return
+                check_gates = False
+                continue
+            event = None
+            await self.hooks.probe("after_node", {"step_id": sid, "node_id": frame.node_id})
+            check_gates = await self._advance(turn, ctx, graph, frame, node, result, sid, started)
+
+    async def _advance(
+        self,
+        turn: _Turn,
+        ctx: ConversationContext,
+        graph: Graph,
+        frame: Frame,
+        node: NodeBase,
+        result: NodeResult,
+        sid: str,
+        started: datetime,
+    ) -> bool:
+        """Apply one node's result to the stack and checkpoint it. Returns "stack changed"."""
+        node_id = frame.node_id
+        patch = to_jsonable_python(result.state_patch)
+        frame.state.update(patch)
+        edge: str | None
+        stack_changed = False
+
+        if result.suspend is not None:
+            edge = None
+            turn.status = result.suspend.status
+        elif result.push_graph is not None:
+            edge = "push"
+            self._push(turn, result.push_graph)
+            stack_changed = True
+        elif result.pop:
+            edge = "pop"
+            self._pop(turn, frame, result.outputs)
+            stack_changed = True
+        else:
+            edge = result.next_edge or "next"
+            frame.node_id = resolve_edge(node, result.next_edge)
+
+        passed_a_gate = (
+            isinstance(node, GateNode) and result.push_graph is None and result.suspend is None
+        )
+        if passed_a_gate and node_id not in frame.passed_gates:
+            frame.passed_gates.append(node_id)
+
+        frame.attempts[node_id] = frame.attempts.get(node_id, 0) + 1
+        await self._checkpoint(
+            turn,
+            step=StepWrite(
+                run_id=turn.run_id,
+                step_id=sid,
+                seq=turn.seq + 1,
+                node_id=node_id,
+                edge=edge,
+                state_patch=patch,
+                llm_response=result.llm_response,
+                started_at=started,
+                ended_at=self.hooks.clock(),
+            ),
+            outbound=[message.text for message in result.outbound],
+            suspend_detail=result.suspend.detail if result.suspend else None,
+            suspend_status=result.suspend.status if result.suspend else None,
+            suspend_node=node_id if result.suspend else None,
+            channel=ctx.channel,
+        )
+        return stack_changed
+
+    async def _run_gate_recheck(
+        self, turn: _Turn, graph: Graph, frame: Frame, gate_id: str
+    ) -> None:
+        """Re-push a gate's redirect because its predicate stopped holding.
+
+        DESIGN.md section 6.6: "Gates fire on every entry to a frame, so an interrupt cannot be
+        used to reach an unverified action." The redirect returns to the node the frame was
+        *actually* at, not to the node after the gate, so nothing between the gate and here is
+        re-executed - and the gate stays in ``passed_gates``, so entering the frame again
+        checks it again.
+        """
+        gate = graph.nodes[gate_id]
+        assert isinstance(gate, GateNode)
+        started = self.hooks.clock()
+        attempt = frame.attempts.get(gate_id, 0)
+        sid = step_id(turn.run_id, frame.frame_seq, gate_id, attempt)
+        self._push(
+            turn,
+            GraphInvocation(graph=gate.redirect, kind="gate_redirect", return_node=frame.node_id),
+        )
+        frame.attempts[gate_id] = attempt + 1
+        await self._checkpoint(
+            turn,
+            step=StepWrite(
+                run_id=turn.run_id,
+                step_id=sid,
+                seq=turn.seq + 1,
+                node_id=gate_id,
+                edge="redirect",
+                started_at=started,
+                ended_at=self.hooks.clock(),
+            ),
+        )
+
+    async def _route_error(
+        self,
+        turn: _Turn,
+        graph: Graph,
+        frame: Frame,
+        node: NodeBase,
+        sid: str,
+        started: datetime,
+        exc: NodeError,
+    ) -> bool:
+        """DESIGN.md section 7.3: the node's ``on_error`` edge if it declares one, else handoff.
+
+        Returns whether the loop should continue. The middle tier of 7.3 - "otherwise the
+        frame's ``on_error`` graph" - has no place in the graph schema phase 1 delivered, so it
+        is not silently invented here; the fall-through is straight to handoff.
+        """
+        on_error = getattr(node, "on_error", None)
+        node_id = frame.node_id
+        if not isinstance(on_error, str):
+            await self._handoff(turn, node_id, "node_error", str(exc), started=started, sid=sid)
+            return False
+        frame.node_id = on_error
+        frame.attempts[node_id] = frame.attempts.get(node_id, 0) + 1
+        await self._checkpoint(
+            turn,
+            step=StepWrite(
+                run_id=turn.run_id,
+                step_id=sid,
+                seq=turn.seq + 1,
+                node_id=node_id,
+                edge="on_error",
+                error=str(exc),
+                started_at=started,
+                ended_at=self.hooks.clock(),
+            ),
+        )
+        return True
+
+    async def _handoff(
+        self,
+        turn: _Turn,
+        node_id: str,
+        reason: str,
+        detail: str,
+        *,
+        started: datetime | None = None,
+        sid: str | None = None,
+    ) -> None:
+        """Give up on the turn and park the run for a human (DESIGN.md section 7.3).
+
+        The handoff *node*, the packet and the queue sinks are phase 6; what phase 2 owns is
+        that every failure path ends in a durable ``waiting_human`` run and one call to the
+        hook, so phase 6 has one place to attach to.
+        """
+        frame = turn.frame
+        attempt = frame.attempts.get(node_id, 0)
+        step = sid or step_id(turn.run_id, frame.frame_seq, node_id, attempt)
+        frame.attempts[node_id] = attempt + 1
+        turn.status = "waiting_human"
+        now = self.hooks.clock()
+        await self._checkpoint(
+            turn,
+            step=StepWrite(
+                run_id=turn.run_id,
+                step_id=step,
+                seq=turn.seq + 1,
+                node_id=node_id,
+                edge=None,
+                error=f"{reason}: {detail}",
+                started_at=started or now,
+                ended_at=now,
+            ),
+            suspend_status="waiting_human",
+            suspend_detail={"reason": reason, "detail": detail},
+            handoff_reason=reason,
+        )
+        turn.outcome.handoff_reason = reason
+        await self.hooks.handoff(
+            HandoffRequest(
+                conversation_id=turn.conversation_id,
+                run_id=turn.run_id,
+                reason=reason,
+                detail=detail,
+                frames=list(turn.frames),
+            )
+        )
+
+    # -- frame stack ---------------------------------------------------------------------
+
+    def _push(self, turn: _Turn, invocation: GraphInvocation) -> None:
+        """Push a frame. Sub-graph calls, gate redirects and (phase 6) interrupts all land here.
+
+        The pushed frame carries the return node, so the caller's own ``node_id`` is untouched
+        until the pop: a crash right after a push resumes inside the callee, which is where the
+        stack says execution is.
+        """
+        graph = self.pack.graphs.get(invocation.graph)
+        if graph is None:
+            msg = f"no graph {invocation.graph!r} in pack {self.pack.id!r}"
+            raise IncompatiblePackError(msg)
+        state = {
+            name: value
+            for name, value in to_jsonable_python(invocation.inputs).items()
+            if name in graph.state.model.model_fields
+        }
+        turn.frames.append(
+            Frame(
+                frame_seq=turn.next_frame_seq,
+                graph_id=graph.id,
+                node_id=graph.start,
+                state=state,
+                kind=invocation.kind,
+                return_node=invocation.return_node,
+                outputs_into=dict(invocation.outputs_into),
+            )
+        )
+        turn.next_frame_seq += 1
+
+    def _pop(self, turn: _Turn, frame: Frame, outputs: dict[str, Any]) -> None:
+        """Pop a frame and map its outputs into the caller (DESIGN.md section 6.2, ``end``)."""
+        turn.frames.pop()
+        if not turn.frames:
+            turn.status = "done"
+            return
+        caller = turn.frame
+        clean = to_jsonable_python(outputs)
+        for state_field, output_name in frame.outputs_into.items():
+            caller.state[state_field] = clean.get(output_name)
+        if frame.return_node is not None:
+            caller.node_id = frame.return_node
+
+    def _failed_gate(
+        self, graph: Graph, frame: Frame, state: BaseModel, ctx: ConversationContext
+    ) -> str | None:
+        """The first gate this frame passed whose predicate no longer holds.
+
+        Run on every entry to a frame - a resume, a return from a pushed frame, and (phase 6) a
+        return from an interrupt - which is DESIGN.md section 6.6's "gates fire on every entry
+        to a frame". Without it, suspending after a gate and coming back later would walk
+        straight into the protected node with the precondition gone.
+        """
+        for gate_id in frame.passed_gates:
+            node = graph.nodes.get(gate_id)
+            if not isinstance(node, GateNode):  # pragma: no cover - the pack is validated
+                continue
+            runner = self._runner(graph, gate_id, node)
+            assert isinstance(runner, GateRunner)
+            if runner.check(state, ctx).push_graph is not None:
+                return gate_id
+        return None
+
+    # -- persistence ---------------------------------------------------------------------
+
+    async def _checkpoint(
+        self,
+        turn: _Turn,
+        *,
+        step: StepWrite,
+        outbound: Sequence[str] = (),
+        suspend_status: SuspendStatus | None = None,
+        suspend_detail: dict[str, Any] | None = None,
+        suspend_node: str | None = None,
+        handoff_reason: str | None = None,
+        channel: Channel | None = None,
+    ) -> None:
+        """One node, one transaction (DESIGN.md section 7.1)."""
+        now = step.ended_at
+        awaiting: dict[str, Any] | None = None
+        timeout_at: datetime | None = None
+        suspended_at: datetime | None = None
+        if suspend_status is not None:
+            suspended_at = now
+            kind = "handoff" if handoff_reason else "node"
+            awaiting = {"kind": kind, "status": suspend_status, "node": suspend_node}
+            if handoff_reason:
+                awaiting["reason"] = handoff_reason
+            if suspend_detail:
+                awaiting["detail"] = suspend_detail
+            rule = self.pack.manifest.timeouts.rule(suspend_status, channel)
+            if rule.seconds is not None:
+                timeout_at = now + timedelta(seconds=rule.seconds)
+
+        update = RunUpdate(
+            run_id=turn.run_id,
+            status=turn.status,
+            frames=[frame.model_dump(mode="json") for frame in turn.frames],
+            checkpoint_seq=step.seq,
+            next_frame_seq=turn.next_frame_seq,
+            turn_nodes=turn.turn_nodes + 1,
+            updated_at=now,
+            suspended_at=suspended_at,
+            timeout_at=timeout_at,
+            awaiting=awaiting,
+            pack_fingerprint=self.pack.pin.fingerprint,
+        )
+
+        async def before_commit() -> None:
+            await self.hooks.probe("checkpoint_before_commit", {"step_id": step.step_id})
+
+        async with self.sessions() as session:
+            await repo.write_checkpoint(
+                session,
+                run=update,
+                step=step,
+                conversation_id=turn.conversation_id,
+                outbound=outbound,
+                before_commit=before_commit,
+            )
+        turn.seq = step.seq
+        turn.turn_nodes += 1
+        turn.outcome.steps.append(step.step_id)
+        turn.outcome.outbound.extend(outbound)
+        await self.hooks.probe("after_checkpoint", {"step_id": step.step_id})
+        if outbound:
+            await self._flush_outbound(turn.conversation_id)
+
+    async def _flush_outbound(self, conversation_id: uuid.UUID) -> None:
+        """Hand every undelivered outbound row to the channel and mark it sent.
+
+        Delivery happens after the commit, so a crash between the two leaves the rows
+        ``pending_send`` and the next checkpoint - or the next turn - retries them. That is
+        at-least-once towards the channel, which is the safe direction: phase 7's adapters own
+        de-duplication at the transport.
+        """
+        async with self.sessions() as session, session.begin():
+            waiting = await repo.pending_outbound(session, conversation_id)
+            if not waiting:
+                return
+            await self.hooks.send(conversation_id, [OutboundMessage(text=m.text) for m in waiting])
+            await repo.mark_sent(session, [m.id for m in waiting])
+
+    async def _begin_turn(self, turn: _Turn) -> None:
+        """Mark the run running and reset the per-turn counter (DESIGN.md section 7.3)."""
+        turn.status = "running"
+        turn.turn_nodes = 0
+        await self._set(
+            turn.run_id,
+            status="running",
+            turn_nodes=0,
+            awaiting=None,
+            timeout_at=None,
+            suspended_at=None,
+            frames=[frame.model_dump(mode="json") for frame in turn.frames],
+            next_frame_seq=turn.next_frame_seq,
+            updated_at=self.hooks.clock(),
+        )
+
+    async def _set(self, run_id: uuid.UUID, **values: Any) -> None:
+        async with self.sessions() as session, session.begin():
+            await repo.set_run_fields(session, run_id, **values)
+
+    async def _claim(self, conversation_id: uuid.UUID) -> tuple[uuid.UUID, str] | None:
+        async with self.sessions() as session, session.begin():
+            message = await repo.claim_next_pending(session, conversation_id)
+            if message is None:
+                return None
+            return message.id, message.text
+
+    async def _conversation(self, conversation_id: uuid.UUID) -> Conversation:
+        async with self.sessions() as session, session.begin():
+            conversation = await repo.get_conversation(session, conversation_id)
+            if conversation is None:
+                msg = f"no conversation {conversation_id}"
+                raise EngineError(msg)
+            session.expunge(conversation)
+            return conversation
+
+    async def _run_for(self, conversation_id: uuid.UUID) -> _RunRow:
+        async with self.sessions() as session, session.begin():
+            run = await repo.load_run(session, conversation_id)
+            if run is None:
+                run = await repo.create_run(
+                    session,
+                    conversation_id=conversation_id,
+                    pack_version=self.pack.manifest.version,
+                    pack_fingerprint=self.pack.pin.fingerprint,
+                )
+            return _snapshot(run)
+
+    # -- helpers -------------------------------------------------------------------------
+
+    def _turn_state(self, run: _RunRow, outcome: TurnOutcome) -> _Turn:
+        return _Turn(
+            run_id=run.id,
+            conversation_id=run.conversation_id,
+            status="running",
+            frames=[Frame.model_validate(frame) for frame in run.frames],
+            seq=run.checkpoint_seq,
+            next_frame_seq=run.next_frame_seq,
+            turn_nodes=run.turn_nodes,
+            outcome=outcome,
+        )
+
+    def _graph(self, frame: Frame) -> Graph:
+        graph = self.pack.graphs.get(frame.graph_id)
+        if graph is None:
+            msg = (
+                f"the run is inside graph {frame.graph_id!r}, which the loaded pack "
+                f"{self.pack.id!r} {self.pack.manifest.version} does not define"
+            )
+            raise IncompatiblePackError(msg)
+        return graph
+
+    def _state(self, graph: Graph, frame: Frame) -> BaseModel:
+        """Rebuild the frame's state model.
+
+        A frame stored under an older pack version whose state shape has changed fails here,
+        which is DESIGN.md section 6.7's "if none exists and the shapes differ, the
+        conversation is handed off". The migration hook itself is phase 9.
+        """
+        try:
+            return graph.state.model.model_validate(frame.state)
+        except ValidationError as exc:
+            msg = (
+                f"the stored state of frame {frame.frame_seq} ({graph.id}.{frame.node_id}) does "
+                f"not fit the state shape of the loaded pack: {exc}"
+            )
+            raise IncompatiblePackError(msg) from exc
+
+    def _runner(self, graph: Graph, node_id: str, node: NodeBase) -> Any:
+        key = (graph.id, node_id)
+        runner = self._runners.get(key)
+        if runner is None:
+            runner = build_runner(node_id, node)
+            self._runners[key] = runner
+        return runner
+
+    def _channel(self, conversation: Conversation) -> Channel:
+        return "email" if conversation.channel == "email" else "web_chat"
+
+    def _context(self, conversation: Conversation) -> ConversationContext:
+        """The read-only ``ctx`` every node and expression sees (DESIGN.md sections 6.1, 10)."""
+        raw = dict(conversation.context or {})
+        raw.pop(ENTRY_INPUTS_KEY, None)
+        customer = dict(raw.get("customer") or {})
+        customer.setdefault("ref", conversation.customer_ref)
+        raw["customer"] = customer
+        raw["conversation_id"] = str(conversation.id)
+        raw["channel"] = self._channel(conversation)
+        raw["summary"] = conversation.summary
+        return ConversationContext.model_validate(raw)

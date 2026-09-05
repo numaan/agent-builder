@@ -1,0 +1,18 @@
+id: tier
+description: Classify an amount into a tier.
+inputs:
+  amount: float | None
+outputs:
+  tier: Literal["high", "low"]
+state:
+  amount: float | None
+start: decide
+nodes:
+  decide:
+    type: router
+    edges:
+      state.amount > 500: high
+    default: low
+
+  high: { type: end, outputs: { tier: high } }
+  low:  { type: end, outputs: { tier: low } }

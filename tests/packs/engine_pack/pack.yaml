@@ -1,0 +1,21 @@
+# A pack for the phase-2 engine tests: suspension, gates, the frame stack and failure routing,
+# using only node types core can execute in phase 2 plus the `wait` and `boom` types the tests
+# register through support_core.engine.register_node_type.
+id: engine-pack
+version: 1.0.0
+core: ">=0.0.1,<1"
+entry_graph: root
+language: en
+channels: [web_chat, email]
+llm:
+  default_model: claude-sonnet-5
+handoff:
+  queue: engine-tests
+limits:
+  max_nodes_per_turn: 8
+timeouts:
+  waiting_customer: { seconds: 1800, action: close }
+  waiting_async_tool: { seconds: 900, action: handoff }
+  channels:
+    email:
+      waiting_customer: { seconds: 604800, action: none }

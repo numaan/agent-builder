@@ -57,6 +57,9 @@ def upgrade() -> None:
 
     op.add_column("run", sa.Column("pack_fingerprint", sa.Text(), nullable=True))
     op.add_column("run", sa.Column("turn_nodes", sa.Integer(), nullable=False, server_default="0"))
+    op.add_column(
+        "run", sa.Column("next_frame_seq", sa.Integer(), nullable=False, server_default="0")
+    )
     op.add_column("run", sa.Column("suspended_at", _TS, nullable=True))
     op.add_column("run", sa.Column("timeout_at", _TS, nullable=True))
     op.add_column("run", sa.Column("awaiting", postgresql.JSONB(), nullable=True))
@@ -79,7 +82,14 @@ def downgrade() -> None:
     op.drop_constraint("uq_run_conversation", "run", type_="unique")
     op.create_index("ix_run_conversation_id", "run", ["conversation_id"])
     op.drop_index("ix_run_timeout_at", table_name="run")
-    for column in ("awaiting", "timeout_at", "suspended_at", "turn_nodes", "pack_fingerprint"):
+    for column in (
+        "awaiting",
+        "timeout_at",
+        "suspended_at",
+        "next_frame_seq",
+        "turn_nodes",
+        "pack_fingerprint",
+    ):
         op.drop_column("run", column)
 
     op.drop_constraint("uq_trace_step_run_seq", "trace_step", type_="unique")

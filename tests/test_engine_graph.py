@@ -1,0 +1,162 @@
+"""The executor walks a graph. Implements the phase-1 exit criterion under the phase-2 engine.
+
+Phase 1's exit criterion was "a deterministic graph using only ``router``, ``say``,
+``subgraph``, ``end`` executes in a unit test through a minimal in-memory stepper". The stepper
+is gone; these tests make the same assertions - the same pack, the same path, the same messages,
+the same outputs - against the real executor and real Postgres, so the criterion survives the
+thing that replaced it.
+"""
+
+import uuid
+
+import pytest
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+from support_core import load_pack
+from support_core.engine import Executor, NodeNotExecutableError
+from support_core.graph.pack import Pack
+from tests.engine_support import (
+    DETERMINISTIC_PACK,
+    PACKS,
+    Recorder,
+    outbound_texts,
+    path,
+    run_row,
+    trace_rows,
+)
+
+
+@pytest.fixture(scope="module")
+def pack() -> Pack:
+    return load_pack(DETERMINISTIC_PACK)
+
+
+@pytest.fixture
+def recorder() -> Recorder:
+    return Recorder()
+
+
+@pytest.fixture
+def executor(pack: Pack, engine: AsyncEngine, recorder: Recorder) -> Executor:
+    return Executor(pack, engine, hooks=recorder.hooks())
+
+
+async def _run(executor: Executor, amount: float, **kwargs: object) -> tuple[uuid.UUID, uuid.UUID]:
+    conversation_id = await executor.start_conversation(inputs={"amount": amount}, **kwargs)  # type: ignore[arg-type]
+    outcome = await executor.on_inbound(conversation_id, "hello")
+    assert outcome.run_id is not None
+    return conversation_id, outcome.run_id
+
+
+async def test_high_tier_path(executor: Executor, engine: AsyncEngine) -> None:
+    conversation_id = await executor.start_conversation(
+        inputs={"amount": 250.0}, context={"customer": {"name": "Ada"}}
+    )
+    outcome = await executor.on_inbound(conversation_id, "hello")
+
+    assert outcome.run_id is not None
+    assert await path(engine, outcome.run_id) == [
+        "greet",
+        "classify",
+        "decide",
+        "high",
+        "tier_router",
+        "escalate",
+        "done",
+    ]
+    assert await outbound_texts(engine, conversation_id) == [
+        "Hello Ada, that charge is 250.00.",
+        "A specialist will look at this personally.",
+    ]
+    assert outcome.status == "done"
+
+
+async def test_low_tier_path_and_the_default_template_value(
+    executor: Executor, engine: AsyncEngine
+) -> None:
+    conversation_id, run_id = await _run(executor, 20.0)
+    assert (await path(engine, run_id))[-2:] == ["settle", "done"]
+    greeting = (await outbound_texts(engine, conversation_id))[0]
+    assert greeting == "Hello there, that charge is 20.00."
+
+
+async def test_sub_graph_outputs_land_in_the_caller_state(
+    executor: Executor, engine: AsyncEngine
+) -> None:
+    _, run_id = await _run(executor, 250.0)
+    steps = await trace_rows(engine, run_id)
+    tier_router = next(step for step in steps if step["node_id"] == "tier_router")
+    assert tier_router["edge"] == "state.tier == 'high'"
+
+
+async def test_the_run_is_deterministic(pack: Pack, engine: AsyncEngine) -> None:
+    """Two conversations of the same pack produce the same path, edges and messages."""
+    first_executor = Executor(pack, engine, hooks=Recorder().hooks())
+    second_executor = Executor(pack, engine, hooks=Recorder().hooks())
+    first_conversation, first_run = await _run(first_executor, 101.0)
+    second_conversation, second_run = await _run(second_executor, 101.0)
+
+    def shape(rows: list[dict[str, object]]) -> list[tuple[object, object, object]]:
+        return [(row["seq"], row["node_id"], row["edge"]) for row in rows]
+
+    assert shape(await trace_rows(engine, first_run)) == shape(await trace_rows(engine, second_run))
+    assert await outbound_texts(engine, first_conversation) == await outbound_texts(
+        engine, second_conversation
+    )
+
+
+async def test_a_router_without_a_matching_branch_hands_off(
+    engine: AsyncEngine, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """The engine refuses to guess. DESIGN.md section 7.3 routes a node failure to a handoff."""
+    import shutil
+
+    target = tmp_path_factory.mktemp("packs") / "pack"
+    shutil.copytree(DETERMINISTIC_PACK, target)
+    tier = target / "graphs" / "tier.yaml"
+    tier.write_text(
+        tier.read_text(encoding="utf-8").replace("    default: low\n", ""), encoding="utf-8"
+    )
+    recorder = Recorder()
+    executor = Executor(load_pack(target), engine, hooks=recorder.hooks())
+    conversation_id, run_id = await _run(executor, 1.0)
+
+    assert [request.reason for request in recorder.handoffs] == ["node_error"]
+    assert "no router branch matched" in (recorder.handoffs[0].detail or "")
+    row = await run_row(engine, conversation_id)
+    assert row["status"] == "waiting_human"
+    assert row["awaiting"]["reason"] == "node_error"
+    failed = (await trace_rows(engine, run_id))[-1]
+    assert failed["node_id"] == "decide"
+    assert "node_error" in failed["error"]
+
+
+async def test_the_engine_refuses_node_types_core_cannot_run_yet(engine: AsyncEngine) -> None:
+    """PLAN.md's standing rule: nothing in phase 2 can execute a tool, and it does not pretend."""
+    executor = Executor(load_pack(PACKS / "refund_pack"), engine, hooks=Recorder().hooks())
+    conversation_id = await executor.start_conversation()
+    with pytest.raises(NodeNotExecutableError, match="'llm' is not executable until phase 3"):
+        await executor.on_inbound(conversation_id, "hello")
+
+
+async def test_a_runaway_graph_hits_the_per_turn_limit(
+    engine: AsyncEngine, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """DESIGN.md section 7.3: limits hit means handoff with reason ``limit_exceeded``."""
+    import shutil
+
+    target = tmp_path_factory.mktemp("packs") / "pack"
+    shutil.copytree(DETERMINISTIC_PACK, target)
+    manifest = target / "pack.yaml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8") + "limits:\n  max_nodes_per_turn: 3\n",
+        encoding="utf-8",
+    )
+    recorder = Recorder()
+    executor = Executor(load_pack(target), engine, hooks=recorder.hooks())
+    conversation_id, _ = await _run(executor, 250.0)
+
+    assert [request.reason for request in recorder.handoffs] == ["limit_exceeded"]
+    row = await run_row(engine, conversation_id)
+    assert row["status"] == "waiting_human"
+    assert row["turn_nodes"] == 4  # three nodes, then the step that records the refusal

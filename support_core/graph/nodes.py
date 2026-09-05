@@ -12,10 +12,14 @@ Each :class:`NodeTypeSpec` records the four facts DESIGN.md section 6.2 tabulate
 * ``suspends`` - what it waits for, if anything (DESIGN.md section 7.2),
 * ``executable`` - whether core can run it *today*.
 
-``router``, ``say``, ``end`` and ``subgraph`` are executable in phase 1. ``llm``, ``ask``,
-``tool``, ``gate``, ``confirm`` and ``handoff`` are declared but not executable: the validator
-type-checks them now and phases 2 to 4 supply the behaviour. ``executable_phase`` records which
-phase that is, so "not implemented" is never a mystery.
+``router``, ``say``, ``end`` and ``subgraph`` became executable in phase 1; ``gate`` and
+``ask`` in phase 2, because DESIGN.md section 6.6 ("gates fire on every entry to a frame") and
+section 7.2 (suspension) are phase 2's subject and neither can be tested without running one.
+A gate only evaluates an expression and pushes a graph; an ``ask`` node's slot extraction, the
+one part that needs a model, is an injectable hook whose default is deterministic and which
+phase 3 replaces. ``llm``, ``tool``, ``confirm`` and ``handoff`` are declared but not
+executable: the validator type-checks them now and phases 3, 4 and 6 supply the behaviour.
+``executable_phase`` records which phase that is, so "not implemented" is never a mystery.
 """
 
 from dataclasses import dataclass
@@ -237,8 +241,8 @@ NODE_TYPES: dict[str, NodeTypeSpec] = {
         model=AskNode,
         chooses_edge=False,
         suspends="waiting_customer",
-        executable=False,
-        executable_phase=3,
+        executable=True,
+        executable_phase=2,
         template_fields=("prompt",),
     ),
     "tool": NodeTypeSpec(
@@ -255,8 +259,8 @@ NODE_TYPES: dict[str, NodeTypeSpec] = {
         model=GateNode,
         chooses_edge=False,
         suspends=None,
-        executable=False,
-        executable_phase=4,
+        executable=True,
+        executable_phase=2,
         expression_fields=("predicate",),
     ),
     "confirm": NodeTypeSpec(
@@ -278,14 +282,24 @@ NODE_TYPES: dict[str, NodeTypeSpec] = {
     ),
 }
 
-EXECUTABLE_TYPES: frozenset[str] = frozenset(
-    name for name, spec in NODE_TYPES.items() if spec.executable
-)
-CUSTOMER_INPUT_TYPES: frozenset[str] = frozenset(
-    name for name, spec in NODE_TYPES.items() if spec.suspends == "waiting_customer"
-)
-"""Node types that receive a customer message. The confirm-on-all-paths analysis in
-:mod:`.rules` treats these as the "last customer input" points of DESIGN.md section 5.2."""
+
+def executable_types() -> frozenset[str]:
+    """Node types core can run today.
+
+    A function, not a constant: :func:`support_core.engine.runners.register_node_type` can add
+    a type at run time (DESIGN.md section 6.2, "custom node types are Python classes registered
+    by name in the pack"), and a constant computed at import would go stale.
+    """
+    return frozenset(name for name, spec in NODE_TYPES.items() if spec.executable)
+
+
+def customer_input_types() -> frozenset[str]:
+    """Node types that receive a customer message. The confirm-on-all-paths analysis in
+    :mod:`.rules` treats these as the "last customer input" points of DESIGN.md section 5.2."""
+    return frozenset(
+        name for name, spec in NODE_TYPES.items() if spec.suspends == "waiting_customer"
+    )
+
 
 AnyNode = (
     RouterNode

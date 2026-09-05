@@ -1,0 +1,52 @@
+id: root
+description: Ask for an amount, verify identity behind a gate, then settle or escalate.
+outputs:
+  outcome: str | None
+state:
+  amount: float | None
+  outcome: str | None
+start: welcome
+nodes:
+  welcome:
+    type: say
+    message: Hello{% if ctx.customer.name %} {{ ctx.customer.name }}{% endif %}.
+    next: collect
+
+  collect:
+    type: ask
+    slots: [amount]
+    prompt: How much was the charge?
+    next: identity
+
+  identity:
+    type: gate
+    predicate: ctx.customer.identity_verified
+    redirect: verify
+    next: decide
+
+  decide:
+    type: router
+    edges:
+      state.amount > 100: escalate
+    default: settle
+
+  escalate:
+    type: subgraph
+    graph: tier
+    inputs: { amount: state.amount }
+    outputs: { outcome: tier }
+    next: report
+
+  settle:
+    type: say
+    message: Settled.
+    next: finish
+
+  report:
+    type: say
+    message: A specialist will look at this.
+    next: finish
+
+  finish:
+    type: end
+    outputs: { outcome: state.outcome }

@@ -1,0 +1,16 @@
+id: verify
+description: Stand-in identity check; phase 4 replaces the body with real tools.
+outputs:
+  verified: bool
+state:
+  verified: bool | None
+start: tell
+nodes:
+  tell:
+    type: say
+    message: Let me verify your identity first.
+    next: done
+
+  done:
+    type: end
+    outputs: { verified: true }

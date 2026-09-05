@@ -138,6 +138,11 @@ class Run(Base):
     turn_nodes: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     """Nodes executed in the current turn, for ``max_nodes_per_turn`` (section 7.3)."""
 
+    next_frame_seq: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    """The next value of ``Frame.frame_seq``. Monotonic and never reused, because ``frame_seq``
+    is the second field of the step id (section 7.1): a graph invoked twice must not produce
+    the same step ids twice."""
+
     suspended_at: Mapped[datetime | None] = mapped_column()
     timeout_at: Mapped[datetime | None] = mapped_column()
     """When the per-status timeout of section 7.2 expires; ``None`` means never."""
