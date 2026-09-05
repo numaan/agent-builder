@@ -1,0 +1,22 @@
+# Local and CI Postgres for support-core (DESIGN.md section 17, PLAN.md "Environment needs").
+# Bring it up with `scripts/db-up.sh` or `make db-up`; see README.md.
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: support-core-db
+    environment:
+      POSTGRES_USER: support
+      POSTGRES_PASSWORD: support
+      POSTGRES_DB: support
+    ports:
+      - "${SUPPORT_DB_PORT:-5432}:5432"
+    volumes:
+      - support-core-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U support -d support"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  support-core-pgdata:
