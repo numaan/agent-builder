@@ -1,9 +1,10 @@
 # Local and CI Postgres for support-core (DESIGN.md section 17, PLAN.md "Environment needs").
 # Bring it up with `scripts/db-up.sh` or `make db-up`; see README.md.
+# No fixed container_name: the compose project (directory) name namespaces the container, so
+# two checkouts on one host can each run their own database on different SUPPORT_DB_PORTs.
 services:
   db:
     image: pgvector/pgvector:pg16
-    container_name: support-core-db
     environment:
       POSTGRES_USER: support
       POSTGRES_PASSWORD: support
@@ -12,6 +13,8 @@ services:
       - "${SUPPORT_DB_PORT:-5432}:5432"
     volumes:
       - support-core-pgdata:/var/lib/postgresql/data
+      # Creates the `support_test` database on first start (see scripts/db-init/).
+      - ./scripts/db-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U support -d support"]
       interval: 2s

@@ -42,8 +42,9 @@ sh scripts/db-up.sh        # or: make db-up
 The `scripts/*.sh` files are the canonical way to do things; the `Makefile` only wraps them for
 convenience and needs GNU make, which Git Bash on Windows does not ship.
 
-The container listens on `localhost:5432` with user, password and database all `support`. Every
-component reads the connection string from one place:
+The container listens on `localhost:5432` with user and password `support` and two databases:
+`support` for development and `support_test`, which only the test suite uses. Every component
+reads the connection string from one place:
 
 ```sh
 export SUPPORT_DATABASE_URL=postgresql+asyncpg://support:support@localhost:5432/support   # the default
@@ -74,10 +75,21 @@ python -m mypy                                              # make typecheck (st
 python -m pytest                                            # make test
 ```
 
-`pytest` needs the database from the previous section. The fixtures in `tests/conftest.py`
-downgrade to base and upgrade to head once per session (so the downgrade path is exercised on
-every run) and truncate every table before each test. Point `SUPPORT_DATABASE_URL` elsewhere to
-use a different Postgres. Do not run the suite in parallel against one database.
+`pytest` needs the database from the previous section and runs against `support_test`, never
+`support`. The fixtures in `tests/conftest.py` downgrade to base and upgrade to head once per
+session (so the downgrade path is exercised on every run) and truncate every table before each
+test, so the suite must own the database it is pointed at. `tests/conftest.py` therefore refuses
+to start (a usage error before collection) unless the database name ends in `_test`:
+
+- With nothing set, the suite uses `postgresql+asyncpg://support:support@localhost:5432/support_test`.
+- If `SUPPORT_DATABASE_URL` is exported it is used only when its database name ends in `_test`;
+  the development URL above is rejected with a message that says so.
+- `SUPPORT_TEST_DATABASE_URL` overrides both and is used as-is (any name); this is the explicit
+  opt-in for CI or a throwaway instance.
+
+`scripts/db-up.sh` creates `support_test` if it is missing, so a data volume created before the
+test database existed only needs `sh scripts/db-up.sh` run again. Do not run the suite in
+parallel against one database.
 
 `make check` runs lint, typecheck, tests and the pack validation in sequence. CI
 (`.github/workflows/ci.yml`) runs the same steps against a `pgvector/pgvector:pg16` service.
