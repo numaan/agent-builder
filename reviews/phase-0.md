@@ -367,3 +367,52 @@ transaction" is confirmed by the `--sql` output.
 11. Backlog and review disagree on the test count, 52 vs 55 (N7).
 12. mypy module naming under `packs/` will collide with a second pack (N10); fixed
     `container_name` collides across checkouts (N11); scripts lack the executable bit (N8).
+
+## Resolution
+
+Resolver: a fresh agent that wrote none of the phase-0 code, 2026-09-05 (PLAN.md step 5). Every
+must-fix and every should-fix the reviewer marked "fix now" is fixed; the two should-fix findings
+the reviewer marked "defer" and the nits that are not a few risk-free lines are recorded under
+"Deferred findings" in BACKLOG.md, each with a checklist line in the owning phase so it is not
+re-discovered. The review itself was committed first as `b45be7e` (it was sitting uncommitted).
+
+| id | severity | action | commit |
+|----|----------|--------|--------|
+| F1 | must-fix | Fixed: `on.push.branches: [main, master]`. Both names rather than every branch because `pull_request` already covers feature branches and push-on-all-branches would run each PR twice; `main` is kept so a later rename cannot silently turn CI off again. CI also runs `alembic upgrade head && alembic check` and `support pack validate`. Still not executed on GitHub (nothing pushed). | b7c9ad4 |
+| F2 | should-fix | Fixed: `support_core.storage.config.test_database_url()` returns `SUPPORT_TEST_DATABASE_URL` if set (explicit opt-in, any name), else `SUPPORT_DATABASE_URL` only when its database name ends in `_test`, else the compose `support_test` database. `tests/conftest.py::pytest_configure` turns a refusal into a `UsageError` before collection; `pytest_report_header` names the database. Verified: with the development URL exported, `pytest` exits 4 with the refusal message and the `support` database keeps its 14 tables. `support_test` is created by `scripts/db-init/10-create-test-database.sql` on a fresh volume and idempotently by `scripts/db-up.sh` on an existing one; CI's service database is `support_test`. README "Database" and "Checks" document the rules. Six unit tests cover the resolution order. | b9c2803 |
+| F3 | should-fix | Fixed: `pack.yaml`, `policies.md`, `knowledge/sources.yaml` and `tools/__init__.py` that are not UTF-8 (or not readable at all) become `manifest.unreadable`, `policies.unreadable`, `knowledge.sources_unreadable`, `tools.unreadable` error findings via one `_read_utf8` helper (`ManifestUnreadableError` for the manifest). A parametrised test writes `ff fe` into each file and checks the CLI prints the rule id rather than a traceback. | b1db08e |
+| F4 | should-fix | Fixed: a blank or whitespace-only `core` specifier is rejected by the manifest validator ("core must name at least one version constraint"); tests for `""` and `"   "`. | b1db08e |
+| F5 | should-fix (defer) | Deferred to phase 2 as the reviewer proposed: BACKLOG "Deferred findings" entry plus a phase 2 checklist line for `trace_step.seq` with unique `(run_id, seq)` and application-clock `started_at`. | 93345a0 |
+| F6 | should-fix (defer) | Deferred to phase 4: BACKLOG entry plus a phase 4 checklist line for `tool_call.run_id` (FK, indexed) and `step_id`. | 93345a0 |
+| N1 | nit | Deferred to phase 4: BACKLOG entry plus a phase 4 checklist line for single-use approvals in the adversarial tests. | 93345a0 |
+| N2 | nit | Documented: README "Database" states that the migrating role must be a superuser or the extension pre-created, and that `downgrade base` drops it. Not dropping the extension on downgrade is deferred to phase 5 (BACKLOG entry): editing the initial migration for a shared-instance concern is not a risk-free few lines and phase 5 owns pgvector. | 93345a0 |
+| N3 | nit | Fixed: `--strict` prints every finding and changes only the exit status (help text says so); the sample-pack CLI test covers plain, `--strict` and `--quiet` output. | 00ced9b |
+| N4 | nit | Fixed: the export check is the regex `^TOOLS\s*[:=]`; `TOOLSET = 5`, a docstring line mentioning TOOLS and an indented `TOOLS = []` are rejected, `TOOLS = []`, `TOOLS: list[Any] = []` and `TOOLS=[]` accepted. Still a textual check until phase 4 imports the module, as the self-critique says. | 00ced9b |
+| N5 | nit | Fixed: `interrupts.allowed_from` and `blocked_in` reject duplicates and empty ids; `language` needs at least two characters. Four parametrised cases. | 00ced9b |
+| N6 | nit | Fixed: an entry under `graphs/` with a graph suffix that is not a file is reported as `layout.not_a_file` (error); the pack is no longer "empty but well-formed" in that case. | 00ced9b |
+| N7 | nit | Fixed: the BACKLOG exit criterion now says 77 tests (55 at review time plus 22 added here). | 93345a0 |
+| N8 | nit | Fixed: `scripts/*.sh` are mode `100755` in the index (`git update-index --chmod=+x`). | 00ced9b |
+| N9 | nit | Deferred (BACKLOG entry): a session-long `pg_try_advisory_lock` needs a connection that outlives the per-test event loops, which the fixture design avoids on purpose, so it is not a few risk-free lines. F2's dedicated database removes the developer-database half of the risk; the two-concurrent-runs half stays documented in README. | 93345a0 |
+| N10 | nit | Fixed: mypy `explicit_package_bases = true`. Verified by adding a throwaway `packs/other_pack/tools/__init__.py`, running mypy (clean, 32 files), then removing it. No `__init__.py` was added under `packs/` so the section 5 layout is unchanged. | 00ced9b |
+| N11 | nit | Fixed: `container_name` dropped from `docker-compose.yml`; the container is now `customer-support-agent-db-1`. Verified by recreating it in place over the existing volume. | b9c2803 |
+| N12 | nit | Deferred to phase 5 (BACKLOG entry plus checklist line), as both the implementer and the reviewer recorded. | 93345a0 |
+
+### Commands run after the fixes
+
+All from the repository root with `.venv/Scripts/python.exe`, Windows 11, Docker Compose v5,
+`pgvector/pgvector:pg16`.
+
+| Command | Result |
+|---------|--------|
+| `python -m ruff check .` | `All checks passed!` |
+| `python -m ruff format --check .` | `31 files already formatted` |
+| `python -m mypy` | `Success: no issues found in 31 source files` |
+| `python -m pytest -q` | `77 passed in 4.17s` (header line: `database: postgresql+asyncpg://support:***@localhost:5432/support_test`) |
+| `SUPPORT_DATABASE_URL=...localhost:5432/support python -m pytest -q` | `ERROR: refusing to run tests against database 'support' ...`, exit 4, no test collected |
+| `python -m alembic upgrade head && python -m alembic check` (development database `support`) | `No new upgrade operations detected.` |
+| `python -m alembic check` with `SUPPORT_DATABASE_URL` at `support_test` | `No new upgrade operations detected.` |
+| `support pack validate packs/acme_billing` | `INFO pack.empty [graphs/] ...` then `acme-billing: empty but well-formed`, exit 0 |
+| `support pack validate --strict packs/acme_billing` | same output including the INFO line (N3), exit 0 |
+| `sh scripts/db-up.sh` twice | first run: `Created test database support_test.`; second run: no creation, idempotent |
+
+Phase 0 is closed: BACKLOG.md status `done`.
