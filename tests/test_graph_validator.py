@@ -1220,6 +1220,30 @@ nodes:
     assert "graph.node_unreachable" in found
 
 
+def test_a_loop_back_into_a_confirmed_call_reuses_one_approval(pack_dir: Path) -> None:
+    """F4: handoff passes both lattices and suspends, so nothing used to notice this loop."""
+    graph = confirmed(
+        "  finish: { type: end }",
+        """  after:
+    type: handoff
+    reason: check_it
+    edges: { resumed: do_it, closed: finish }
+  finish: { type: end }""",
+    ).replace(
+        "requires_approval: confirm_it\n    next: finish",
+        "requires_approval: confirm_it\n    next: after",
+    )
+    found = rules(pack_dir, {"main": graph})
+    assert "graph.approval_reused" in found
+
+
+def test_a_loop_that_passes_the_confirm_again_is_allowed(pack_dir: Path) -> None:
+    """Re-entering through the confirm asks the customer again, so the approval is fresh."""
+    graph = confirmed("next: finish\n  finish", "next: confirm_it\n  finish")
+    found = rules(pack_dir, {"main": graph}, Severity.ERROR)
+    assert found == set(), found
+
+
 def test_an_unconfirmed_second_caller_of_the_sub_graph_is_caught(pack_dir: Path) -> None:
     caller_graph = """
 id: main

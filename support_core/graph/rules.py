@@ -720,6 +720,45 @@ class _Rules:
                     graph=graph,
                     node=point[1],
                 )
+            self.confirm_reentry(point, node, spec)
+
+    def confirm_reentry(self, point: Point, node: ToolNode, spec: ToolSpec) -> None:
+        """A cycle back into a confirmed tool node that passes neither a ``confirm`` nor an ``ask``.
+
+        DESIGN.md section 8.2 binds one ``ActionApproval`` to one proposed action. A loop that
+        re-enters the call without a fresh customer decision lets a single approval authorise
+        unbounded calls, and the run-time hash check cannot see it because the arguments never
+        change (phase-0 deferred finding N1, phase-1 review finding F4).
+
+        Intra-graph only, which is sufficient: by the same-graph rule the approving confirm is a
+        node in this graph, and a path that leaves the graph can only come back through this
+        graph's ``start`` or through the call site it left from, both of which are on the
+        intra-graph edges walked here.
+        """
+        graph = self.graphs[point[0]]
+        seen: set[str] = set()
+        stack = [target for _label, target in edge_targets(node) if target in graph.nodes]
+        while stack:
+            current = stack.pop()
+            if current == point[1]:
+                self.error(
+                    "graph.approval_reused",
+                    f"tool {node.tool!r} is {spec.risk.value} risk and this node is reachable "
+                    "from itself without passing a confirm or an ask, so one ActionApproval "
+                    "would authorise every call the loop makes; the arguments never change, so "
+                    "the run-time hash check cannot catch it either. Put the confirm inside the "
+                    "loop, or break the cycle",
+                    graph=graph,
+                    node=point[1],
+                )
+                return
+            if current in seen:
+                continue
+            seen.add(current)
+            here = graph.nodes[current]
+            if isinstance(here, ConfirmNode | AskNode):
+                continue  # the customer decides again on this path
+            stack.extend(t for _label, t in edge_targets(here) if t in graph.nodes)
 
     def covered_out(self, point: Point, incoming: frozenset[Point], label: str) -> frozenset[Point]:
         node = self.node_at(point)
