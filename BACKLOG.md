@@ -30,9 +30,9 @@ Design: sections 4.1, 17, 18.
 - [x] `support` CLI entry point with `pack validate` stub.
 - [x] `packs/acme_billing/` with `pack.yaml`, empty `persona.md`, `policies.md`, `graphs/`, `tools/__init__.py`, `knowledge/`, `evals/`.
 - [x] `tests/conftest.py` providing an async Postgres session fixture with per-test schema reset.
-- [x] CI config (GitHub Actions) running ruff, mypy, pytest with a Postgres service. (Workflow file written and mirrors the local commands; it has not yet executed on GitHub because nothing has been pushed.)
+- [x] CI config (GitHub Actions) running ruff, mypy, pytest with a Postgres service. (Triggers on push to `main` or `master` and on pull requests; also runs `alembic check` and `support pack validate`. It has not yet executed on GitHub because nothing has been pushed.)
 
-Exit criterion: `support pack validate packs/acme_billing` runs and reports the pack is empty but well-formed; `pytest` runs one database smoke test green. Met locally on 2026-09-05 (52 tests green, see reviews/phase-0.md).
+Exit criterion: `support pack validate packs/acme_billing` runs and reports the pack is empty but well-formed; `pytest` runs one database smoke test green. Met locally on 2026-09-05 and re-confirmed after review resolution (77 tests green, see reviews/phase-0.md "Resolution").
 
 ## Phase 1: Graph model, loader, validator, expression language
 
@@ -58,6 +58,7 @@ Design: sections 6.3, 7.1 to 7.3, 17.
 - [ ] Executor: turn loop from section 7.1 without the LLM-dependent parts (interrupt check is a pluggable hook that defaults to `continue`).
 - [ ] Frame stack push, pop, output mapping, and gate re-evaluation on frame entry.
 - [ ] Checkpoint after every node in one transaction with the `trace_step` row; deterministic step ids.
+- [ ] `trace_step.seq` (the run's `checkpoint_seq` at write time) with a unique `(run_id, seq)` so replay has a total order per run; the executor sets `started_at` from the application clock, not the `now()` default (phase 0 deferred finding F5).
 - [ ] Postgres advisory lock per conversation; pending-message queue for messages that arrive while locked.
 - [ ] Suspend and resume for `waiting_customer`, `waiting_human`, `waiting_async_tool`, `waiting_timer`; per-status timeouts.
 - [ ] Per-turn limits (`max_nodes_per_turn`) with handoff fallback hook.
@@ -87,7 +88,9 @@ Design: sections 8.1 to 8.4, 6.2 (`tool`, `confirm`, `gate`), 6.4.
 - [ ] `Tool`, `Risk`, `ToolContext`; registry with duplicate and schema checks.
 - [ ] Risk policy enforcement in the runtime, not in prompts: READ only from llm loops, WRITE and HIGH only from tool nodes with approval, `confirm_exempt` reporting.
 - [ ] Idempotency: `tool_call` row keyed by step id; at-most-once for non-idempotent tools.
+- [ ] Migration adding `run_id` (FK, indexed) and `step_id` to `tool_call` so calls can be joined to a run and conversation without parsing the idempotency key (phase 0 deferred finding F6).
 - [ ] `confirm` node computing `sha256(tool_name + canonical_json(args))`, storing `action_approval`, yes/no edges.
+- [ ] `action_approval` is single-use: `consumed_by_tool_call_id`/`consumed_at`, and a consumed approval is treated as absent; covered by the adversarial tests (phase 0 deferred finding N1).
 - [ ] `tool` node with `args` expressions, `into` mapping, `on_error`, `requires_approval` hash check.
 - [ ] `gate` node pushing the redirect graph and re-evaluating.
 - [ ] Async tools completing via callback (`waiting_async_tool`).
@@ -104,6 +107,7 @@ Design: sections 9.1 to 9.3, 14 (citation guardrail).
 
 - [ ] `Passage`, `Retriever` protocol, `CompositeRetriever`.
 - [ ] `DocumentRetriever`: chunking by headings, embeddings via provider abstraction (fake embedder in tests), pgvector plus tsvector hybrid search, optional model reranking.
+- [ ] Migration fixing `doc_chunk.embedding` to `vector(N)` for the chosen embedding model (while the table is empty) and adding the HNSW index; decide whether downgrade should keep the `vector` extension (phase 0 deferred findings N12, N2).
 - [ ] `LiveLookupRetriever` routing to READ tools.
 - [ ] Ingestion CLI `support pack knowledge sync` for `markdown_dir` and `html_crawl` sources, with `source_version` and stale-chunk marking.
 - [ ] `knowledge:` block on llm nodes; passages inserted as delimited data with ids.
@@ -180,6 +184,13 @@ Exit criterion: the sample pack builds as its own image, starts, and answers "wh
 ## Deferred findings
 
 Populated by phase reviews. Format: `- [phase N] finding, severity, reason deferred`.
+
+- [phase 0] F5: `trace_step` has no ordering column; `started_at` defaults to `now()`, which is identical for every step written in one transaction, so replay (DESIGN 7.3) cannot order steps by it, should-fix, deferred to phase 2 which owns the checkpoint transaction and its migration (checklist line added there).
+- [phase 0] F6: `tool_call` has no `run_id`, `conversation_id` or `step_id`; the only link to a conversation is the idempotency key string, should-fix, deferred to phase 4 which owns the `tool_call` migration (checklist line added there).
+- [phase 0] N1: `action_approval` has no single-use marker or expiry, so one approval row could satisfy two tool calls with the same args hash, nit (a design gap: DESIGN 8.2 does not demand single use), deferred to phase 4 (checklist line added there).
+- [phase 0] N2 (downgrade half): the initial migration's downgrade drops the `vector` extension, which fails or removes a shared extension if an administrator pre-installed it, nit, deferred to phase 5 which owns pgvector; editing the initial migration for a shared-instance concern is not a risk-free few lines. The superuser requirement is documented in README.
+- [phase 0] N9: two concurrent `pytest` processes against one database corrupt each other's fixtures (reviewer measured 47 passed, 8 errors); README warns but nothing enforces it, nit, deferred because a session-long advisory lock needs a connection that outlives the per-test event loops, which the fixture design avoids on purpose. The dedicated `support_test` database (F2) removes the developer-database half of the risk.
+- [phase 0] N12: `doc_chunk.embedding` is dimensionless, so no HNSW index is possible and mixed-dimension rows fail only at query time, nit (admitted by the implementer, measured by the reviewer), deferred to phase 5 which picks the embedding model (checklist line added there).
 
 ---
 

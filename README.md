@@ -57,6 +57,12 @@ python -m alembic upgrade head      # or: make migrate
 python -m alembic check             # confirms models and migrations agree
 ```
 
+The initial migration runs `CREATE EXTENSION IF NOT EXISTS vector`. On the
+`pgvector/pgvector:pg16` image that needs a superuser (the compose user `support` is one);
+against a managed Postgres, have the extension created by an administrator first and the
+migration will find it. `alembic downgrade base` also drops the extension, so do not run
+the downgrade against an instance that shares it with other databases.
+
 Other useful commands:
 
 ```sh
