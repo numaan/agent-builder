@@ -230,6 +230,26 @@ def _literal_type(value: Any) -> TypeInfo:
     return STR
 
 
+def _mapping_value_annotation(annotation: Any) -> Any | None:
+    """The value annotation of a string-keyed mapping, or ``None`` if this is not one.
+
+    Only ``str`` keys qualify: an attribute name in the expression language is always a string,
+    so a mapping keyed by anything else can never be read through one. A bare ``dict`` promises
+    nothing about its values, so it reads as ``Any``.
+    """
+    if annotation is dict or annotation is Mapping:
+        return Any
+    origin = get_origin(annotation)
+    if origin is None or not (
+        origin is dict or (isinstance(origin, type) and issubclass(origin, Mapping))
+    ):
+        return None
+    args = get_args(annotation)
+    if len(args) != 2 or args[0] is not str:
+        return None
+    return args[1]
+
+
 def _attribute(node: Attribute, ctx: _Context) -> TypeInfo:
     owner = _infer(node.value, ctx)
     if owner.unknown:
@@ -246,6 +266,14 @@ def _attribute(node: Attribute, ctx: _Context) -> TypeInfo:
             )
         )
     annotation = owner.annotation
+    mapping_value = _mapping_value_annotation(annotation)
+    if mapping_value is not None:
+        # The evaluator traverses a Mapping by key (``ctx.customer.attributes.plan``, the CRM
+        # record of DESIGN.md section 10). The checker used to refuse, which made that
+        # expression a load-time error and the evaluator's mapping arm dead code (phase-1
+        # review finding F8). Keys are not declared anywhere, so the key itself cannot be
+        # checked; the value type is what the declaration promises.
+        return from_annotation(mapping_value)
     if not (isinstance(annotation, type) and issubclass(annotation, BaseModel)):
         raise TypeError_(
             f"cannot read {node.name!r} of {owner.describe()}; only declared models have fields",

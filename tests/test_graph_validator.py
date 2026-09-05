@@ -1444,6 +1444,14 @@ def test_expressions_cannot_reach_pydantic_internals(pack_dir: Path) -> None:
     assert "expr.type_error" in rules(pack_dir, {"main": graph})
 
 
+def test_a_graph_may_read_the_crm_record_out_of_ctx(pack_dir: Path) -> None:
+    """F8: ``ctx.customer.attributes`` is a ``dict[str, Any]`` and must be readable."""
+    graph = MAIN.replace(
+        "state.charge_id != none: finish", "ctx.customer.attributes.plan == 'pro': finish"
+    )
+    assert rules(pack_dir, {"main": graph}, Severity.ERROR) == set()
+
+
 def test_a_node_named_with_a_dunder_is_rejected(pack_dir: Path) -> None:
     graph = MAIN.replace("  finish: { type: end }", "  __init__: { type: end }")
     assert "graph.node_id_invalid" in rules(pack_dir, {"main": graph})

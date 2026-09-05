@@ -373,6 +373,32 @@ def test_optional_filter_input_is_a_note() -> None:
     assert [n.code for n in notes] == ["optional_filter_input"]
 
 
+def test_the_checker_and_the_evaluator_agree_about_mapping_traversal() -> None:
+    """Phase-1 review F8: the checker refused what the evaluator supports.
+
+    ``ctx.customer.attributes`` is the CRM record of DESIGN.md section 10, a ``dict[str, Any]``.
+    Refusing it at load time made every such expression an error and the evaluator's mapping
+    arm unreachable.
+    """
+
+    class Attrs(BaseModel):
+        plan: dict[str, str] = {}
+        raw: dict[str, Any] = {}
+        counted: dict[int, str] = {}
+
+    e = model_type_env(state=Attrs)
+    assert infer(parse("state.plan.tier"), e).describe() == "str"
+    assert infer(parse("state.raw.anything"), e).describe() == "unknown"
+    assert evaluate(parse("state.plan.tier"), {"state": Attrs(plan={"tier": "pro"})}) == "pro"
+
+    with pytest.raises(TypeError_):
+        infer(parse("state.counted.nope"), e)  # a non-str key can never be read this way
+    with pytest.raises(EvaluationError):
+        evaluate(parse("state.plan.tier"), {"state": Attrs()})  # the key is simply absent
+    with pytest.raises(EvaluationError):
+        evaluate(parse("state.plan.tier.oops"), {"state": Attrs(plan={"tier": "pro"})})
+
+
 def test_unknown_annotations_allow_everything() -> None:
     class Opaque(BaseModel):
         payload: Any = None
