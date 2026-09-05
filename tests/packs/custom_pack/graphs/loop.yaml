@@ -1,0 +1,16 @@
+id: loop
+description: A gate redirect that cannot satisfy the gate. It does not suspend, so the gate
+  re-pushes it inside one turn until the per-turn limit stops the run.
+outputs:
+  done: bool
+state: {}
+start: note
+nodes:
+  note:
+    type: say
+    message: Trying to verify.
+    next: over
+
+  over:
+    type: end
+    outputs: { done: true }

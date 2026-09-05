@@ -1,0 +1,20 @@
+id: verify
+description: The gate's redirect. It waits for a human, standing in for phase 4's identity tools.
+outputs:
+  verified: bool
+state: {}
+start: tell
+nodes:
+  tell:
+    type: say
+    message: Verifying your identity first.
+    next: hold
+
+  hold:
+    type: wait
+    status: waiting_human
+    next: done
+
+  done:
+    type: end
+    outputs: { verified: true }

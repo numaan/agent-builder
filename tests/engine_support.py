@@ -236,7 +236,7 @@ BOOM_SPEC = NodeTypeSpec(
 
 
 @contextmanager
-def test_node_types() -> Iterator[None]:
+def custom_node_types() -> Iterator[None]:
     """Register ``wait`` and ``boom`` for the duration of the block."""
     register_node_type(WAIT_SPEC, WaitRunner)
     register_node_type(BOOM_SPEC, BoomRunner)

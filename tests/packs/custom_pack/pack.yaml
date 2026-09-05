@@ -1,0 +1,19 @@
+# A pack whose graphs use the `wait` and `boom` node types the phase-2 tests register through
+# support_core.engine.register_node_type (DESIGN.md section 6.2, "custom node types are Python
+# classes registered by name in the pack"). It only loads while those types are registered.
+id: custom-pack
+version: 1.0.0
+core: ">=0.0.1,<1"
+entry_graph: root
+language: en
+channels: [web_chat]
+llm:
+  default_model: claude-sonnet-5
+handoff:
+  queue: engine-tests
+limits:
+  max_nodes_per_turn: 10
+timeouts:
+  waiting_async_tool: { seconds: 900, action: handoff }
+  waiting_timer: { seconds: 60, action: none }
+  waiting_customer: { seconds: 1800, action: close }

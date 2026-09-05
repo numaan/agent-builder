@@ -174,6 +174,16 @@ async def claim_next_pending(session: AsyncSession, conversation_id: uuid.UUID) 
     return await session.get(Message, row[0])
 
 
+async def requeue(session: AsyncSession, message_id: uuid.UUID) -> None:
+    """Put a claimed inbound message back on the queue.
+
+    Used when a turn ends without the node that was waiting for the message ever seeing it -
+    a gate re-check pushed a redirect that suspended, for instance. The row keeps its
+    ``created_at``, so it is still the oldest pending message and order is preserved.
+    """
+    await session.execute(update(Message).where(Message.id == message_id).values(status="pending"))
+
+
 async def pending_count(session: AsyncSession, conversation_id: uuid.UUID) -> int:
     result = await session.execute(
         text("SELECT count(*) FROM message WHERE conversation_id = :c AND status = 'pending'"),

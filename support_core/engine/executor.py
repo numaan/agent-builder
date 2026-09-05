@@ -205,6 +205,19 @@ class Executor:
                 return TurnOutcome(conversation_id=conversation_id, queued=True)
             return await self._drain(conversation_id)
 
+    async def drain(self, conversation_id: uuid.UUID) -> TurnOutcome:
+        """Process whatever the conversation has queued, under its lock.
+
+        The same body ``on_inbound`` runs after storing its message. A poller, a recovery
+        worker, or a caller that put a message back on the queue uses this to pick it up.
+        """
+        async with conversation_lock(
+            self.engine, conversation_id, wait_seconds=self.lock_wait_seconds
+        ) as acquired:
+            if not acquired:
+                return TurnOutcome(conversation_id=conversation_id, queued=True)
+            return await self._drain(conversation_id)
+
     async def resume_human(
         self,
         conversation_id: uuid.UUID,
@@ -318,7 +331,8 @@ class Executor:
             )
 
         await self._begin_turn(turn)
-        await self._loop(turn, ctx, event)
+        undelivered = await self._loop(turn, ctx, event)
+        await self._requeue(undelivered)
         return await self._run_for(conversation.id)
 
     async def _continue_interrupted(
@@ -331,6 +345,13 @@ class Executor:
             return await self._run_for(conversation.id)
         await self._loop(turn, self._context(conversation), None)
         return await self._run_for(conversation.id)
+
+    async def _requeue(self, event: ResumeEvent | None) -> None:
+        """Put back a customer message no node consumed (see :meth:`_loop`)."""
+        if event is None or event.message_id is None:
+            return
+        async with self.sessions() as session, session.begin():
+            await repo.requeue(session, event.message_id)
 
     async def _resume(
         self,
@@ -361,7 +382,8 @@ class Executor:
             awaiting = run.awaiting or {}
             resume_event = event if awaiting.get("kind") == "node" else None
             await self._begin_turn(turn)
-            await self._loop(turn, self._context(conversation), resume_event)
+            undelivered = await self._loop(turn, self._context(conversation), resume_event)
+            await self._requeue(undelivered)
             await self._flush_outbound(conversation_id)
             outcome.status = (await self._run_for(conversation_id)).status  # type: ignore[assignment]
         return outcome
@@ -431,9 +453,21 @@ class Executor:
 
     # -- the loop ------------------------------------------------------------------------
 
-    async def _loop(self, turn: _Turn, ctx: ConversationContext, event: ResumeEvent | None) -> None:
-        """Run nodes until the run suspends, ends, or hits a limit (DESIGN.md section 7.1)."""
+    async def _loop(
+        self, turn: _Turn, ctx: ConversationContext, event: ResumeEvent | None
+    ) -> ResumeEvent | None:
+        """Run nodes until the run suspends, ends, or hits a limit (DESIGN.md section 7.1).
+
+        Returns the resume event if no node ever consumed it, which happens when the frame's
+        gates fire on entry and the redirect suspends before the waiting node runs. The caller
+        puts the message back on the queue rather than dropping it, so nothing a customer sent
+        is lost by a gate firing.
+        """
         check_gates = True
+        resume_target = (turn.frame.frame_seq, turn.frame.node_id) if event else None
+        """Where the run suspended. The event belongs to *that* node and to no other: a gate
+        firing on entry pushes a redirect whose first node has not been waiting for anything,
+        and handing it a resume event would call ``resume`` on a node that never suspended."""
         while turn.status == "running":
             frame = turn.frame
             try:
@@ -441,7 +475,7 @@ class Executor:
                 state = self._state(graph, frame)
             except IncompatiblePackError as exc:
                 await self._handoff(turn, frame.node_id, "pack_incompatible", str(exc))
-                return
+                return event
 
             if check_gates:
                 check_gates = False
@@ -449,7 +483,7 @@ class Executor:
                     gate_id = self._failed_gate(graph, frame, state, ctx)
                 except NodeError as exc:
                     await self._handoff(turn, frame.node_id, "node_error", str(exc))
-                    return
+                    return event
                 if gate_id is not None:
                     await self._run_gate_recheck(turn, graph, frame, gate_id)
                     check_gates = True
@@ -463,7 +497,7 @@ class Executor:
                     "limit_exceeded",
                     f"max_nodes_per_turn ({limit}) reached",
                 )
-                return
+                return event
 
             node = graph.nodes[frame.node_id]
             attempt = frame.attempts.get(frame.node_id, 0)
@@ -480,20 +514,27 @@ class Executor:
             runner = self._runner(graph, frame.node_id, node)
             started = self.hooks.clock()
             await self.hooks.probe("before_node", {"step_id": sid, "node_id": frame.node_id})
+            delivering = event is not None and resume_target == (
+                frame.frame_seq,
+                frame.node_id,
+            )
             try:
-                if event is not None:
+                if delivering and event is not None:
                     result = await runner.resume(state, ctx, runtime, event)
                 else:
                     result = await runner.run(state, ctx, runtime)
             except NodeError as exc:
-                event = None
+                if delivering:
+                    event = None
                 if not await self._route_error(turn, graph, frame, node, sid, started, exc):
-                    return
+                    return event
                 check_gates = False
                 continue
-            event = None
+            if delivering:
+                event = None
             await self.hooks.probe("after_node", {"step_id": sid, "node_id": frame.node_id})
             check_gates = await self._advance(turn, ctx, graph, frame, node, result, sid, started)
+        return event
 
     async def _advance(
         self,
@@ -664,6 +705,7 @@ class Executor:
             ),
             suspend_status="waiting_human",
             suspend_detail={"reason": reason, "detail": detail},
+            suspend_node=node_id,
             handoff_reason=reason,
         )
         turn.outcome.handoff_reason = reason

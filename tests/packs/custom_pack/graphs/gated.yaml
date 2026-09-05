@@ -1,0 +1,28 @@
+id: gated
+description: A protected node behind a gate, with a suspending node after the gate.
+outputs:
+  reached: bool
+state:
+  answer: str | None
+start: guard
+nodes:
+  guard:
+    type: gate
+    predicate: ctx.customer.identity_verified
+    redirect: verify
+    next: collect
+
+  collect:
+    type: ask
+    slots: [answer]
+    prompt: What is your answer?
+    next: reveal
+
+  reveal:
+    type: say
+    message: "Protected: {{ state.answer }}."
+    next: finish
+
+  finish:
+    type: end
+    outputs: { reached: true }

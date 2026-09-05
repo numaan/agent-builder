@@ -1,0 +1,70 @@
+id: root
+description: Run the scenario named by the conversation context.
+outputs:
+  outcome: str | None
+state:
+  outcome: str | None
+  detail: str | None
+  reached: bool | None
+start: pick
+nodes:
+  pick:
+    type: router
+    edges:
+      ctx.customer.attributes.mode == 'timer': timer_wait
+      ctx.customer.attributes.mode == 'human': human_wait
+      ctx.customer.attributes.mode == 'error': explode
+      ctx.customer.attributes.mode == 'error_routed': explode_routed
+      ctx.customer.attributes.mode == 'gate': gated_call
+      ctx.customer.attributes.mode == 'gate_loop': gated_loop_call
+    default: tool_wait
+
+  tool_wait:
+    type: wait
+    status: waiting_async_tool
+    next: report
+
+  timer_wait:
+    type: wait
+    status: waiting_timer
+    next: report
+
+  human_wait:
+    type: wait
+    status: waiting_human
+    next: report
+
+  explode:
+    type: boom
+    next: report
+
+  explode_routed:
+    type: boom
+    on_error: recovered
+    next: report
+
+  gated_call:
+    type: subgraph
+    graph: gated
+    outputs: { reached: reached }
+    next: report
+
+  gated_loop_call:
+    type: subgraph
+    graph: gated_loop
+    outputs: { reached: reached }
+    next: report
+
+  recovered:
+    type: say
+    message: Recovered.
+    next: finish
+
+  report:
+    type: say
+    message: Done with {{ state.detail | default('nothing') }}.
+    next: finish
+
+  finish:
+    type: end
+    outputs: { outcome: state.detail }

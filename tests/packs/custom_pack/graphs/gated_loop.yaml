@@ -1,0 +1,21 @@
+id: gated_loop
+description: A protected node behind a gate whose redirect never satisfies it.
+outputs:
+  reached: bool
+state: {}
+start: guard
+nodes:
+  guard:
+    type: gate
+    predicate: ctx.customer.identity_verified
+    redirect: loop
+    next: reveal
+
+  reveal:
+    type: say
+    message: Protected.
+    next: finish
+
+  finish:
+    type: end
+    outputs: { reached: true }
