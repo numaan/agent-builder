@@ -26,6 +26,11 @@ from pydantic import BaseModel, ConfigDict, Field
 SuspendKind = Literal["waiting_customer", "waiting_human", "waiting_async_tool"]
 """DESIGN.md section 7.2 statuses a node can suspend into."""
 
+Scalar = str | bool | int | float | None
+"""A YAML scalar in an ``args``/``into``/``outputs``/``inputs`` mapping. Either an expression
+(always a string) or a literal of the declared type, so ``{ verified: false }`` and
+``{ outcome: "refunded" }`` both work (DESIGN.md section 6.4 uses both forms)."""
+
 
 class NodeBase(BaseModel):
     """Fields every node block may carry. Unknown keys are rejected."""
@@ -61,8 +66,8 @@ class EndNode(NodeBase):
     """Pop the frame and return outputs (DESIGN.md section 6.2)."""
 
     type: Literal["end"]
-    outputs: dict[str, str] = Field(default_factory=dict)
-    """Declared output name to a literal or an expression (see :func:`.schema.value_kind`)."""
+    outputs: dict[str, Scalar] = Field(default_factory=dict)
+    """Declared output name to a literal or an expression (see :func:`.schema.parse_value`)."""
 
 
 class SubgraphNode(NodeBase):
@@ -70,8 +75,8 @@ class SubgraphNode(NodeBase):
 
     type: Literal["subgraph"]
     graph: str
-    inputs: dict[str, str] = Field(default_factory=dict)
-    """Callee input name to a caller-side expression."""
+    inputs: dict[str, Scalar] = Field(default_factory=dict)
+    """Callee input name to a caller-side expression or literal."""
 
     outputs: dict[str, str] = Field(default_factory=dict)
     """Caller state field to a callee output name."""
@@ -117,8 +122,8 @@ class ToolNode(NodeBase):
 
     type: Literal["tool"]
     tool: str
-    args: dict[str, str] = Field(default_factory=dict)
-    into: str | dict[str, str] | None = None
+    args: dict[str, Scalar] = Field(default_factory=dict)
+    into: str | dict[str, Scalar] | None = None
     """Either a target path (``state.charge``) or ``{state field: literal or expression}``."""
 
     requires_approval: str | None = None
@@ -145,7 +150,7 @@ class ConfirmAction(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     tool: str
-    args: dict[str, str] = Field(default_factory=dict)
+    args: dict[str, Scalar] = Field(default_factory=dict)
 
 
 class ConfirmNode(NodeBase):

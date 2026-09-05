@@ -1,0 +1,38 @@
+id: verify_identity
+description: Verify the customer's identity with a one-time passcode.
+outputs:
+  verified: bool
+state:
+  code: str | None
+  code_sent: bool | None
+  verified: bool | None
+start: send_code
+nodes:
+  send_code:
+    type: tool
+    tool: send_otp
+    args: { email: ctx.customer.email }
+    into: { code_sent: result.sent }
+    next: ask_code
+
+  ask_code:
+    type: ask
+    slots: [code]
+    prompt: I have sent a code to your email. What is it?
+    next: check_code
+
+  check_code:
+    type: tool
+    tool: check_otp
+    args: { code: state.code }
+    into: { verified: result.verified }
+    next: verified_router
+
+  verified_router:
+    type: router
+    edges:
+      state.verified == true: verified
+    default: not_verified
+
+  verified:     { type: end, outputs: { verified: true } }
+  not_verified: { type: end, outputs: { verified: false } }

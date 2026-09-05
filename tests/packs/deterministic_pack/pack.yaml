@@ -1,0 +1,12 @@
+# A pack whose graphs use only the node types core can execute in phase 1
+# (router, say, subgraph, end). It is the pack behind the phase-1 exit criterion.
+id: deterministic-pack
+version: 1.0.0
+core: ">=0.0.1,<1"
+entry_graph: root
+language: en
+channels: [web_chat]
+llm:
+  default_model: claude-sonnet-5
+handoff:
+  queue: billing-tier-1

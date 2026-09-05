@@ -43,6 +43,7 @@ from support_core.graph.nodes import (
     NodeBase,
     RouterNode,
     SayNode,
+    Scalar,
     SubgraphNode,
     ToolNode,
     edge_targets,
@@ -51,6 +52,7 @@ from support_core.graph.nodes import (
 from support_core.graph.schema import Graph, ValueLooksLikeExpression, parse_value
 from support_core.graph.templates import validate as validate_template
 from support_core.graph.tools_manifest import ToolManifest, ToolSpec
+from support_core.graph.types import build_model
 from support_core.tools.risk import MODEL_CALLABLE, Risk
 
 Point = tuple[str, str]
@@ -148,6 +150,15 @@ class _Rules:
                 f"start node {graph.start!r} is not defined in nodes",
                 graph=graph,
             )
+        state_fields = graph.state.model.model_fields
+        for name in graph.inputs.model.model_fields:
+            if name not in state_fields:
+                self.warn(
+                    "graph.input_not_in_state",
+                    f"declared input {name!r} has no state field of the same name, so the value "
+                    "the caller passes has nowhere to land and no node can read it",
+                    graph=graph,
+                )
         if not any(isinstance(node, EndNode) for node in graph.nodes.values()):
             self.error(
                 "graph.no_end",
@@ -370,6 +381,16 @@ class _Rules:
                 )
         if node.knowledge is not None:
             self.template(graph, node_id, node.knowledge.query, field="knowledge.query")
+        built = build_model(f"{node_id.title()}Output", node.output_schema)
+        for issue in built.issues:
+            if issue.code == "unresolved_type":
+                continue  # pack tool models are stubs until phase 4; already warned on state
+            self.error(
+                "graph.llm_output_schema_invalid",
+                f"output_schema.{issue.field}: {issue.message}",
+                graph=graph,
+                node=node_id,
+            )
         fields = graph.state.model.model_fields
         for slot in node.output_schema:
             if slot not in fields:
@@ -422,7 +443,7 @@ class _Rules:
         self.approval_binding(graph, node_id, spec, node)
 
     def tool_arguments(
-        self, graph: Graph, node_id: str, spec: ToolSpec, args: dict[str, str], *, field: str
+        self, graph: Graph, node_id: str, spec: ToolSpec, args: dict[str, Scalar], *, field: str
     ) -> None:
         env = self.state_env(graph)
         declared = spec.input_model.model_fields
@@ -548,20 +569,30 @@ class _Rules:
     def confirm_coverage(self) -> None:
         """Every write or high-risk tool node has a ``confirm`` on all paths from customer input.
 
-        A forward *must*-analysis over the interprocedural control-flow graph. The value at a
-        point is the set of confirm nodes that certainly cover it:
+        Two forward *must*-analyses over the interprocedural control-flow graph, computed
+        together to a fixpoint:
 
-        * graph entry contributes the empty set (a conversation begins with a customer message),
-        * an ``ask`` node clears the set (the customer spoke again since any earlier approval),
-        * a ``confirm`` node's ``yes`` edge produces exactly itself, and its ``no`` edge the
-          empty set (nothing was approved),
-        * every other node passes its incoming set through,
-        * a point's incoming set is the *intersection* over its predecessors, so a set is only
-          non-empty when the confirm is on **every** path.
+        ``guarded`` (a boolean)
+            "some confirm node lies on every path from the last customer input to here".
+            This is DESIGN.md section 5.2's rule.
 
-        A WRITE or HIGH tool node whose incoming set is empty is unconfirmed. A node that names
-        a specific confirm in ``requires_approval`` additionally needs that confirm in the set,
-        otherwise the approval exists on some paths only.
+        ``covered`` (a set of confirm points)
+            "*these* confirm nodes lie on every such path". This is what DESIGN.md section 8.2
+            needs, because an approval is bound to one action's arguments: a confirm for a
+            different action does not authorise this call.
+
+        Transfer function, identical for both:
+
+        * graph entry contributes nothing (a conversation begins with a customer message),
+        * an ``ask`` node clears it (the customer spoke again since any earlier approval),
+        * a ``confirm`` node's ``yes`` edge produces exactly itself and its ``no`` edge nothing,
+        * every other node passes its incoming value through,
+        * a point's incoming value is the *meet* (``and`` / intersection) over its predecessors,
+          so a value survives only when it holds on **every** path.
+
+        Two confirms on two different branches therefore leave ``guarded`` true but ``covered``
+        empty: there is always a confirmation, but no single approval covers the call. That is
+        ``graph.approval_unreachable``, not ``graph.unconfirmed_write``.
         """
         successors, entries = self.control_flow_graph()
         if not successors:
@@ -577,25 +608,37 @@ class _Rules:
         covered: dict[Point, frozenset[Point]] = {
             point: (frozenset() if point in entries else universe) for point in successors
         }
+        guarded: dict[Point, bool] = {point: point not in entries for point in successors}
         reachable = self.reachable_points(successors, entries)
 
         changed = True
         rounds = 0
-        limit = len(successors) * len(universe) + len(successors) + 2
+        limit = len(successors) * (len(universe) + 2) + 2
         while changed and rounds < limit:
             changed = False
             rounds += 1
             for point in successors:
-                incoming: frozenset[Point] | None = frozenset() if point in entries else None
+                at_entry = point in entries
+                incoming: frozenset[Point] | None = frozenset() if at_entry else None
+                incoming_guard: bool | None = False if at_entry else None
                 for pred, label in predecessors.get(point, []):
                     if pred not in reachable:
                         continue
                     out = self.covered_out(pred, covered[pred], label)
                     incoming = out if incoming is None else (incoming & out)
+                    out_guard = self.guarded_out(pred, guarded[pred], label)
+                    incoming_guard = (
+                        out_guard if incoming_guard is None else (incoming_guard and out_guard)
+                    )
                 if incoming is None:
-                    incoming = frozenset() if point in entries else universe
+                    incoming = frozenset() if at_entry else universe
+                if incoming_guard is None:
+                    incoming_guard = not at_entry
                 if incoming != covered[point]:
                     covered[point] = incoming
+                    changed = True
+                if incoming_guard != guarded[point]:
+                    guarded[point] = incoming_guard
                     changed = True
 
         for point in sorted(reachable):
@@ -606,7 +649,7 @@ class _Rules:
             if spec is None or not spec.needs_confirm:
                 continue
             graph = self.graphs[point[0]]
-            if not covered[point]:
+            if not guarded[point]:
                 self.error(
                     "graph.unconfirmed_write",
                     f"tool {node.tool!r} is {spec.risk.value} risk but there is a path from the "
@@ -635,6 +678,15 @@ class _Rules:
             return frozenset({point}) if label == "yes" else frozenset()
         if isinstance(node, AskNode):
             return frozenset()
+        return incoming
+
+    def guarded_out(self, point: Point, incoming: bool, label: str) -> bool:
+        """The boolean twin of :meth:`covered_out`: is anything confirmed on the way out?"""
+        node = self.node_at(point)
+        if isinstance(node, ConfirmNode):
+            return label == "yes"
+        if isinstance(node, AskNode):
+            return False
         return incoming
 
     def node_at(self, point: Point) -> NodeBase | None:
@@ -828,7 +880,7 @@ class _Rules:
             self.error("expr.parse_error", f"{field}: {exc}", graph=graph, node=node_id)
             return None
 
-    def value(self, graph: Graph, node_id: str, raw: str, *, field: str) -> "_TypedValue | None":
+    def value(self, graph: Graph, node_id: str, raw: Scalar, *, field: str) -> "_TypedValue | None":
         try:
             value = parse_value(raw)
         except ParseError as exc:
@@ -837,7 +889,7 @@ class _Rules:
         except ValueLooksLikeExpression as exc:
             self.error("expr.looks_like_expression", f"{field}: {exc}", graph=graph, node=node_id)
             return None
-        return _TypedValue(raw=raw, expression=value.expression, literal=value.literal)
+        return _TypedValue(raw=value.raw, expression=value.expression, literal=value.literal)
 
     def typed(
         self, graph: Graph, node_id: str, expression: Expr, env: TypeEnv, *, field: str
@@ -957,15 +1009,16 @@ class _TypedValue:
 
 
 def _literal_type_info(literal: object) -> TypeInfo:
-    if isinstance(literal, bool):
-        return TypeInfo(annotation=bool)
-    if isinstance(literal, int):
-        return TypeInfo(annotation=int)
-    if isinstance(literal, float):
-        return TypeInfo(annotation=float)
+    """The type of a literal, remembering its value so a ``Literal[...]`` target can check it."""
     if literal is None:
         return TypeInfo(annotation=type(None), optional=True)
-    return TypeInfo(annotation=str)
+    if isinstance(literal, bool):
+        return TypeInfo(annotation=bool, literal_values=(literal,))
+    if isinstance(literal, int):
+        return TypeInfo(annotation=int, literal_values=(literal,))
+    if isinstance(literal, float):
+        return TypeInfo(annotation=float)
+    return TypeInfo(annotation=str, literal_values=(literal,))
 
 
 def _incompatible(source: TypeInfo, target: TypeInfo) -> str | None:
@@ -986,11 +1039,14 @@ def _incompatible(source: TypeInfo, target: TypeInfo) -> str | None:
     return None
 
 
-def _canonical_args(args: dict[str, str]) -> str:
+def _canonical_args(args: dict[str, Scalar]) -> str:
     """Canonical text for an argument mapping, so whitespace differences are not a mismatch."""
     parts = []
     for name in sorted(args):
         raw = args[name]
+        if not isinstance(raw, str):
+            parts.append(f"{name}={raw!r}")
+            continue
         try:
             parts.append(f"{name}={unparse(parse(raw))}")
         except ParseError:

@@ -1,0 +1,41 @@
+# Declarative tool manifest (support_core.graph.tools_manifest). Phase 4 replaces this with the
+# registry built from tools/__init__.py's TOOLS export; until then it is what gives the
+# validator risk tiers for the confirm-on-all-paths rule.
+tools:
+  - name: list_recent_charges
+    description: List the customer's recent charges.
+    risk: read
+    input: { limit: "int | None" }
+    output: { charge_ids: "list[str]" }
+
+  - name: get_charge
+    description: Fetch one charge by id.
+    risk: read
+    input: { charge_id: str }
+    output: { id: str, amount: float, description: str }
+
+  - name: check_refund_eligibility
+    description: Decide whether a charge may be refunded.
+    risk: read
+    input: { charge_id: str }
+    output: { eligible: bool, reason: "str | None" }
+
+  - name: issue_refund
+    description: Refund a charge to the original payment method.
+    risk: high
+    input: { charge_id: str, amount: float }
+    output: { refund_id: str }
+    idempotent: true
+
+  - name: send_otp
+    description: Send a one-time passcode to the customer's email.
+    risk: write
+    confirm_exempt: true
+    input: { email: "str | None" }
+    output: { sent: bool }
+
+  - name: check_otp
+    description: Check a one-time passcode.
+    risk: read
+    input: { code: "str | None" }
+    output: { verified: bool }

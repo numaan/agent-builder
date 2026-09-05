@@ -1,0 +1,48 @@
+id: root
+description: Greet, classify the amount through a sub-graph, and answer accordingly.
+outputs:
+  tier: str | None
+state:
+  amount: float | None
+  tier: str | None
+start: greet
+nodes:
+  greet:
+    type: say
+    message: >-
+      Hello {{ ctx.customer.name | default('there') }}, that charge is
+      {{ state.amount | money }}.
+    next: classify
+
+  classify:
+    type: subgraph
+    graph: tier
+    inputs: { amount: state.amount }
+    outputs: { tier: tier }
+    next: tier_router
+
+  tier_router:
+    type: router
+    edges:
+      state.tier == 'high': escalate
+      state.tier == 'low': settle
+    default: unsure
+
+  escalate:
+    type: say
+    message: A specialist will look at this personally.
+    next: done
+
+  settle:
+    type: say
+    message: I can settle this right away.
+    next: done
+
+  unsure:
+    type: say
+    message: Let me check that for you.
+    next: done
+
+  done:
+    type: end
+    outputs: { tier: state.tier }

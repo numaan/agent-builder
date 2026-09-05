@@ -1,0 +1,50 @@
+id: root
+description: Entry graph. Classify the intent and dispatch to a workflow (DESIGN.md 6.5).
+state:
+  intent: str | None
+  charge_hint: str | None
+  refund_outcome: str | None
+start: classify
+nodes:
+  classify:
+    type: llm
+    instructions: |
+      Decide what the customer wants. Set charge_hint to the words they used to describe
+      the charge, if any.
+    output_schema:
+      charge_hint: str | None
+    edges:
+      refund: do_refund
+      small_talk: small_talk
+      unknown: unknown
+      finished: goodbye
+
+  do_refund:
+    type: subgraph
+    graph: refund
+    inputs: { charge_hint: state.charge_hint }
+    outputs: { refund_outcome: outcome }
+    next: anything_else
+
+  small_talk:
+    type: say
+    message: Happy to help.
+    next: anything_else
+
+  unknown:
+    type: say
+    message: I cannot help with that yet, but a colleague can.
+    next: anything_else
+
+  anything_else:
+    type: ask
+    slots: [intent]
+    prompt: Is there anything else I can help with?
+    next: classify
+
+  goodbye:
+    type: say
+    message: Thanks for getting in touch. Goodbye.
+    next: done
+
+  done: { type: end }

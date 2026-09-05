@@ -1,0 +1,118 @@
+id: refund
+description: Handle a refund request for a charge on the customer's account.
+inputs:
+  charge_hint: str | None
+outputs:
+  outcome: Literal["refunded", "denied", "escalated", "abandoned"]
+state:
+  charge_hint: str | None       # seeded from the declared input of the same name
+  charge_id: str | None
+  charge: Charge | None            # Pydantic model exported by pack tools (phase 4)
+  reason: str | None
+  eligible: bool | None
+  denial_reason: str | None
+  outcome: str | None
+
+start: identity_gate
+nodes:
+  identity_gate:
+    type: gate
+    predicate: ctx.customer.identity_verified
+    redirect: verify_identity
+    next: find_charge
+
+  find_charge:
+    type: llm
+    instructions: |
+      Identify which charge the customer wants refunded. Use list_recent_charges
+      if needed. If exactly one charge matches, set charge_id. If ambiguous, ask.
+    tools: [list_recent_charges]
+    output_schema:
+      charge_id: str | None
+    edges:
+      found: fetch_charge
+      ambiguous: ask_which_charge
+
+  ask_which_charge:
+    type: ask
+    slots: [charge_id]
+    prompt: Which of these charges would you like refunded?
+    next: fetch_charge
+
+  fetch_charge:
+    type: tool
+    tool: get_charge
+    args:
+      charge_id: state.charge_id
+    into: state.charge
+    on_error: handoff_lookup_failed
+    next: check_eligibility
+
+  check_eligibility:
+    type: tool
+    tool: check_refund_eligibility
+    args:
+      charge_id: state.charge_id
+    into: { eligible: result.eligible, denial_reason: result.reason }
+    next: eligibility_router
+
+  eligibility_router:
+    type: router
+    edges:
+      state.eligible == true: confirm_refund
+      state.eligible == false: explain_denial
+    default: explain_denial
+
+  confirm_refund:
+    type: confirm
+    action:
+      tool: issue_refund
+      args: { charge_id: state.charge_id, amount: state.charge.amount }
+    prompt: |
+      I can refund {{ state.charge.amount | money }} for {{ state.charge.description }}
+      to your original payment method. Shall I go ahead?
+    edges:
+      yes: issue_refund
+      no: abandon
+
+  issue_refund:
+    type: tool
+    tool: issue_refund
+    args: { charge_id: state.charge_id, amount: state.charge.amount }
+    requires_approval: confirm_refund      # engine checks ActionApproval hash matches
+    into: { outcome: "refunded" }
+    next: tell_done
+
+  tell_done:
+    type: llm
+    instructions: Confirm the refund and state the expected timing from knowledge.
+    knowledge: { query: "refund processing time", k: 3 }
+    edges:
+      done: done
+
+  explain_denial:
+    type: llm
+    instructions: |
+      Explain the denial using state.denial_reason and cite the policy.
+      Offer escalation if the customer disagrees.
+    knowledge: { query: "refund policy {{ state.denial_reason }}", k: 3 }
+    edges:
+      accepted: done_denied
+      disputes: handoff_dispute
+
+  handoff_dispute:
+    type: handoff
+    reason: refund_denial_dispute
+    edges:
+      resumed: done_escalated
+      closed: done_escalated
+
+  handoff_lookup_failed:
+    type: handoff
+    reason: charge_lookup_failure
+    edges: { resumed: done_escalated, closed: done_escalated }
+
+  abandon:        { type: end, outputs: { outcome: abandoned } }
+  done:           { type: end, outputs: { outcome: refunded } }
+  done_denied:    { type: end, outputs: { outcome: denied } }
+  done_escalated: { type: end, outputs: { outcome: escalated } }

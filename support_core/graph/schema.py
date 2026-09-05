@@ -33,7 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from support_core.graph.expr import ParseError, parse
 from support_core.graph.expr.syntax import Expr
 from support_core.graph.findings import Finding, Severity
-from support_core.graph.nodes import NODE_TYPES, NodeBase
+from support_core.graph.nodes import NODE_TYPES, ConfirmNode, NodeBase, Scalar
 from support_core.graph.types import BuiltModel, build_model
 
 GRAPH_ID = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -86,13 +86,16 @@ class ValueLooksLikeExpression(ValueError):
     """A scalar resembles an expression but does not start with a known root."""
 
 
-def parse_value(raw: str) -> Value:
+def parse_value(raw: Scalar) -> Value:
     """Classify a mapping value as an expression or a literal.
 
-    Raises :class:`~support_core.graph.expr.ParseError` when a scalar that starts with a root
-    does not parse, and :class:`ValueLooksLikeExpression` when one that does not start with a
-    root still looks like one.
+    Only a string can be an expression: a YAML ``false`` or ``12`` is always a literal of that
+    type. Raises :class:`~support_core.graph.expr.ParseError` when a string that starts with a
+    root does not parse, and :class:`ValueLooksLikeExpression` when one that does not start with
+    a root still looks like one.
     """
+    if not isinstance(raw, str):
+        return Value(raw=repr(raw), expression=None, literal=raw)
     if EXPRESSION_START.match(raw):
         return Value(raw=raw, expression=parse(raw))
     if LOOKS_LIKE_EXPRESSION.search(raw):
@@ -236,6 +239,7 @@ def _parse_node(node_id: str, block: Any, *, file: str) -> tuple[NodeBase | None
                 node=node_id,
             )
         ]
+    block = _normalise_confirm_edges(node_type, block)
     try:
         node = NODE_TYPES[node_type].model.model_validate(block)
     except ValidationError as exc:
@@ -252,6 +256,27 @@ def _parse_node(node_id: str, block: Any, *, file: str) -> tuple[NodeBase | None
             )
         ]
     return node, []
+
+
+_YAML_BOOL_EDGE_LABELS = {True: "yes", False: "no"}
+"""YAML 1.1 reads a bare ``yes:``/``no:`` key as a boolean, and DESIGN.md section 6.4 writes
+confirm edges exactly that way. Rather than making every pack author quote them, the keys are
+translated back before validation."""
+
+
+def _normalise_confirm_edges(node_type: str, block: dict[str, Any]) -> dict[str, Any]:
+    if node_type != ConfirmNode.model_fields["type"].default and node_type != "confirm":
+        return block
+    edges = block.get("edges")
+    if not isinstance(edges, dict):
+        return block
+    if not any(isinstance(key, bool) for key in edges):
+        return block
+    fixed = dict(block)
+    fixed["edges"] = {
+        _YAML_BOOL_EDGE_LABELS.get(k, k) if isinstance(k, bool) else k: v for k, v in edges.items()
+    }
+    return fixed
 
 
 _DECLARATION_RULES = {
