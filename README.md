@@ -9,13 +9,14 @@ plan, self-critique and independent review live in `reviews/`.
 
 ```
 support_core/        the library; one subpackage per DESIGN.md section 18 entry
-  storage/           SQLAlchemy models, Alembic migrations (support_core/storage/migrations)
+  storage/           SQLAlchemy models, Alembic migrations, the engine's repositories
   graph/             pack manifest, graph schema, expression language, templates, validator
+  engine/            the turn loop, frame stack, checkpoints, advisory lock, node runners
   cli/               the `support` command
 packs/acme_billing/  sample domain pack (DESIGN.md section 5 layout)
 tests/               pytest suite; database tests run against real Postgres
-  packs/             reference packs the validator and stepper tests load
-  stepper.py         test-only in-memory graph stepper (the engine is phase 2)
+  packs/             reference packs the validator and engine tests load
+  engine_child.py    a separate OS process the durability and concurrency tests drive
 scripts/             db-up.sh, db-down.sh, db-psql.sh (POSIX sh, Git Bash and Linux)
 docker-compose.yml   Postgres 16 + pgvector
 ```
@@ -124,6 +125,39 @@ DESIGN.md 6.4 example and reports `well-formed` with warnings.
 
 `support pack knowledge sync`, `support pack eval` and `support replay` exist but exit with
 status 3 and name the phase that delivers them.
+
+## Running a conversation
+
+```python
+from support_core import load_pack
+from support_core.engine import Executor
+from support_core.storage.session import make_engine
+
+executor = Executor(load_pack("packs/acme_billing"), make_engine())
+conversation_id = await executor.start_conversation(channel="web_chat")
+await executor.on_inbound(conversation_id, "I was charged twice")
+```
+
+What the engine guarantees (DESIGN.md 7.1 to 7.3, 17), and what it does not yet do:
+
+- **One writer per conversation.** Each turn is run under `pg_advisory_xact_lock`. A message
+  that arrives while the lock is held is stored with `status = pending` and processed, in order,
+  by whichever process next holds the lock. Nothing is lost and nothing overtakes.
+- **A checkpoint after every node**, writing the frame stack, the trace step and the node's
+  outbound messages in one transaction. A process that dies anywhere resumes from the last
+  checkpoint to the same outcome; the step id (`run_id:frame_seq:node_id:attempt`) is the same
+  on the retry, which is what will make phase 4's tool calls idempotent.
+- **Suspension** into `waiting_customer`, `waiting_human`, `waiting_async_tool` and
+  `waiting_timer`, with per-status and per-channel timeouts from `pack.yaml`'s `timeouts:` block.
+  Resume with `on_inbound`, `resume_human`, `resume_async_tool`, `resume_timer`; a sweep of
+  expired deadlines is `sweep_timeouts`.
+- **Gates fire on every entry to a frame**, so a customer cannot suspend after a gate, let the
+  precondition lapse, and come back to the protected node.
+- Everything a later phase owns is a hook on `EngineHooks` with a default that does nothing
+  surprising: the interrupt check answers `continue` (phase 6), slot extraction fills the first
+  slot with the whole reply (phase 3), handoff records nothing but the run still parks for a
+  human (phase 6), and outbound messages stay `pending_send` because there is no channel
+  adapter (phase 7). `llm`, `tool` and `confirm` nodes refuse to run and name their phase.
 
 ## Writing a pack's graphs
 
