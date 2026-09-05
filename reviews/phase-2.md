@@ -429,3 +429,241 @@ What I know is fragile:
 Two of the items above started as findings in this section and were fixed rather than recorded:
 the stalled-run leak (item 2, now `recover_stalled` with a test) and the crash matrix's gap over
 the push and pop nodes (now all seven nodes rather than four). The rest stands as written.
+
+---
+
+## Independent review
+
+Reviewed by an agent that did not write the code, against DESIGN.md 3, 6.1, 6.3, 6.6, 7.1 to 7.3
+and 17, PLAN.md, and the phase-2 backlog entry.
+
+**Verdict.** The phase is close, and closer than the test count alone would show: everything the
+implementer claims reproduces exactly (463 tests green twice, ruff, ruff format, mypy strict,
+`support pack validate`, `alembic downgrade base` / `upgrade head` / `check`), the checkpoint
+really is atomic, the advisory lock really is load-bearing, and step ids survived every attack I
+could design - loops, a sub-graph invoked twice, retries after failure, and a crash mid-turn all
+produce unique, stable ids. Concurrency held under five OS processes, ten concurrent coroutines,
+a writer killed with `os._exit` while holding the lock, a duplicate message, and a resume racing
+an inbound message: nothing lost, duplicated or reordered, and two conversations do not serialise
+against each other (measured: 1.43 s against a 1.42 s uncontended control, while the other
+conversation slept 4 s inside its turn). But durability is broken in two places, both of them in
+exactly the seam the implementer's own self-critique named as the fragile one - "the interaction
+of *event still pending* with *stack changed* is the one piece of state that lives in two places
+at once". A customer message can be permanently lost in the window between the claim transaction
+and the turn-event write (R1), and a crash during a gate re-check makes the resumed run diverge
+from the uninterrupted one, hand off with a spurious `node_error`, and swallow the reply (R2).
+Both are the phase's stated purpose, so both are must-fix; neither needs a redesign, and the
+frame stack, the migration and the step-id scheme they rest on are sound.
+
+### Findings
+
+| id | severity | location | finding | suggested fix |
+|----|----------|----------|---------|---------------|
+| R1 | must-fix | `support_core/engine/executor.py:325` with `:369`; `support_core/storage/repositories.py:149` | **A customer message is lost for good if the process dies between claiming it and starting the turn.** `_claim` commits `status = 'received'` in its own transaction; `run.awaiting.turn_event` is not written until `_begin_turn`, one or more transactions later, with the (phase 6) `interrupt_check` LLM call in between. Kill the process in that window and the row is `received`, the run is still `waiting_customer`, `drain` finds nothing pending, and `recover_stalled` only looks at runs that are `running`. Nothing in the system will ever notice. Reproduced two ways: with an executor that dies right after `_claim`, and from durable state alone (claim the row by hand, then `drain`) - both leave the conversation parked on "How much was the charge?" for ever. The implementer fixed the *later* half of this window (the turn event); the earlier half is still open. | Claim the message and mark the run `running` with `awaiting.turn_event` in **one** transaction - move the claim into `_begin_turn`'s transaction, or have `claim_next_pending` set `run.awaiting` in the same statement. Belt and braces: let `recover_stalled` also pick up a conversation holding an inbound `received` message that no run is awaiting. |
+| R2 | must-fix | `support_core/engine/executor.py:511` (`resume_target`), with `:374` `_continue_interrupted` | **After a crash, the resume event is delivered to the wrong node whenever the stack moved during the interrupted turn.** `resume_target` is computed from the *current* stack top at loop entry, not from durable state. On a normal turn that is the node the run suspended at; on a re-entry after a crash it is wherever the stack now points. Crash anywhere in a turn that pushed a gate redirect (`_run_gate_recheck`) and the resumed loop calls `resume()` on the redirect's first node: `node_error: tell: a 'say' node does not suspend, so it cannot be resumed` then handoff. Three of the four kill points during a gate re-check diverge from the uninterrupted baseline (`checkpoint_before_commit` survives, because the push had not committed). The customer's reply is also swallowed: it stays `received` where the uninterrupted run leaves it `pending` for redelivery. This is the exact case the self-critique flagged as untested. It gets worse in phase 6, where every interrupt pushes a frame while an event is pending, and worse again in phase 4, where the event being routed can be a `confirm` answer. | Store the target *with* the event: put `frame_seq` and `node_id` into `run.awaiting.turn_event` when it is written and match `delivering` against that, not against the stack top. `awaiting["node"]` already records the same fact at suspend time. |
+| R3 | should-fix | `support_core/engine/executor.py:266-288` | **One poisoned conversation stops the whole recovery sweep.** `recover_stalled` calls `_drain` inside its loop with no per-conversation error handling, so any exception that is not a `NodeError` - `NodeNotExecutableError`, the `EngineError` phase 6's `new_intent` will raise, a raising `send` hook, a `ConversationContext` validation failure - aborts the batch and every later stalled run stays stalled. Reproduced: a pack that reaches an `llm` node leaves the run `running` with the message consumed and no handoff, and each subsequent `recover_stalled` raises the same error again, for ever. | Wrap each conversation's `_drain` in `try/except`, count attempts on the run, and park it `waiting_human` with reason `engine_error` after a few failures instead of retrying eternally. |
+| R4 | should-fix | `support_core/storage/repositories.py:253-266`, `:286` | **Messages written by one checkpoint come back in random order.** Outbound rows take the server default `created_at`, which is the transaction timestamp, so several messages from one node share it and `ORDER BY created_at, id` then sorts by a random UUID. Eight messages written by one checkpoint came back `8, 3, 5, 7, 2, 4, 6, 1`. It does not bite today only because no phase-2 runner emits more than one message; phase 3's `llm` node and phase 6's handoff will, and both the stored transcript and the send order to the channel are affected. The implementation note "message timestamps come from the server now" is true only *between* checkpoints. | Give `message` an ordinal (or write `created_at` per message from a counter inside the transaction) and order by it. |
+| R5 | should-fix | `support_core/engine/locks.py:73` | `conversation_lock` treats **every** `DBAPIError` as "the lock is busy". A connection failure, a cancelled statement or a permissions error is reported to the caller as `queued=True` and the message is left pending with no error recorded anywhere. | Inspect the SQLSTATE and swallow only `55P03` (`lock_not_available`); re-raise the rest. |
+| R6 | should-fix | `support_core/engine/runners.py:486-518` | **`register_node_type` is a process-wide, unscoped registry** - the same class of bug as the phase-1 P2 finding this phase just fixed for Jinja environments. A second registration of an existing custom name silently overwrites the first's spec and factory (the core-type guard only protects core names), and `unregister_node_type` removes it for everyone. DESIGN.md 6.7 keeps two pack versions loaded side by side and phase 9 splits core from packs, so two packs that both define a `verify_identity` node type will corrupt each other. | Scope the registry per `Pack` (a `Pack.node_types` mapping consulted by `build_runner`), or at minimum refuse a duplicate registration under a different factory. |
+| R7 | should-fix | `support_core/engine/executor.py:212-217`, `:410` | **A burst on one conversation stalls a connection per waiter.** Measured with five OS processes: one drained all five messages while the other four blocked on the advisory lock for the whole turn, each holding a connection, and returned `messages_processed = 0`. With a bounded pool, N+1 concurrent inbound messages on one conversation is a stall, and phase 3's LLM calls make each turn seconds long. The implementer names this as fragility item 3; I am ranking it, because phase 7 puts an HTTP handler in front of it. | Add a queue-and-return mode (`lock_wait_seconds=0` plus a poller calling `drain`) and make it the default for channel webhooks. |
+| R8 | should-fix | `support_core/storage/migrations/versions/0002_engine_durability.py:69-78` | The `uq_run_conversation` back-fill **silently destroys history**: `DELETE FROM run` cascades to `trace_step` (`ondelete="CASCADE"`), and will cascade further once phase 4 adds `tool_call.run_id`. Seeded two runs with three trace steps each on 0001; after `upgrade head`, one run and three steps remained, with no warning. Harmless today because nothing has run the engine, dangerous the day this migration meets a real database. | Fail the migration loudly when duplicates exist, or re-point the loser's children at the survivor, rather than deleting rows. |
+| R9 | nit | `tests/test_engine_frames.py:218` | `assert frame_seqs == sorted(...) or True` can never fail. The two assertions around it carry the test; this line is noise that reads like coverage. | Delete it, or make it the monotonic-order assertion it was meant to be. |
+| R10 | nit | `support_core/engine/errors.py:35`; `support_core/storage/repositories.py:195`, `:303` | Three dead public symbols: `LockTimeout` is exported and never raised; `pending_count` and `step_exists` are never called. | Delete them or use them - `LockTimeout` is the natural thing to raise for R5. |
+| R11 | nit | `support_core/engine/types.py:104-126`; `support_core/engine/executor.py:602-615` | `NodeResult` accepts contradictory results (`suspend` **and** `push_graph` **and** `pop`) and `_advance` silently prioritises `suspend`, then `push_graph`, then `pop`. Phase 3 and 4 nodes return richer results than phase 2's; a silently dropped `push_graph` would be very hard to find. | Add a model validator rejecting more than one of the three. |
+| R12 | nit | `support_core/engine/executor.py:798-809` | `_pop` writes a callee's outputs straight into `caller.state[state_field]` with no check that the field exists. The mistake surfaces one node later as an `IncompatiblePackError` reported to the operator as `pack_incompatible`, which is the wrong diagnosis. | Check the field against the caller graph's state model and raise a `NodeError` naming the mapping. |
+| R13 | nit | `support_core/storage/migrations/versions/0002_engine_durability.py:43-53` | The `seq` back-fill orders by `(started_at, id)`, so for exactly the rows finding F5 is about - several steps sharing one transaction timestamp - it invents an order from a random UUID. | Say so in the docstring; refusing to back-fill ambiguous runs is probably not worth it. |
+| R14 | nit | `tests/test_engine_durability.py:76-90` | `_uninterrupted` rebuilds the baseline conversation inside every one of the 28 parametrised cases. That is most of the suite's 165 s, and it grows with every phase. | Compute the baseline once per module (a module-scoped fixture keyed on the pack). |
+
+### Crash and concurrency attempts
+
+Every scenario I ran, including the ones that correctly held. Fixtures were written under
+`reviews/scratch-phase-2/` and deleted afterwards; no repo file was modified.
+
+**Crash attempts**
+
+| # | scenario | result |
+|---|----------|--------|
+| 1 | Reproduce the implementer's 28-case matrix (4 kill points x 7 nodes, `deterministic_pack`) | held; the comparison is not trivially equal - the baseline is a *different* conversation, so run ids differ and the signature compares step-id suffixes, frames, trace, status and transcript |
+| 2 | Check each of the 28 cases actually kills where it says | held; `crash_after` beyond the number of probe visits would fail `pytest.raises`, so no case is vacuous, and all 7 nodes of the route - including the push and the pop - are covered |
+| 3 | Real `os._exit` child mid-transaction | held; run left `running` at `checkpoint_seq = 3`, resumed byte-identical |
+| 4 | **My own 28-case matrix over a suspend-and-resume conversation** (`engine_pack`: say, ask, suspend, resume, gate, router, say, end), comparing trace, frames, status, transcript *and* inbound message statuses | all 28 held - this is the gap the self-critique named ("the crash matrix runs one pack, one path, one turn") and the engine survives it |
+| 5 | **Crash during a gate re-check**, 4 kill points | **3 of 4 broke (R2)**: the resumed run delivers the customer's reply to the redirect's `say` node, raises `node_error`, hands off and consumes the message. `checkpoint_before_commit` held |
+| 6 | **Crash between claiming a pending message and starting the turn** | **broke (R1)**: message permanently lost, no recovery path, `recover_stalled` does not see it |
+| 7 | The same window reproduced from durable state alone (claim the row by hand, then `drain`) | **broke (R1)**, confirming it is a property of the schema and not of my subclass |
+| 8 | Crash immediately after taking the advisory lock, before anything is claimed | held; lock released by the dying connection, message still `pending`, next drain processes it |
+| 9 | Crash during recovery, then again during the second recovery, then recover | held; three successive deaths at three different points still converge on the uninterrupted signature |
+| 10 | Crash while a suspend is being written (the `ask` node's checkpoint) | held (part of #4); the prompt is not duplicated, because the outbound row is inside the rolled-back transaction |
+| 11 | Migration: `downgrade base` then `upgrade head` then `alembic check` | held |
+| 12 | Migration 0002 against a **non-empty** 0001 database (two runs on one conversation, three trace steps sharing a timestamp) | back-fill and dedupe both work, but the dedupe cascades away the loser's trace (**R8**) and the tie order is arbitrary (**R13**) |
+| 13 | Failure part-way through a migration | held; Postgres DDL is transactional and Alembic reports "Will assume transactional DDL", so a half-applied revision is not reachable |
+
+**Concurrency attempts**
+
+| # | scenario | result |
+|---|----------|--------|
+| 14 | **Five OS processes** on one conversation, the first deliberately slow inside its turn | held; all five messages `received` in arrival order, echoes in order, no duplicate, `seq` contiguous, step ids unique. The slow process drained all five and the other four returned `messages_processed = 0` after blocking on the lock (**R7**) |
+| 15 | **Ten concurrent `on_inbound` coroutines** on ten engines, no pause between them | held; every message processed exactly once and answered in the order the enqueue transactions committed - which for genuinely simultaneous callers is the only order that exists |
+| 16 | **A writer killed with `os._exit` while holding the advisory lock**, with a second writer already waiting | held; the lock was released by the dead connection, the waiter finished the dead process's interrupted turn from its checkpoint (`echo`, `finish`) and then processed its own message. No loss, no duplicate |
+| 17 | The same message text delivered twice | held (two rows, both processed); the engine has no transport de-duplication, which is correct - that is phase 7's job and it is documented |
+| 18 | A resume racing an inbound message (`resume_human` and `on_inbound` concurrently, two engines) | held; both serialised on the lock, no exception, both messages accounted for |
+| 19 | Four coroutines contending for one conversation lock | held; never two holders at once |
+| 20 | Two conversations under contention | held; the second finished in 1.43 s against a 1.42 s uncontended control while the first slept 4 s inside its turn - the lock really is per conversation |
+| 21 | Pending-queue order across a **requeue** (a gate fires and puts a message back with a later message already queued) | held; the requeued message keeps its `created_at` and is delivered before the newer one |
+
+**Step id attempts** (all held)
+
+| # | scenario | result |
+|---|----------|--------|
+| 22 | The same sub-graph invoked twice in one turn | two frames (`frame_seq` 1 and 2), disjoint step ids |
+| 23 | A node visited eight times in a loop in one frame | `collect:0` to `collect:7`, all unique |
+| 24 | Full step-id sequence compared across a crash and a resume | byte-identical to the uninterrupted run |
+| 25 | A node that fails and is retried by four successive human resumes | `explode:0` to `explode:3`, no reuse |
+| 26 | A node stopped by `max_nodes_per_turn` before it ran | the handoff writes a trace row under the id the node would have used and burns that attempt, so the node later runs under the *next* id. Safe for phase 4 (no key reuse), but worth knowing: a `trace_step` row can exist for a step that never executed |
+
+**Mutation checks** (does the phase's own suite have teeth?)
+
+| # | mutation | caught? |
+|---|----------|---------|
+| 27 | `write_checkpoint` commits the trace step and outbound rows in a separate transaction *before* the run row | **caught** - resume dies on `uq_trace_step_step_id`; checkpoint atomicity is genuinely tested, not assumed |
+| 28 | `_continue_interrupted` forgets `run.awaiting.turn_event` | **caught** - the conversation re-asks "How much was the charge?" instead of settling, exactly as the repo's own test asserts |
+| 29 | `conversation_lock` replaced by a no-op | **caught** - three of four concurrent turns die with `IntegrityError`; single-writer ordering is load-bearing and tested |
+
+### Exit criterion
+
+- *Kill-and-resume passes under Postgres*: **partly**. It passes for every kill point on a
+  straight-line turn (28 cases plus a real `os._exit`) and for every kill point on a
+  suspend-and-resume turn (my own 28, #4). It fails during a gate re-check (R2) and in the claim
+  window (R1). Both are kill points and both lose or misroute a customer message, so I do not
+  consider the criterion met until they are fixed.
+- *Two concurrent inbound messages are processed in order with no lost state*: **met**,
+  independently of the implementer's tests, and it survives five processes, ten coroutines, a
+  killed lock holder and a requeue (#14 to #21).
+
+### Design conformance
+
+DESIGN.md 7.1 line by line: lock (`locks.conversation_lock`), load Run (`_run_for`), guardrails
+(absent and declared, phase 7), append to history (`enqueue_inbound`, before the lock, correct),
+interrupt check on `waiting_customer` (hook, `continue` only), push root frame when idle (also on
+`done`, which is the "one run per conversation" decision and is right), the loop, the checkpoint
+in one transaction, send after the commit, advance, release. The one substantive reordering -
+writing outbound rows inside the checkpoint and sending after it - is the safe direction and is
+recorded. 7.2's four statuses all exist, are all resumed on a fresh `Executor`, and all have
+per-status and per-channel timeouts. 7.3 is implemented except the frame-level `on_error` graph.
+
+- **Promoting `gate` and `ask` into phase 2 was sound.** DESIGN.md 6.6's "gates fire on every
+  entry to a frame" is a phase-2 checklist line and cannot be tested without a runnable gate;
+  `waiting_customer` is the first row of 7.2 and `ask` is the only node that reaches it. Neither
+  pre-empts phase 3 or 4 in a way that will need rework: `GateRunner` evaluates an expression the
+  phase-1 evaluator already provides, and `AskRunner` puts the only model-dependent part behind
+  `hooks.extract_slots`. The one risk is the one the implementer names - phase 3 must replace the
+  *hook* and not the node - and `AskRunner.resume` is small enough that the temptation will be
+  visible in review.
+- **The frame stack does accommodate phase 6's interrupt stack.** `Frame.kind` includes
+  `interrupt` from the first commit, `_push` is the single entry point for every reason a frame
+  appears, `return_node` and `outputs_into` are per frame rather than per call site, and
+  `frame_seq` is monotonic per run rather than a stack depth, which is what stops two invocations
+  of one graph colliding. `tests/test_engine_frames.py` pushes an interrupt frame and round-trips
+  it through JSONB. No migration of stored stacks will be needed. The blocker for phase 6 is not
+  the stack, it is R2.
+- **Migration 0002 fixes phase-0 finding F5 properly.** `trace_step.seq` is the run's
+  `checkpoint_seq` at write time with a unique `(run_id, seq)`, both timestamps come from the
+  injectable clock rather than `now()`, and `repositories.trace` orders by `seq`. I confirmed the
+  constraint refuses a second row at the same `(run_id, seq)` and that `started_at` is never
+  null. The columns beyond section 17's list are additive and all earn their place; the two new
+  constraints are the interesting part and both are justified in the decisions log. The defects
+  are in the *back-fill* only: R8 and R13.
+- **Skipping 7.3's frame-level `on_error` graph was the right call.** Graphs have no `on_error`
+  key in the phase-1 schema, nothing in phase 2 can raise a frame-level error that a node-level
+  edge could not catch, and adding the tier later needs no change to stored frames - the graph
+  definition would carry it, not the `Frame`. Recorded as a divergence, which is correct.
+
+### Forward compatibility
+
+- **Phase 3** (llm node, prompt assembly): clean. `trace_step.llm_response` exists, `NodeResult`
+  carries it, the step id is on `NodeRuntime` ready to be a replay cache key, and
+  `hooks.extract_slots` is the only thing `ask` needs replaced. Two concrete problems it will
+  meet: R4 (an `llm` node that emits more than one message gets a randomly ordered transcript)
+  and R7 (turns become seconds long, so the lock-per-waiter stall becomes real).
+- **Phase 4** (tool execution, confirm hash, idempotency): the step id is exactly what it needs
+  and it held under every attack, including the one that matters - a step re-executed after a
+  crash keeps its id, so a non-idempotent tool is deduplicated. Two things to watch: a
+  `trace_step` row can exist for a step that never ran (#26), so the tool runtime must key on the
+  `tool_call` table rather than on "does a trace step exist"; and R2 means a `confirm` answer can
+  be routed to the wrong node after a crash, which for an approval is a safety property and not
+  only a correctness one.
+- **Phase 6** (interrupt stack, handoff node): the stack shape is ready, but R2 is squarely in
+  its path - phase 6 pushes a frame *while a customer message is pending*, which is precisely the
+  configuration that breaks today. Fix R2 before phase 6 starts, not during it. R3 matters too,
+  because phase 6's `interrupt_check` returns three answers the executor currently raises on, and
+  a raise inside `recover_stalled` poisons the batch.
+- **Phase 9 and DESIGN 6.7** (two pack versions side by side): R6 - the node-type registry is
+  process-wide and unscoped, the same defect the phase just fixed for Jinja environments.
+
+### The every-phase rule (no tool execution without an `ActionApproval`)
+
+Holds, and holds structurally rather than by accident. `NODE_RUNNERS` has no entry for `tool`,
+`confirm`, `llm` or `handoff`, so `build_runner` returns `NotExecutableRunner`, which raises and
+names the owning phase (verified by actually reaching an `llm` node at run time). `NodeRuntime`
+exposes only `graph`, `frame`, `step_id`, `run_id`, `conversation_id`, `hooks` and the pack's
+Jinja environment - there is no tool seam to drive - and no hook on `EngineHooks` executes
+anything. `register_node_type` refuses to replace a core type, so a pack cannot supply its own
+`tool` node, and `load_pack` does not read a pack's `nodes/` directory yet, so today only tests
+can register anything at all.
+
+Two things for phase 4 to get right, neither of them a phase-2 defect: (a) the approval check
+must live on the `NodeRuntime` method that invokes a tool, not inside a `ToolRunner`, because a
+pack-registered custom node type is arbitrary Python and `rt` is its only route to the outside -
+put the check anywhere else and a custom node bypasses it; (b) R6 must be fixed first, or a
+second pack can overwrite a registered node type's factory.
+
+### Commands run
+
+From the repository root with `.venv/Scripts/python.exe`; Postgres 16 in
+`customer-support-agent-db-1`, database `support_test`.
+
+| Command | Result |
+|---------|--------|
+| `python -m ruff check .` | `All checks passed!` (exit 0) |
+| `python -m ruff format --check .` | `77 files already formatted` (exit 0) |
+| `python -m mypy` | `Success: no issues found in 77 source files` |
+| `python -m pytest -q` (first pass) | `463 passed in 165.37s` |
+| `python -m pytest -q` (second pass, isolation) | `463 passed in 152.63s` |
+| `python -m support_core.cli.main pack validate packs/acme_billing` | `acme-billing: empty but well-formed`, exit 0 |
+| `python -m alembic downgrade base` then `upgrade head` | both revisions apply from base and roll back cleanly |
+| `python -m alembic check` | `No new upgrade operations detected.` |
+| `alembic downgrade 0001`, seed two runs and six trace steps, `upgrade head` | back-fill correct; one run and three steps survive (R8) |
+| Reviewer's crash attacks | 28 suspend-and-resume kill points pass; gate re-check 3 of 4 fail (R2); the claim window fails (R1) |
+| Reviewer's concurrency attacks | 9 scenarios, all pass |
+| Reviewer's step-id attacks | 5 scenarios, all pass |
+| Reviewer's mutation checks | 3 mutations, all caught |
+
+Every claim in the implementation notes reproduced. Nothing was found that the notes assert and
+the code does not do.
+
+### Missed by self-critique
+
+The self-critique is unusually honest - it names the crash matrix's narrowness, the untested gate
+re-check, the untested resume-crash, the lock-per-waiter stall and the at-least-once send, and it
+fixed two of its own findings rather than recording them. What it missed:
+
+1. **R1 is not in it at all.** The notes describe the turn-event fix as closing the window where
+   "a process died between claiming a message and delivering it", and it closes the *second* half
+   of that window. The first half - between the claim transaction committing and the turn-event
+   write - is still open, and unlike the second half it is unrecoverable, because no sweep looks
+   for it. Two transactions where the invariant needs one.
+2. **R2 was predicted but never run.** Self-critique item 6 says a crash during a gate re-check
+   is untested and "the ordering is delicate", then concludes "it should be as safe as any other
+   node". It is not: three of the four kill points break. A named suspicion is worth the hour it
+   takes to test, especially when the same paragraph identifies the exact state that lives in two
+   places at once.
+3. **R3.** "`sweep_timeouts` and `recover_stalled` are never tested under contention" is in the
+   notes; that they have no error handling at all, so one bad conversation blocks recovery for
+   every other one, is not.
+4. **R4.** The notes state that outbound timestamps come from the server so that a transcript
+   cannot be reordered across a crash and a resume. That is true between checkpoints and false
+   within one, and no test writes two messages from one node.
+5. **R6.** The phase fixed the process-wide Jinja environment (P2) and in the same commits
+   introduced a process-wide node-type registry with the same failure mode under DESIGN 6.7's
+   two-versions rule.
+6. **R5, R8, R9, R10.** Smaller: the over-broad `except DBAPIError`, the cascading delete in the
+   migration back-fill, an assertion that can never fail, and three dead exported symbols.
