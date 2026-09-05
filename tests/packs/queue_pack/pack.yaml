@@ -1,0 +1,12 @@
+# A pack for the concurrency tests: every turn echoes the message that drove it, so the order
+# two processes handled two messages in is visible in the transcript.
+id: queue-pack
+version: 1.0.0
+core: ">=0.0.1,<1"
+entry_graph: root
+language: en
+channels: [web_chat]
+llm:
+  default_model: claude-sonnet-5
+handoff:
+  queue: engine-tests

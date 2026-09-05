@@ -184,6 +184,14 @@ async def requeue(session: AsyncSession, message_id: uuid.UUID) -> None:
     await session.execute(update(Message).where(Message.id == message_id).values(status="pending"))
 
 
+async def forget_turn_event(session: AsyncSession, run_id: uuid.UUID) -> None:
+    """Drop the in-flight turn event from ``run.awaiting`` (see the executor's requeue)."""
+    await session.execute(
+        text("UPDATE run SET awaiting = awaiting - 'turn_event' WHERE id = :id"),
+        {"id": run_id},
+    )
+
+
 async def pending_count(session: AsyncSession, conversation_id: uuid.UUID) -> int:
     result = await session.execute(
         text("SELECT count(*) FROM message WHERE conversation_id = :c AND status = 'pending'"),
@@ -243,6 +251,10 @@ async def write_checkpoint(
             )
         )
         for body in outbound:
+            # created_at is left to the server default. It orders the customer's transcript,
+            # and a conversation is single-writer, so successive checkpoints get increasing
+            # transaction timestamps whichever process wrote them - which an engine clock,
+            # injectable and therefore skewable, could not promise across a crash and a resume.
             session.add(
                 Message(
                     conversation_id=conversation_id,
@@ -250,7 +262,6 @@ async def write_checkpoint(
                     author="agent",
                     text=body,
                     status="pending_send",
-                    created_at=step.ended_at,
                 )
             )
         if before_commit is not None:

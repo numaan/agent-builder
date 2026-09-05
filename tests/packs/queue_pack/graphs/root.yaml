@@ -1,0 +1,22 @@
+id: root
+description: Ask, then echo the reply. One customer message per completed turn.
+outputs:
+  note: str | None
+state:
+  note: str | None
+start: collect
+nodes:
+  collect:
+    type: ask
+    slots: [note]
+    prompt: Say something.
+    next: echo
+
+  echo:
+    type: say
+    message: You said {{ state.note }}.
+    next: finish
+
+  finish:
+    type: end
+    outputs: { note: state.note }

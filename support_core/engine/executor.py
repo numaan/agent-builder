@@ -77,6 +77,11 @@ widget that opened on a charge, an email whose subject named an order - puts it 
 root frame is seeded from it under the same rule the validator enforces for every other graph
 (``graph.input_not_in_state``): an input lands in the state field of the same name."""
 
+TURN_EVENT_KEY = "turn_event"
+"""Key in ``run.awaiting`` holding the event that drove the turn in flight, until the node it
+belongs to consumes it. Without it, a process that died between claiming a customer message and
+delivering it would leave the message claimed and the run with no idea what it was for."""
+
 RESUMABLE_BY_CUSTOMER = frozenset(["idle", "done", "waiting_customer"])
 """Statuses in which a customer message starts or continues a turn. A run waiting for a human,
 a tool or a timer keeps its queue: the message is stored and stays ``pending`` until the thing
@@ -95,6 +100,12 @@ class _Turn:
     next_frame_seq: int
     turn_nodes: int
     outcome: TurnOutcome
+    pending_event: ResumeEvent | None = None
+    """The event that started this turn, until the node it belongs to consumes it.
+
+    It is written into ``run.awaiting`` by every checkpoint while it is still pending, so a
+    process that dies mid-turn does not lose the customer message that drove it: the message
+    row is already claimed, and only the run row can say what it was for."""
 
     @property
     def frame(self) -> Frame:
@@ -330,9 +341,10 @@ class Executor:
                 ),
             )
 
+        turn.pending_event = event
         await self._begin_turn(turn)
-        undelivered = await self._loop(turn, ctx, event)
-        await self._requeue(undelivered)
+        undelivered = await self._loop(turn, ctx)
+        await self._requeue(turn, undelivered)
         return await self._run_for(conversation.id)
 
     async def _continue_interrupted(
@@ -341,17 +353,26 @@ class Executor:
         """Re-enter a turn whose process died. The current node runs again under its own id."""
         turn = self._turn_state(run, outcome)
         if not turn.frames:
-            await self._set(run.id, status="idle", turn_nodes=0)
+            await self._set(run.id, status="idle", turn_nodes=0, awaiting=None)
             return await self._run_for(conversation.id)
-        await self._loop(turn, self._context(conversation), None)
+        stored = (run.awaiting or {}).get(TURN_EVENT_KEY)
+        turn.pending_event = ResumeEvent.model_validate(stored) if stored else None
+        undelivered = await self._loop(turn, self._context(conversation))
+        await self._requeue(turn, undelivered)
         return await self._run_for(conversation.id)
 
-    async def _requeue(self, event: ResumeEvent | None) -> None:
-        """Put back a customer message no node consumed (see :meth:`_loop`)."""
+    async def _requeue(self, turn: _Turn, event: ResumeEvent | None) -> None:
+        """Put back a customer message no node consumed (see :meth:`_loop`).
+
+        The message going back on the queue and the run forgetting it are one transaction. Any
+        other order leaves a window in which a crash would either lose the message or deliver
+        it twice.
+        """
         if event is None or event.message_id is None:
             return
         async with self.sessions() as session, session.begin():
             await repo.requeue(session, event.message_id)
+            await repo.forget_turn_event(session, turn.run_id)
 
     async def _resume(
         self,
@@ -381,9 +402,10 @@ class Executor:
             # node waiting on an event: re-run the node the human unblocked.
             awaiting = run.awaiting or {}
             resume_event = event if awaiting.get("kind") == "node" else None
+            turn.pending_event = resume_event
             await self._begin_turn(turn)
-            undelivered = await self._loop(turn, self._context(conversation), resume_event)
-            await self._requeue(undelivered)
+            undelivered = await self._loop(turn, self._context(conversation))
+            await self._requeue(turn, undelivered)
             await self._flush_outbound(conversation_id)
             outcome.status = (await self._run_for(conversation_id)).status  # type: ignore[assignment]
         return outcome
@@ -453,9 +475,7 @@ class Executor:
 
     # -- the loop ------------------------------------------------------------------------
 
-    async def _loop(
-        self, turn: _Turn, ctx: ConversationContext, event: ResumeEvent | None
-    ) -> ResumeEvent | None:
+    async def _loop(self, turn: _Turn, ctx: ConversationContext) -> ResumeEvent | None:
         """Run nodes until the run suspends, ends, or hits a limit (DESIGN.md section 7.1).
 
         Returns the resume event if no node ever consumed it, which happens when the frame's
@@ -464,7 +484,7 @@ class Executor:
         is lost by a gate firing.
         """
         check_gates = True
-        resume_target = (turn.frame.frame_seq, turn.frame.node_id) if event else None
+        resume_target = (turn.frame.frame_seq, turn.frame.node_id) if turn.pending_event else None
         """Where the run suspended. The event belongs to *that* node and to no other: a gate
         firing on entry pushes a redirect whose first node has not been waiting for anything,
         and handing it a resume event would call ``resume`` on a node that never suspended."""
@@ -475,7 +495,7 @@ class Executor:
                 state = self._state(graph, frame)
             except IncompatiblePackError as exc:
                 await self._handoff(turn, frame.node_id, "pack_incompatible", str(exc))
-                return event
+                return turn.pending_event
 
             if check_gates:
                 check_gates = False
@@ -483,7 +503,7 @@ class Executor:
                     gate_id = self._failed_gate(graph, frame, state, ctx)
                 except NodeError as exc:
                     await self._handoff(turn, frame.node_id, "node_error", str(exc))
-                    return event
+                    return turn.pending_event
                 if gate_id is not None:
                     await self._run_gate_recheck(turn, graph, frame, gate_id)
                     check_gates = True
@@ -497,7 +517,7 @@ class Executor:
                     "limit_exceeded",
                     f"max_nodes_per_turn ({limit}) reached",
                 )
-                return event
+                return turn.pending_event
 
             node = graph.nodes[frame.node_id]
             attempt = frame.attempts.get(frame.node_id, 0)
@@ -514,6 +534,7 @@ class Executor:
             runner = self._runner(graph, frame.node_id, node)
             started = self.hooks.clock()
             await self.hooks.probe("before_node", {"step_id": sid, "node_id": frame.node_id})
+            event = turn.pending_event
             delivering = event is not None and resume_target == (
                 frame.frame_seq,
                 frame.node_id,
@@ -525,16 +546,16 @@ class Executor:
                     result = await runner.run(state, ctx, runtime)
             except NodeError as exc:
                 if delivering:
-                    event = None
+                    turn.pending_event = None
                 if not await self._route_error(turn, graph, frame, node, sid, started, exc):
-                    return event
+                    return turn.pending_event
                 check_gates = False
                 continue
             if delivering:
-                event = None
+                turn.pending_event = None
             await self.hooks.probe("after_node", {"step_id": sid, "node_id": frame.node_id})
             check_gates = await self._advance(turn, ctx, graph, frame, node, result, sid, started)
-        return event
+        return turn.pending_event
 
     async def _advance(
         self,
@@ -814,6 +835,8 @@ class Executor:
             if rule.seconds is not None:
                 timeout_at = now + timedelta(seconds=rule.seconds)
 
+        awaiting = self._with_turn_event(turn, awaiting)
+
         update = RunUpdate(
             run_id=turn.run_id,
             status=turn.status,
@@ -871,13 +894,23 @@ class Executor:
             turn.run_id,
             status="running",
             turn_nodes=0,
-            awaiting=None,
+            awaiting=self._with_turn_event(turn, None),
             timeout_at=None,
             suspended_at=None,
             frames=[frame.model_dump(mode="json") for frame in turn.frames],
             next_frame_seq=turn.next_frame_seq,
             updated_at=self.hooks.clock(),
         )
+
+    def _with_turn_event(
+        self, turn: _Turn, awaiting: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Add the undelivered turn event to what the run says it is waiting for."""
+        if turn.pending_event is None:
+            return awaiting
+        merged = dict(awaiting or {})
+        merged[TURN_EVENT_KEY] = turn.pending_event.model_dump(mode="json")
+        return merged
 
     async def _set(self, run_id: uuid.UUID, **values: Any) -> None:
         async with self.sessions() as session, session.begin():
