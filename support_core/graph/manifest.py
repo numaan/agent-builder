@@ -42,6 +42,17 @@ class InterruptConfig(BaseModel):
     allowed_from: list[str] = Field(default_factory=list)
     blocked_in: list[str] = Field(default_factory=list)
 
+    @field_validator("allowed_from", "blocked_in")
+    @classmethod
+    def _graph_ids_unique(cls, value: list[str]) -> list[str]:
+        if any(not graph for graph in value):
+            msg = "graph ids must not be empty"
+            raise ValueError(msg)
+        if len(set(value)) != len(value):
+            msg = "contains duplicates"
+            raise ValueError(msg)
+        return value
+
 
 class HandoffConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -70,7 +81,8 @@ class PackManifest(BaseModel):
     core: str
     """PEP 440 specifier the installed ``support_core`` version must satisfy."""
     entry_graph: str = Field(min_length=1)
-    language: str = "en"
+    language: str = Field(default="en", min_length=2)
+    """BCP 47 tag such as ``en`` or ``pt-BR``; must not be blank."""
     channels: list[Channel] = Field(min_length=1)
     llm: LlmConfig
     interrupts: InterruptConfig = Field(default_factory=InterruptConfig)

@@ -62,6 +62,9 @@ strict = true
 warn_unreachable = true
 plugins = ["pydantic.mypy"]
 files = ["support_core", "tests", "packs"]
+# Name modules by their path from the repo root (packs.acme_billing.tools), so a second
+# pack's tools/__init__.py is not a duplicate top-level module named `tools`.
+explicit_package_bases = true
 exclude = ['\.venv']
 
 [[tool.mypy.overrides]]

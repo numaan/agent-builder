@@ -8,6 +8,7 @@ Phase 1 hook: :func:`validate_graphs`. It receives the manifest and the graph fi
 implement every rule listed in section 5.2. Until then it only reports that graphs were seen.
 """
 
+import re
 from collections.abc import Iterable
 from enum import StrEnum
 from pathlib import Path
@@ -44,6 +45,8 @@ GRAPH_SUFFIXES: tuple[str, ...] = (".yaml", ".yml")
 KNOWLEDGE_SECTIONS: tuple[str, ...] = ("documents", "knowledge_graph", "live_lookups")
 POLICIES_MAX_LINES = 40
 """Section 5: policies.md is 'short hard rules injected into every prompt (max ~40 lines)'."""
+TOOLS_EXPORT = re.compile(r"^TOOLS\s*(?::|=)")
+"""A module-level ``TOOLS = ...`` or ``TOOLS: list[...] = ...`` line (section 8.3)."""
 
 
 class Severity(StrEnum):
@@ -142,11 +145,21 @@ def validate_pack(pack_path: Path) -> ValidationReport:
 
     graphs_dir = pack_path / "graphs"
     if graphs_dir.is_dir():
-        report.graph_files = sorted(
-            p.relative_to(pack_path).as_posix()
-            for p in graphs_dir.iterdir()
-            if p.is_file() and p.suffix in GRAPH_SUFFIXES
-        )
+        for entry in sorted(graphs_dir.iterdir()):
+            if entry.suffix not in GRAPH_SUFFIXES:
+                continue
+            rel = entry.relative_to(pack_path).as_posix()
+            if entry.is_file():
+                report.graph_files.append(rel)
+            else:
+                findings.append(
+                    Finding(
+                        severity=Severity.ERROR,
+                        rule="layout.not_a_file",
+                        message=f"{rel} has a graph file suffix but is not a file",
+                        location=rel,
+                    )
+                )
 
     if report.empty:
         findings.append(
@@ -283,7 +296,7 @@ def _check_tools_module(pack_path: Path) -> list[Finding]:
     source, findings = _read_utf8(pack_path, "tools/__init__.py", "tools.unreadable")
     if source is None:
         return findings
-    if not any(line.startswith("TOOLS") for line in source.splitlines()):
+    if not any(TOOLS_EXPORT.match(line) for line in source.splitlines()):
         return [
             Finding(
                 severity=Severity.ERROR,

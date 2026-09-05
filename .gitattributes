@@ -6,4 +6,5 @@
 *.md text eol=lf
 *.toml text eol=lf
 *.ini text eol=lf
+*.sql text eol=lf
 Makefile text eol=lf

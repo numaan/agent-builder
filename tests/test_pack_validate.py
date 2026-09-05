@@ -35,6 +35,15 @@ def test_sample_pack_is_empty_but_well_formed_via_cli() -> None:
     assert "acme-billing: empty but well-formed" in result.output
     assert "pack.empty" in result.output
 
+    # --strict only changes the exit status; it must not hide INFO findings (review N3).
+    strict = CliRunner().invoke(cli, ["pack", "validate", "--strict", str(SAMPLE_PACK)])
+    assert strict.exit_code == EXIT_OK, strict.output
+    assert "pack.empty" in strict.output
+
+    quiet = CliRunner().invoke(cli, ["pack", "validate", "--quiet", str(SAMPLE_PACK)])
+    assert quiet.exit_code == EXIT_OK
+    assert quiet.output.strip() == "acme-billing: empty but well-formed"
+
 
 def test_sample_pack_report() -> None:
     report = validate_pack(SAMPLE_PACK)
@@ -160,6 +169,27 @@ def test_manifest_rejects_empty_core_specifier(pack_copy: Path, value: str) -> N
     assert "manifest.invalid" in _rules(pack_copy, Severity.ERROR)
 
 
+@pytest.mark.parametrize(
+    ("old", "new", "field"),
+    [
+        ("allowed_from: [root, refund", "allowed_from: [root, root", "allowed_from"),
+        ("blocked_in: [verify_identity, payment_capture]", "blocked_in: [x, x]", "blocked_in"),
+        ("language: en", "language: ''", "language"),
+        ("language: en", "language: e", "language"),
+    ],
+)
+def test_manifest_list_uniqueness_and_language(
+    pack_copy: Path, old: str, new: str, field: str
+) -> None:
+    """Interrupt lists are as strict as channels; language must not be blank (review N5)."""
+    manifest_path = pack_copy / "pack.yaml"
+    original = manifest_path.read_text(encoding="utf-8")
+    assert old in original
+    manifest_path.write_text(original.replace(old, new), encoding="utf-8")
+    with pytest.raises(ManifestError, match=field):
+        load_manifest(pack_copy)
+
+
 def test_manifest_interrupt_lists_must_not_overlap(pack_copy: Path) -> None:
     manifest_path = pack_copy / "pack.yaml"
     manifest_path.write_text(
@@ -197,9 +227,24 @@ def test_non_utf8_files_are_reported_not_raised(pack_copy: Path, rel: str, rule:
     assert rule in result.output, "the CLI must print the finding, not a traceback"
 
 
-def test_tools_module_must_export_tools(pack_copy: Path) -> None:
-    (pack_copy / "tools" / "__init__.py").write_text('"""no tools"""\n', encoding="utf-8")
+@pytest.mark.parametrize(
+    "source",
+    [
+        '"""no tools"""\n',
+        "TOOLSET = 5\n",
+        '"""TOOLS are documented here but never defined."""\n',
+        "    TOOLS = []\n",
+    ],
+)
+def test_tools_module_must_export_tools(pack_copy: Path, source: str) -> None:
+    (pack_copy / "tools" / "__init__.py").write_text(source, encoding="utf-8")
     assert "tools.no_export" in _rules(pack_copy, Severity.ERROR)
+
+
+@pytest.mark.parametrize("source", ["TOOLS = []\n", "TOOLS: list[Any] = []\n", "TOOLS=[]\n"])
+def test_tools_module_export_forms_accepted(pack_copy: Path, source: str) -> None:
+    (pack_copy / "tools" / "__init__.py").write_text(source, encoding="utf-8")
+    assert "tools.no_export" not in _rules(pack_copy)
 
 
 def test_knowledge_sources_shape(pack_copy: Path) -> None:
@@ -237,6 +282,17 @@ def test_graph_files_hit_the_phase_1_hook(pack_copy: Path) -> None:
     assert report.graph_files == ["graphs/root.yaml"]
     assert "graph.not_validated" in {f.rule for f in report.warnings}
     assert report.summary() == "acme-billing: well-formed (1 warning(s))"
+
+
+def test_directory_with_graph_suffix_is_reported(pack_copy: Path) -> None:
+    """A directory named root.yaml is not silently skipped as 'empty' (review N6)."""
+    (pack_copy / "graphs" / "root.yaml").mkdir()
+    report = validate_pack(pack_copy)
+    assert not report.ok
+    assert report.empty
+    assert ("layout.not_a_file", "graphs/root.yaml") in {
+        (f.rule, f.location) for f in report.errors
+    }
 
 
 def test_entry_graph_must_exist_once_graphs_are_present(pack_copy: Path) -> None:

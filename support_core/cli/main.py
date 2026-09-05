@@ -11,7 +11,7 @@ from pathlib import Path
 import click
 
 from support_core import __version__
-from support_core.graph.validator import Severity, validate_pack
+from support_core.graph.validator import validate_pack
 
 EXIT_OK = 0
 EXIT_INVALID = 1
@@ -31,19 +31,18 @@ def pack() -> None:
 
 @pack.command("validate")
 @click.argument("path", type=click.Path(path_type=Path))
-@click.option("--strict", is_flag=True, help="Treat warnings as errors.")
+@click.option("--strict", is_flag=True, help="Exit 1 on warnings as well as errors.")
 @click.option("--quiet", "-q", is_flag=True, help="Print only the summary line.")
 def pack_validate(path: Path, strict: bool, quiet: bool) -> None:
     """Validate the domain pack at PATH (DESIGN.md section 5.2).
 
     Exit status 0 when the pack is well-formed, 1 when it has errors (or warnings with
-    --strict).
+    --strict). Every finding is printed in both modes; --strict changes only the exit
+    status.
     """
     report = validate_pack(path)
     if not quiet:
         for finding in report.findings:
-            if finding.severity is Severity.INFO and strict:
-                continue
             click.echo(finding.render())
     click.echo(report.summary())
     failed = not report.ok or (strict and report.warnings)
