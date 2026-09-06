@@ -614,3 +614,60 @@ async def _rewrite_charge_amount(
             text("UPDATE run SET frames = CAST(:f AS jsonb) WHERE conversation_id = :c"),
             {"f": json.dumps(frames), "c": conversation_id},
         )
+
+
+# -- 8. one live approval per proposal -----------------------------------------------------
+
+
+async def test_a_second_proposal_supersedes_the_first_live_approval(engine: AsyncEngine) -> None:
+    """Review finding P5, at the only place it can happen.
+
+    The finding as written - a parked ``confirm`` re-presenting its proposal writes a second live
+    approval - does not reproduce: ``ConfirmRunner`` records an approval on a *yes*, not when it
+    presents, so a re-presentation writes no row at all. What is real is the shape behind it. A
+    ``confirm`` node re-entered in the same frame and answered yes twice - a graph whose
+    ``on_error`` leads back past it is the way to get there - would leave two rows for one run,
+    one frame, one node, one tool and one hash, both live, and the second call would find the
+    spare waiting.
+
+    Written at the repository, because that is where the invariant lives and because building a
+    graph that reaches the shape would test the graph rather than the rule.
+    """
+    from support_core.storage.repositories import ApprovalWrite, live_approvals, record_approval
+
+    executor, _ = build(hostile("replay"), engine)
+    conversation_id = await executor.start_conversation()
+    run = await run_row(engine, conversation_id)
+
+    def proposal(step: str, approved_by: str = "customer") -> ApprovalWrite:
+        return ApprovalWrite(
+            conversation_id=conversation_id,
+            run_id=run["id"],
+            frame_seq=0,
+            node_id="confirm_it",
+            step_id=step,
+            tool="charge",
+            args={"amount": 29.0},
+            args_hash="deadbeef",
+            approved_by=approved_by,
+            approved_at=executor.hooks.clock(),
+        )
+
+    async with executor.sessions() as session, session.begin():
+        await record_approval(session, proposal("step:0"))
+        await record_approval(session, proposal("step:1"))
+        live = await live_approvals(session, conversation_id)
+
+    assert [row.step_id for row in live] == ["step:1"], "one live approval per proposal"
+    rows = await approvals(engine, conversation_id)
+    assert len(rows) == 2, "the superseded row is kept, so an auditor can see both proposals"
+    assert rows[0]["consumed_at"] is not None
+    assert rows[0]["consumed_by_tool_call_id"] is None, "spent by nothing: superseded, not called"
+
+    # And the human half of a `requires_human_approval` pair does not cancel the customer half
+    # it was written to countersign - the supersede is scoped by who approved.
+    async with executor.sessions() as session, session.begin():
+        await record_approval(session, proposal("step:1#human", approved_by="human"))
+        live = await live_approvals(session, conversation_id)
+
+    assert sorted(row.approved_by for row in live) == ["customer", "human"]

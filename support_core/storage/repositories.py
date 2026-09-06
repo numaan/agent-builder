@@ -587,7 +587,35 @@ async def record_approval(session: AsyncSession, approval: ApprovalWrite) -> uui
 
     Idempotent under ``(run_id, step_id)``: a ``confirm`` node whose step re-executes after a
     crash records the same approval, not a second one that a later call could also spend.
+
+    **A new proposal supersedes the frame's earlier live ones for the same node** (review finding
+    P5). A ``confirm`` node can legitimately run twice in one frame - returning to a workflow
+    parked by an interrupt re-enters at the node it was suspended in, and it re-presents its
+    proposal rather than assuming the old answer - and each run wrote a live row, so the invariant
+    "one live approval per proposal" quietly stopped holding. Nothing was over-authorised in the
+    sample pack, because ``consume_approval`` spends exactly one and no edge returns to the tool
+    node in the same frame; a graph whose ``on_error`` did return there would have found the spare
+    waiting. The supersede is scoped by ``approved_by``, so the *human* half of a
+    ``requires_human_approval`` pair does not cancel the customer half it was written to
+    countersign; it is in the same statement batch as the insert, and therefore in the same
+    checkpoint transaction, so no window exists in which both are live or neither is.
     """
+    await session.execute(
+        text(
+            "UPDATE action_approval SET consumed_at = :approved_at "
+            "WHERE run_id = :run_id AND frame_seq = :frame_seq AND node_id = :node_id "
+            "  AND approved_by = :approved_by AND step_id <> :step_id "
+            "  AND consumed_at IS NULL"
+        ),
+        {
+            "run_id": approval.run_id,
+            "frame_seq": approval.frame_seq,
+            "node_id": approval.node_id,
+            "approved_by": approval.approved_by,
+            "step_id": approval.step_id,
+            "approved_at": approval.approved_at,
+        },
+    )
     result = await session.execute(
         text(
             "INSERT INTO action_approval "
