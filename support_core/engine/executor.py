@@ -60,6 +60,8 @@ from support_core.engine.interrupts import (
     resolve_intent,
     return_offer,
     switch_notice,
+    unsure_hint,
+    unsure_notice,
     workflow_intents,
 )
 from support_core.engine.locks import conversation_lock
@@ -718,10 +720,21 @@ class Executor:
                 window=[(m.author, m.text) for m in await self._history(turn.conversation_id)],
             )
         )
+        if decision.kind not in {"cancel", "new_intent"}:
+            return
+        if decision.confidence < self.pack.manifest.llm.confidence_threshold:
+            # Review finding P3. The check's confidence was collected, carried through three
+            # layers and read by nobody, so a `cancel` at confidence 0.0 unwound the stack and a
+            # `new_intent` at 0.0 parked a workflow. `llm.confidence_threshold` is the pack's own
+            # answer to "how sure does a model have to be before the engine acts on it"
+            # (DESIGN.md section 11.3) and there is no reason this decision is exempt: these are
+            # the only two answers here that destroy anything. Below it the engine does not act
+            # and does not pretend it understood - it says so, hints the node, and the node asks
+            # its question again.
+            self._unsure(turn)
+            return
         if decision.kind == "cancel":
             self._cancel(turn)
-            return
-        if decision.kind != "new_intent":
             return
         intent = resolve_intent(intents, decision.graph or decision.label)
         if intent is None or intent.graph == frame.graph_id:
@@ -793,6 +806,12 @@ class Executor:
         }
         if not any(item.get("graph") == intent.graph for item in turn.secondary_intents):
             turn.secondary_intents.append(recorded)
+
+    def _unsure(self, turn: _Turn) -> None:
+        """Resume the suspended node, saying the engine did not follow (review finding P3)."""
+        if turn.pending_event is not None:
+            turn.pending_event = turn.pending_event.model_copy(update={"hint": unsure_hint()})
+        turn.notices.append(unsure_notice())
 
     def _cancel(self, turn: _Turn) -> None:
         """Unwind every frame above the root and acknowledge (step 2's ``cancel``).

@@ -542,6 +542,42 @@ async def test_cancel_unwinds_to_the_root_frame(engine: AsyncEngine) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "decision",
+    [
+        InterruptDecision(kind="cancel", confidence=0.0),
+        InterruptDecision(kind="new_intent", graph="beta", label="beta", confidence=0.2),
+    ],
+    ids=["a near-random cancel", "a near-random new_intent"],
+)
+async def test_a_decision_below_the_packs_confidence_threshold_is_not_acted_on(
+    engine: AsyncEngine, decision: InterruptDecision
+) -> None:
+    """Review finding P3. ``llm.confidence_threshold`` gates this decision too.
+
+    The check's confidence used to be collected, carried to the engine and read by nobody, so a
+    ``cancel`` at confidence 0.0 unwound the whole stack and a ``new_intent`` at 0.0 discarded a
+    workflow. Both are destructive and neither is worth doing on a guess. Below the threshold the
+    engine does not act, says so, and lets the suspended node ask its own question again.
+    """
+    check = Check(decision)
+    executor, conversation_id = await _classified(engine, "alpha", check=check)
+    assert executor.pack.manifest.llm.confidence_threshold > decision.confidence
+    _slots(executor, {"answer": "my answer"})
+
+    await executor.on_inbound(conversation_id, "hmm, maybe, something about beta")
+
+    row = await run_row(engine, conversation_id)
+    steps = await path(engine, row["id"])
+    assert "ask_a" in steps and "tell_a" in steps, "alpha carried on where it was"
+    assert "ask_b" not in steps, "nothing was pushed on a guess"
+    assert row["secondary_intents"] == []
+    said = await outbound_texts(engine, conversation_id)
+    assert any("I was not sure whether you wanted to change" in text for text in said)
+    assert any(text == "Alpha has your answer: my answer." for text in said)
+    assert not any("I have stopped that" in text for text in said), "nothing was unwound"
+
+
 # -- answers the engine will not act on --------------------------------------------------------
 
 

@@ -151,6 +151,39 @@ def abandoned_notice(graph_id: str, intent_label: str | None = None) -> str:
     return f"All right, I have left {_words_for(intent_label or graph_id)} as it was."
 
 
+def unsure_notice() -> str:
+    """Said when the check's answer is below the pack's confidence threshold (finding P3).
+
+    ``llm.confidence_threshold`` gates an ``llm`` node's decision and a ``confirm`` node's yes;
+    it now gates this one too, and for the same reason. The two answers the engine *acts* on -
+    ``cancel``, which unwinds the whole stack, and ``new_intent``, which parks a workflow - are
+    both destructive, and neither is worth doing on a guess: a customer who really did change
+    the subject will say so again, while a workflow discarded on a coin-flip is gone.
+
+    So the engine does not act, and it does not pretend it understood either. It says this, and
+    the suspended node then asks its own question again - which is what "route it to asking the
+    customer" means here: the node that asked is better placed to ask again than core is.
+    """
+    return (
+        "Sorry - I was not sure whether you wanted to change what we are doing, so I have not "
+        "changed it. Tell me plainly if you would like to stop or do something else."
+    )
+
+
+def unsure_hint() -> str:
+    """What the suspended node is told when the check was not confident enough to act.
+
+    The counterpart of :func:`deferral_hint`, and it exists for the same reason: without it, a
+    reply that may have been a topic change is fed to a slot extractor as though it were an
+    answer to the question that was asked.
+    """
+    return (
+        "The customer's reply may not be an answer to the question this step asked: it read as "
+        "a possible change of subject, but not clearly enough to act on. Take from it only what "
+        "plainly answers this step, and ask again if nothing does."
+    )
+
+
 def cancelled_notice() -> str:
     """Said when the check reads ``cancel``. It claims nothing about what was undone."""
     return (
