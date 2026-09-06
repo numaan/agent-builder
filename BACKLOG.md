@@ -17,8 +17,7 @@ Each phase follows the five-step workflow in [PLAN.md](PLAN.md). Design referenc
 | 8 | Evaluation harness | todo | reviews/phase-8.md |
 | 9 | Knowledge graph, customer memory, cost controls, packaging | todo | reviews/phase-9.md |
 | 10 | Evaluate mem0 for customer memory (after 8) | todo | reviews/phase-10.md |
-| 11 | Evaluate DSPy for per-node prompt tuning (after 8) | todo | reviews/phase-11.md |
-| 12 | `support pack new` - pack authoring tool | todo | reviews/phase-12.md |
+| 12 | `support pack` — authoring tool, with DSPy tuning | todo | reviews/phase-12.md |
 | F | Final integration review | todo | reviews/final.md |
 
 ---
@@ -263,36 +262,6 @@ idea of conversation state would reintroduce exactly that class of bug.
 Exit criterion: a written recommendation with the baseline and the measured comparison, and either
 an implementation behind the memory tool or a recorded decision not to adopt, with reasons.
 
-## Phase 11: Evaluate DSPy for per-node prompt tuning
-
-Depends on Phase 8. Added 2026-09-06 at the user's request. It cannot come earlier: optimisation
-needs a scoring function and a training set, and until the golden conversations and node evals of
-section 16 exist there is nothing to optimise against and a tuner would fit to noise.
-
-**Scope is the node's own instruction text and nothing else.** DESIGN.md 11.2 fixes nine prompt
-layers in an order packs cannot change, and layers 1 to 3 - the core system prompt, the persona
-and the policies - are a compliance surface. An optimiser that rewrites a policy line to improve a
-score has broken the thing the design exists to protect.
-
-- [ ] Freeze layers 1 to 3 against any optimiser, structurally, not by convention. The assembly
-      already refuses to let a pack reorder or reach past its own layer; extend that so a tuning
-      run physically cannot alter them, and test it.
-- [ ] Baseline every `llm` node on the phase 8 suite before tuning, per node, not per pack.
-- [ ] Tune `instructions` only, per node, and diff the result a human reviews. A prompt nobody
-      read is a prompt nobody owns.
-- [ ] Re-run the adversarial suite after tuning. A prompt optimised for task accuracy can quietly
-      lose refusal behaviour, and phase 3's review showed injection resistance is not something to
-      take on trust.
-- [ ] Keep the decision constraint out of scope: an undeclared edge is refused by the engine
-      against the graph's own labels (DESIGN.md 3, principle 2), not by prompt wording, and tuning
-      must not become a reason to soften that.
-- [ ] Record tuned prompts as pack data, versioned and reviewable like any other pack change, not
-      as an artefact regenerated at deploy time.
-
-Exit criterion: a measured before-and-after on the phase 8 suite per node, the adversarial suite
-still green, and either tuned instructions committed as reviewed pack data or a recorded decision
-not to adopt.
-
 ## Phase 12: `support pack new` - a tool for building a pack
 
 Added 2026-09-06 at the user's request. Independent of phases 5 to 11; it needs the validator
@@ -323,12 +292,45 @@ than at run time in front of a customer.
       risk tier without stating why, and may not write `policies.md`.
 - [ ] `support pack doctor` - runs the validator plus the phase 8 adversarial suite against a pack
       and reports what a release would fail on.
+
+### Tuning the drafted prompts with DSPy
+
+Folded in from what was phase 11, at the user's request, because it belongs to the same job: the
+tool that drafts a workflow's instructions is the tool that should improve them. Still gated on
+phase 8, which is what produces a score - a tuner with no metric fits noise.
+
+- [ ] `support pack tune <pack> [--node ...]` - optimise the `instructions` of `llm` nodes and
+      nothing else. DSPy signatures map cleanly onto what a node already declares: the output
+      schema is the output fields, and `decision` is a constrained choice over the node's own edge
+      labels, which is the decision constraint restated rather than relaxed.
+- [ ] **Layers 1 to 3 are frozen against the optimiser, structurally.** The core system prompt, the
+      persona and the policies are a compliance surface (DESIGN.md 11.2); an optimiser that
+      rewrites a policy line to win a score has broken the thing the design protects. Enforce it in
+      code, not by convention, and test that a tuning run cannot reach them.
+- [ ] **The training signal must come from outside the generator.** Tuning drafted prompts against
+      evals the same tool drafted is circular and measures nothing. Accept only human-approved
+      golden conversations or real transcripts from the queue the pack is replacing, and refuse to
+      run against a set the tool generated and nobody reviewed.
+- [ ] **Treat compiled few-shot demonstrations as content, not configuration.** DSPy compiles
+      examples into the prompt; a demonstration drawn from a real conversation puts that customer's
+      words into every future prompt. Redact before compiling, review the demonstrations a human
+      would never otherwise read, and pass them through phase 3's delimiting like any other text.
+- [ ] Baseline per node before tuning, and diff what changed for a human to approve. A prompt
+      nobody read is a prompt nobody owns.
+- [ ] Re-run the adversarial suite after tuning. A prompt optimised for task accuracy can quietly
+      lose its refusal behaviour, and phase 3's review showed injection resistance is not something
+      to take on trust.
+- [ ] Commit tuned instructions as ordinary pack data, versioned and reviewable like any other pack
+      change, never regenerated at deploy time. A pack must be the same thing on every machine.
+- [ ] DSPy is an optional dependency of the tool, not of `support-core`. A deployment that serves
+      packs must not have to install an optimiser.
 - [ ] Tests: a generated pack validates; its generated workflow passes the adversarial approval
       suite; a guided draft that violates a rule is rejected rather than written out.
 
 Exit criterion: `support pack new acme_airline` followed by `support pack add-workflow
 cancel_booking` produces a pack that validates clean and runs an end-to-end conversation against
-the recorded provider.
+the recorded provider; and `support pack tune` measurably improves a node against a human-approved
+set without touching the persona or policy layers and without losing an adversarial test.
 
 ## Phase F: Final integration review
 
@@ -368,6 +370,16 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
 ---
 
 ## Decisions log
+
+- 2026-09-06: DSPy folded into phase 12's pack tool rather than kept as its own phase, at the
+  user's suggestion. It is the same job: the tool that drafts a workflow's instructions is the one
+  that should improve them, and both are authoring-time concerns that a serving deployment never
+  runs. The constraints carry over unchanged - only node instructions are tunable, layers 1 to 3
+  are frozen in code, and the adversarial suite must still pass afterwards. Two constraints were
+  added on folding: the training set may not be one the tool itself generated, because tuning a
+  draft against its own draft measures nothing; and compiled few-shot demonstrations are content
+  rather than configuration, so a demonstration drawn from a real conversation is a customer's
+  words in every future prompt unless it is redacted and reviewed.
 
 - 2026-09-06: ColBERT folded into phase 5 as a second retriever rather than added as a later phase,
   because it changes that phase's design rather than following it. It runs locally, which removes
