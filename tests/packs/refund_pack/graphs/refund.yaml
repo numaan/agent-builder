@@ -87,6 +87,7 @@ nodes:
     type: llm
     instructions: Confirm the refund and state the expected timing from knowledge.
     knowledge: { query: "refund processing time", k: 3 }
+    output_schema: {}
     edges:
       done: done
 
@@ -96,6 +97,7 @@ nodes:
       Explain the denial using state.denial_reason and cite the policy.
       Offer escalation if the customer disagrees.
     knowledge: { query: "refund policy {{ state.denial_reason }}", k: 3 }
+    output_schema: {}
     edges:
       accepted: done_denied
       disputes: handoff_dispute

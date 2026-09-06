@@ -83,6 +83,10 @@ def build_node_output_model(
     inventing a transition: an undeclared label is a validation failure with a message naming
     what was allowed, and the engine treats that as malformed output (DESIGN.md section 11.3),
     never as a decision.
+
+    ``state_updates`` becomes the node's ``output_schema`` as a closed model - and an *empty*
+    closed model when the node declares none, so absence of a schema means the model may write
+    nothing rather than anything.
     """
     fields: dict[str, Any] = {}
     if edges:
@@ -91,17 +95,27 @@ def build_node_output_model(
             Literal[labels],
             Field(description=f"Exactly one of: {', '.join(labels)}."),
         )
-    if output_schema:
-        built = build_model(
-            f"{_camel(node_id)}StateUpdates", dict(output_schema), all_optional=True
-        )
-        fields["state_updates"] = (
-            built.model,
-            Field(
-                default_factory=built.model,
-                description="Values to write into the workflow state.",
+    # Always a *typed* ``state_updates``, even when the node declares no ``output_schema``
+    # (review finding V2). ``build_model`` closes the model with ``extra="forbid"``, so an
+    # undeclared schema builds a model with no fields at all: the model may then write nothing,
+    # and a payload that writes something fails validation here rather than being taken on trust
+    # by ``frame.state.update``. The old code left ``state_updates`` as ``dict[str, Any]``
+    # whenever the schema was absent, which is how a `chat` node's answer could set the graph's
+    # own `outcome` field to an arbitrary string.
+    built = build_model(
+        f"{_camel(node_id)}StateUpdates", dict(output_schema or {}), all_optional=True
+    )
+    fields["state_updates"] = (
+        built.model,
+        Field(
+            default_factory=built.model,
+            description=(
+                "Values to write into the workflow state."
+                if output_schema
+                else "This step declares no output schema and may write no state; leave it empty."
             ),
-        )
+        ),
+    )
     model = create_model(
         f"{_camel(node_id)}Output",
         __base__=LlmNodeOutput,

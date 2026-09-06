@@ -361,6 +361,22 @@ nodes:
         },
     ),
     (
+        "graph.llm_output_schema_absent",
+        {
+            "main": """
+id: main
+state: { charge_id: str | None }
+start: think
+nodes:
+  think:
+    type: llm
+    instructions: think
+    edges: { done: finish }
+  finish: { type: end }
+"""
+        },
+    ),
+    (
         "graph.llm_output_schema_invalid",
         {
             "main": """
@@ -649,6 +665,27 @@ def test_manifest_interrupt_graph_unknown(pack_dir: Path) -> None:
     parsed, _ = read_graphs(pack_dir, ["graphs/main.yaml"])
     found = validate_graph_set(parsed, load_tool_manifest(pack_dir), manifest)
     assert "manifest.interrupt_graph_unknown" in {f.rule for f in found}
+
+
+def test_a_prompt_budget_below_the_core_prompt_is_refused(pack_dir: Path) -> None:
+    """Review finding V11: a pack can deny itself service through ``llm.prompt_budget``.
+
+    ``core_system: 1`` makes every turn raise ``PromptTooLargeError`` and hand off, which is
+    self-inflicted but silent until a customer arrives. It is a static property of the manifest.
+    """
+    manifest = MANIFEST.model_copy(
+        update={"llm": MANIFEST.llm.model_copy(update={"prompt_budget": {"core_system": 1}})}
+    )
+    (pack_dir / "graphs" / "main.yaml").write_text(MAIN, encoding="utf-8")
+    parsed, _ = read_graphs(pack_dir, ["graphs/main.yaml"])
+    found = validate_graph_set(parsed, load_tool_manifest(pack_dir), manifest)
+    assert "manifest.prompt_budget_too_small" in {f.rule for f in found}
+
+    generous = MANIFEST.model_copy(
+        update={"llm": MANIFEST.llm.model_copy(update={"prompt_budget": {"core_system": 1200}})}
+    )
+    ok = validate_graph_set(parsed, load_tool_manifest(pack_dir), generous)
+    assert "manifest.prompt_budget_too_small" not in {f.rule for f in ok}
 
 
 def test_invalid_tool_manifest_is_reported(tmp_path: Path) -> None:

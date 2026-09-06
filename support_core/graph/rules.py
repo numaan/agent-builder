@@ -144,6 +144,7 @@ class _Rules:
         self.call_cycles()
         self.confirm_coverage()
         self.manifest_graph_references()
+        self.prompt_budget_sanity()
         self.not_executable_notice()
         self.exemptions_notice()
         return self.findings
@@ -396,7 +397,22 @@ class _Rules:
                 )
         if node.knowledge is not None:
             self.template(graph, node_id, node.knowledge.query, field="knowledge.query")
-        built = build_model(f"{node_id.title()}Output", node.output_schema)
+        if node.output_schema is None:
+            # Review finding V2's load-time half. At run time an absent schema now means the
+            # model may write no state at all, where it used to mean it could write any field of
+            # the frame state at any type. A pack that meant the second reading gets a handoff on
+            # every turn instead of a silent write, which is safe but is a bad way to find out;
+            # a pack that meant "this node writes nothing" says so in one line. Intent is not
+            # recoverable from the node's prose, so the rule asks for it rather than guessing.
+            self.error(
+                "graph.llm_output_schema_absent",
+                "llm node declares no output_schema, so its answer may write no state at all; "
+                "declare 'output_schema: {}' if that is intended, or list the state fields this "
+                "node may write and their types",
+                graph=graph,
+                node=node_id,
+            )
+        built = build_model(f"{node_id.title()}Output", node.output_schema or {})
         for issue in built.issues:
             if issue.code == "unresolved_type":
                 continue  # pack tool models are stubs until phase 4; already warned on state
@@ -407,7 +423,7 @@ class _Rules:
                 node=node_id,
             )
         fields = graph.state.model.model_fields
-        for slot in node.output_schema:
+        for slot in node.output_schema or {}:
             if slot not in fields:
                 self.warn(
                     "graph.llm_output_not_in_state",
@@ -1103,6 +1119,29 @@ class _Rules:
                 f"tool {spec.name!r} is {spec.risk.value} risk and marked confirm_exempt, so no "
                 "confirm node is required before it; review this deliberately",
                 location="tools/tools.yaml",
+            )
+
+    def prompt_budget_sanity(self) -> None:
+        """A budget the core prompt itself cannot fit in is always wrong.
+
+        Phase 3's self-critique found it and review finding V11 asked for the check: a pack that
+        sets ``llm.prompt_budget.core_system`` below the size of core's own layer 1 makes every
+        single turn raise ``PromptTooLargeError`` and hand off. Loud and self-inflicted, but it
+        is a static property of the manifest, so it belongs at load time rather than in the
+        first customer's turn.
+        """
+        if self.manifest is None:
+            return
+        from support_core.llm.prompt import CORE_SYSTEM_PROMPT, estimate_tokens
+
+        declared = self.manifest.llm.prompt_budget.get("core_system")
+        needed = estimate_tokens(CORE_SYSTEM_PROMPT)
+        if declared is not None and declared < needed:
+            self.error(
+                "manifest.prompt_budget_too_small",
+                f"llm.prompt_budget.core_system is {declared} tokens and core's own layer 1 "
+                f"needs about {needed}; every turn would fail prompt assembly and hand off",
+                location="pack.yaml",
             )
 
     def manifest_graph_references(self) -> None:

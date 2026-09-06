@@ -42,6 +42,7 @@ nodes:
       Reply to the customer's small talk in one or two short sentences, in the persona's voice.
       Do not discuss charges, refunds, balances or account details here, and do not promise
       that anything will be done: this step has no access to the account and takes no action.
+    output_schema: {}      # this step writes no state; declared, not merely absent (V2)
     edges:
       done: anything_else
 

@@ -107,7 +107,14 @@ class LlmNode(NodeBase):
     tools: list[str] = Field(default_factory=list)
     """READ-tier tools the model may call in this node's bounded loop (DESIGN.md section 8.4)."""
 
-    output_schema: dict[str, str] = Field(default_factory=dict)
+    output_schema: dict[str, str] | None = None
+    """The state fields this node's answer may write, and their types (DESIGN.md section 11.3).
+
+    ``None`` means *undeclared*, which is not the same as ``{}``. Undeclared is a validation
+    error (``graph.llm_output_schema_absent``), because it used to mean "anything, of any type"
+    at run time and now means "nothing", and a pack author who has not said which they meant
+    should find out at load rather than on a customer's turn (review finding V2). ``{}`` is the
+    explicit way to say a node writes no state."""
     knowledge: KnowledgeQuery | None = None
     edges: dict[str, str] = Field(min_length=1)
     model: str | None = None
