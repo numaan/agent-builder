@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from support_core import load_pack
 from support_core.engine import Executor
+from support_core.engine.runners import DEFAULT_HANDOFF_MESSAGE
 from support_core.graph.pack import Pack
 from support_core.llm.fake import Rule, ScriptedProvider
 from support_core.llm.tool_loop import ModelToolSpec, ToolOutcome
@@ -188,7 +189,14 @@ async def test_an_undeclared_edge_is_retried_once_and_then_handed_off(
     from support_core.llm.fake import render_request
 
     assert "Your previous answer was rejected" in render_request(provider.calls[1])
-    assert await outbound_texts(engine, conversation_id) == []
+    # The failing turn tells the customer something (review finding W6). It used to say nothing
+    # at all: the run went to waiting_human with zero outbound messages, so a web chat client had
+    # only a status pill to render and an email customer got silence after asking a question.
+    # What it may not do is leak the failure - the model's rejected answer, the reason, the node.
+    said = await outbound_texts(engine, conversation_id)
+    assert said == [DEFAULT_HANDOFF_MESSAGE]
+    assert "small_talk" not in said[0]
+    assert "llm_invalid_output" not in said[0]
 
 
 async def test_a_correct_answer_on_the_retry_is_accepted(pack: Pack, engine: AsyncEngine) -> None:
@@ -271,7 +279,13 @@ async def test_low_confidence_with_no_unclear_edge_hands_off(
     outcome = await executor.on_inbound(conversation_id, "hello")
     assert outcome.status == "waiting_human"
     assert [request.reason for request in recorder.handoffs] == ["low_confidence"]
-    assert await outbound_texts(engine, conversation_id) == []
+    # The failing turn tells the customer something (review finding W6). It used to say nothing
+    # at all: the run went to waiting_human with zero outbound messages, so a web chat client had
+    # only a status pill to render and an email customer got silence after asking a question.
+    # What it may not do is leak the failure - the model's rejected answer, the reason, the node.
+    said = await outbound_texts(engine, conversation_id)
+    assert said == [DEFAULT_HANDOFF_MESSAGE]
+    assert "confidence" not in said[0]
 
 
 async def test_the_model_may_ask_for_a_human_and_the_engine_decides(

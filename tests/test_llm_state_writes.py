@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from support_core import load_pack
 from support_core.engine import Executor
+from support_core.engine.runners import DEFAULT_HANDOFF_MESSAGE
 from support_core.graph.pack import Pack
 from support_core.llm.fake import Rule, ScriptedProvider
 from support_core.llm.schemas import build_node_output_model
@@ -88,7 +89,11 @@ async def test_a_node_with_no_output_schema_cannot_write_the_graphs_own_outcome(
     row = await run_row(engine, conversation_id)
     patches = [step["state_patch"] for step in await trace_rows(engine, row["id"])]
     assert all("outcome" not in (patch or {}) for patch in patches), patches
-    assert await outbound_texts(engine, conversation_id) == []
+    # The failing turn tells the customer something (review finding W6). It used to say nothing
+    # at all: the run went to waiting_human with zero outbound messages, so a web chat client had
+    # only a status pill to render and an email customer got silence after asking a question.
+    # What it may not do is leak the failure - the model's rejected answer, the reason, the node.
+    assert await outbound_texts(engine, conversation_id) == [DEFAULT_HANDOFF_MESSAGE]
 
 
 async def test_a_node_with_no_output_schema_cannot_write_an_ill_typed_field(

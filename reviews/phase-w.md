@@ -388,7 +388,12 @@ run, after writing the plan, the implementation and the self-critique. The orche
 verification and committed the phase. No source was changed at this step; only this section and
 the BACKLOG status cell were added.
 
-Commands run from the repository root with `.venv/Scripts/python.exe`, on 2026-09-06:
+Commands run from the repository root with `.venv/Scripts/python.exe`, on 2026-09-06, against
+the tree as phase W was committed. **These numbers are of that date and no other**: phase 6
+landed on top of phase W, so a reader checking them against a later tree finds 1361 tests rather
+than 1259, 18 pack warnings rather than 9, and migration head 0008 rather than 0007. None of the
+three is a regression; all three are phase 6 (review finding W13). The resolution section at the
+end of this file carries the numbers for the tree as it stands.
 
 | Command | Result |
 |---|---|
@@ -406,8 +411,14 @@ Commands run from the repository root with `.venv/Scripts/python.exe`, on 2026-0
 Started with `SUPPORT_APP_CONFIG=demo/acme_web_chat.json python -m uvicorn app:app --port 8000`.
 `GET /` served the client page (200). `GET /healthz` returned 200 with
 `provider: "replay"`, `channels: ["web_chat"]`, `database: "ok"` and the pack fingerprint.
-Note the README's own instructions say `/health`; the endpoint is `/healthz` (recorded as a
-finding for the review).
+
+> **Corrected at resolution (review finding W12).** This paragraph used to end: "Note the
+> README's own instructions say `/health`; the endpoint is `/healthz` (recorded as a finding for
+> the review)." That was not true and is struck rather than left standing. The README said
+> `/healthz` when phase W was committed (`git show 032fb6a:README.md`) and says it now; there was
+> no defect, and nothing was fixed for one. The reviewer checked and could not reproduce it,
+> which is the only reason it is not still in the record as a defect this project believed it
+> had.
 
 A script then drove the four recorded messages over a real websocket to
 `/channels/web_chat/ws`, in one connection, against the running server:

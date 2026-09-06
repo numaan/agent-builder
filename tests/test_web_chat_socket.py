@@ -21,6 +21,7 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from support_core.api import AppConfig
+from support_core.engine.runners import DEFAULT_HANDOFF_MESSAGE
 from support_core.storage import repositories as repo
 from tests.app_support import (
     ACME,
@@ -147,6 +148,36 @@ async def test_a_binary_frame_is_refused_rather_than_crashing_the_handler(
     assert "binary" in refusal["detail"]
     assert closed.value.rcvd is not None
     assert closed.value.rcvd.code == 1003, closed.value.rcvd
+
+
+async def test_a_turn_that_fails_still_says_something_to_the_customer(
+    engine: AsyncEngine,
+) -> None:
+    """Phase W review finding W6, from the reviewer's attempt A8.
+
+    Sending an unrecorded message to the sample pack is a cassette miss, which is a node error,
+    which DESIGN.md section 7.3 routes to a handoff. The reviewer did that and got a status
+    change on the socket and **no message at all**: the run was parked for a human and the
+    customer had been told nothing. The next message was answered ("it is with one of our
+    people", phase 6's finding P6), which made the silence look like a decision. It was not.
+
+    The turn that raises the handoff now says the same sentence a ``handoff`` node says. What it
+    must not say is what went wrong - the failure detail belongs in the packet a person reads,
+    not in the customer's transcript.
+    """
+    reset_acme_backend()
+    app = build_app(ACME, engine, config=acme_config())
+    async with serving(app) as host, chatting(host, "failing-turn-01") as chat:
+        await chat.ready()
+        turn = await chat.say("please recite the fourteenth verse of the shipping policy")
+
+    assert turn["status"] == "waiting_human"
+    assert chat.messages, "the failing turn said nothing at all"
+    assert chat.messages[-1] == DEFAULT_HANDOFF_MESSAGE
+    said = " ".join(chat.messages)
+    assert "llm_unavailable" not in said
+    assert "cassette" not in said.lower()
+    assert "Traceback" not in said
 
 
 async def test_a_socket_speaks_only_for_its_own_conversation(engine: AsyncEngine) -> None:
