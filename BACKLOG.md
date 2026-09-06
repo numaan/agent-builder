@@ -12,7 +12,7 @@ Each phase follows the five-step workflow in [PLAN.md](PLAN.md). Design referenc
 | 4 | Tool runtime and safety nodes | done | reviews/phase-4.md |
 | W | Web chat slice (pulled forward from 7) | in-review | reviews/phase-w.md |
 | 5 | Knowledge layer and citations | todo | reviews/phase-5.md |
-| 6 | Interrupts, root graph, handoff | self-critique | reviews/phase-6.md |
+| 6 | Interrupts, root graph, handoff | in-review | reviews/phase-6.md |
 | 7 | Channels, observability, replay | todo | reviews/phase-7.md |
 | 8 | Evaluation harness | todo | reviews/phase-8.md |
 | 9 | Knowledge graph, customer memory, cost controls, packaging | todo | reviews/phase-9.md |
