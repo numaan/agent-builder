@@ -259,7 +259,7 @@ class ToolRuntime:
         async with self.sessions() as session, session.begin():
             existing = await repo.get_tool_call(session, key)
             if existing is not None:
-                return await self._reenter(session, tool, existing, now)
+                return await self._reenter(session, tool, existing, canonical, now)
 
             call = await repo.start_tool_call(
                 session,
@@ -367,8 +367,31 @@ class ToolRuntime:
             frame_seq=approval.frame_seq,
         )
 
-    async def _reenter(self, session: Session, tool: Tool, existing: Any, now: datetime) -> _Claim:
-        """Another pass over a key that already exists (DESIGN.md sections 7.3, 8.1)."""
+    async def _reenter(
+        self,
+        session: Session,
+        tool: Tool,
+        existing: Any,
+        canonical: dict[str, Any],
+        now: datetime,
+    ) -> _Claim:
+        """Another pass over a key that already exists (DESIGN.md sections 7.3, 8.1).
+
+        The arguments are compared first. A step re-executed after a crash should compute the
+        same ones - the frame state comes from the same checkpoint - but "should" is doing work
+        there, and the consequence of being wrong is either executing *new* arguments under the
+        approval that authorised the old ones, or replaying an old result as the answer to a new
+        question. Neither is a state to reach by inference, so the key belongs to the call it was
+        claimed for and a call with different arguments is refused.
+        """
+        if dict(existing.args or {}) != canonical:
+            await repo.reenter_tool_call(session, existing.id, status=existing.status, when=now)
+            msg = (
+                f"{tool.name!r} was already claimed under this step ({existing.idempotency_key}) "
+                f"with different arguments; the idempotency key belongs to that call, and this "
+                f"one is not it"
+            )
+            return _Claim(refusal=ToolRefused(msg))
         status = existing.status
         if status == "succeeded":
             await repo.reenter_tool_call(session, existing.id, status=status, when=now)

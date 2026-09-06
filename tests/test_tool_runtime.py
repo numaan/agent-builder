@@ -438,6 +438,26 @@ async def test_an_idempotent_call_whose_outcome_is_unknown_is_repeated(
     assert LEDGER.executed == [("charge", 29.0)]
 
 
+async def test_a_second_call_under_one_key_with_different_arguments_is_refused(
+    engine: AsyncEngine,
+) -> None:
+    """The idempotency key belongs to the call it was claimed for.
+
+    A step re-executed after a crash computes the same arguments, because the frame state comes
+    from the same checkpoint. If it ever did not - a pack changed under a suspended run, a bug -
+    the alternatives are executing new arguments under the approval that authorised the old ones,
+    or handing back the old result as the answer to a new question. Both are worse than a
+    refusal that a human reads.
+    """
+    conversation_id, run_id = await conversation_and_run(engine)
+    where = site(conversation_id, run_id)
+    tools = runtime(engine)
+    await tools.invoke(tool_name="peek", args={"amount": 1.0}, site=where, caller="tool_node")
+    with pytest.raises(ToolRefused, match="with different arguments"):
+        await tools.invoke(tool_name="peek", args={"amount": 2.0}, site=where, caller="tool_node")
+    assert LEDGER.executed == [("peek", 1.0)]
+
+
 async def test_a_recorded_failure_is_replayed_rather_than_retried(engine: AsyncEngine) -> None:
     conversation_id, run_id = await conversation_and_run(engine)
     where = site(conversation_id, run_id)
