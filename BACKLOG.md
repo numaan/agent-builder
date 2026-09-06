@@ -147,7 +147,11 @@ Design: sections 9.1 to 9.3, 14 (citation guardrail).
 - [ ] `Passage`, `Retriever` protocol, `CompositeRetriever`.
 - [ ] `DocumentRetriever`: chunking by headings, embeddings via provider abstraction (fake embedder in tests), pgvector plus tsvector hybrid search, optional model reranking.
 - [ ] **`ColbertRetriever` as a second `Retriever` implementation** (added 2026-09-06 at the user's request). Late interaction: one vector per token, scored by MaxSim, rather than one vector per chunk. Two reasons it belongs here rather than later. It runs locally, so it removes this phase's worst limitation - there is no embedding API in this deployment (no Anthropic key; the GLM endpoint is Anthropic-compatible and serves no embeddings), so without it the dense path ships with its retrieval quality unmeasured against a stand-in embedder. And late interaction is strongest on exactly this corpus shape: short policy passages where the answer turns on a phrase.
-  - [ ] Decide the index home first, because it is the one architectural cost. A ColBERT index is its own structure (PLAID/FAISS), not a pgvector column, so adopting it breaks DESIGN.md section 4.1's "Postgres is the single stateful dependency". Either accept a second artefact - an index built at sync time, shipped with the deployment or rebuilt on boot - or store token vectors in pgvector and do MaxSim in SQL, which is honest but slow. Write down which and why.
+  - [ ] **Host it in Qdrant** (decided 2026-09-06 after the user raised it). Qdrant stores multivectors and scores MaxSim natively, so late interaction becomes an ordinary query against an ordinary service instead of a PLAID/FAISS index directory the deployment has to build, ship, version and back up by itself. The two alternatives were considered and rejected: ColBERT's own index makes the corpus a second artefact with none of a database's operational affordances, and MaxSim in SQL over pgvector is honest but too slow for a 4-second p95 turn.
+  - [ ] Note what this does *not* break. DESIGN.md 7.1's rule is that the frame stack and the trace step are written in one transaction and resume derives from durable state; retrieval is a read outside that transaction, so a second store here cannot cost a checkpoint or a resume. That is the distinction from phase 10's mem0 question, where per-customer notes would sit in the write path.
+  - [ ] Split the two halves deliberately: Qdrant owns the vector side (dense and ColBERT multivector), Postgres full-text owns the lexical side. `CompositeRetriever` merges them. This buys graceful degradation - with Qdrant unavailable the lexical half still answers, and a total retrieval failure already routes to handoff through the citation guardrail rather than to a guess.
+  - [ ] Version by collection, not in place: a sync builds `<source>_v<n>` and flips an alias. Old and new genuinely coexist, which is what makes the exit criterion's "an old trace still names the old version" true rather than approximately true.
+  - [ ] Add Qdrant to `docker-compose.yml` beside Postgres, and to CI. Accept the operational cost explicitly: one deployment per domain (Q12) means one Qdrant per domain, so this is a container, a backup and an upgrade path multiplied by the number of domains served.
   - [ ] `source_version` must survive it. The exit criterion is that a wrong answer names the revision that caused it, so the index is versioned with the corpus and a re-sync builds a new one rather than mutating in place.
   - [ ] Keep it behind the same `Retriever` protocol and the same `CompositeRetriever`, so a pack picks its backend in `sources.yaml` and neither the engine nor a graph knows which is in use.
   - [ ] Measure it against the pgvector path on the same corpus before making it the default. Two retrievers with no comparison between them is worse than one.
@@ -368,9 +372,16 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
 - 2026-09-06: ColBERT folded into phase 5 as a second retriever rather than added as a later phase,
   because it changes that phase's design rather than following it. It runs locally, which removes
   phase 5's worst limitation: no embedding API is available in this deployment, so the dense path
-  alone would ship with its retrieval quality unmeasured. The cost is explicit and must be settled
-  before building - a ColBERT index is not a pgvector column, so adopting it either adds a second
-  stateful artefact or accepts MaxSim in SQL. Neither is free and the phase must say which it took.
+  alone would ship with its retrieval quality unmeasured.
+- 2026-09-06: Qdrant chosen as ColBERT's home, replacing the earlier open question about where a
+  late-interaction index should live. It stores multivectors and scores MaxSim natively, so the
+  corpus stays a service rather than becoming an index directory the deployment must build and
+  version by hand, and collection aliases make "a re-sync produces a new version, old traces keep
+  the old one" exact instead of approximate. This does relax DESIGN.md 4.1's "Postgres is the
+  single stateful dependency", and the relaxation is accepted knowingly: retrieval is a read
+  outside the checkpoint transaction, so it cannot cost a checkpoint or a resume, which is the
+  property 4.1 existed to protect. Postgres keeps the lexical half, so retrieval degrades rather
+  than fails when Qdrant is down. The real price is operational - one Qdrant per domain.
 - 2026-09-06: A pack authoring tool added as phase 12. Its principle is that the validator is the
   teacher: generated packs validate from the first minute, and guided generation iterates against
   the rules rather than against a reviewer. Tool bodies are never generated, only stubs, and a
