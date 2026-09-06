@@ -100,6 +100,10 @@ class ApproveBody(BaseModel):
     human_id: str | None = None
 
 
+def _at(when: Any) -> str | None:
+    return str(when.isoformat()) if when else None
+
+
 def _summary(row: Handoff) -> dict[str, Any]:
     """One queue row, without its packet: what a desk's list view shows."""
     return {
@@ -152,11 +156,21 @@ def desk_router(runtime: AppRuntime) -> APIRouter:
 
     @router.get("/handoffs/{handoff_id}")
     async def read_handoff(handoff_id: uuid.UUID) -> JSONResponse:
-        """One handoff, with the whole packet (DESIGN.md section 13)."""
+        """One handoff, with the whole packet (DESIGN.md section 13).
+
+        Plus anything the customer has said *since* it was raised. A run parked
+        ``waiting_human`` queues customer messages rather than running them - resuming early
+        would drop the wait the pack asked for - so those messages were durable and invisible,
+        and a customer answering "a specialist will pick this up" was talking into a void
+        (review finding P6). They are part of what the person picking this up needs to read.
+        """
         row = await _load(handoff_id)
         if row is None:
             return JSONResponse({"error": "no such handoff"}, status_code=404)
-        return JSONResponse({**_summary(row), "packet": row.packet})
+        async with runtime.executor.sessions() as session, session.begin():
+            waiting = await repo.pending_inbound(session, row.conversation_id)
+            queued = [{"text": message.text, "at": _at(message.created_at)} for message in waiting]
+        return JSONResponse({**_summary(row), "packet": row.packet, "waiting_messages": queued})
 
     @router.post("/handoffs/{handoff_id}/reply")
     async def reply(handoff_id: uuid.UUID, request: Request) -> JSONResponse:
@@ -237,9 +251,20 @@ def desk_router(runtime: AppRuntime) -> APIRouter:
         node, and ``approved_by = 'human'``. There is no way to name a different action, because
         the desk supplies no arguments - which is the whole point of a second signature.
 
+        It also approves *the action this handoff showed*, which is a different property and was
+        the weaker half (review finding P4). The endpoint used to take the newest live approval
+        in the whole **conversation**, whatever the handoff said, whatever run it belonged to,
+        and whether or not the handoff was still open - so a human reading a packet that said
+        "issue_refund - indeterminate" could sign a different, newer action with one click, and a
+        resolved handoff still signed. Now the approval is resolved *from the packet*: the run,
+        the confirm node, the tool and the arguments the human was looking at, all four, and a
+        handoff that is no longer open signs nothing.
+
         Idempotent in the way that matters: a second call writes a second human row, and the
         runtime consumes exactly one per call, so a double click does not authorise a second
-        refund. The customer's approval is still single-use underneath it.
+        refund. (Since the supersede of review finding P5, the second human row also cancels the
+        first, so a double click leaves exactly one.) The customer's approval is still single-use
+        underneath it.
         """
         body = await _body(request, ApproveBody)
         if isinstance(body, JSONResponse):
@@ -247,23 +272,54 @@ def desk_router(runtime: AppRuntime) -> APIRouter:
         row = await _load(handoff_id)
         if row is None:
             return JSONResponse({"error": "no such handoff"}, status_code=404)
+        if row.status != "open":
+            return JSONResponse(
+                {"error": f"this handoff is {row.status}, so there is nothing left to sign"},
+                status_code=409,
+            )
+        shown = (row.packet or {}).get("pending_action")
+        if not isinstance(shown, dict) or shown.get("status") != "proposed":
+            return JSONResponse(
+                {
+                    "error": (
+                        "this handoff does not show an action awaiting a signature, so there is "
+                        "nothing here for a human to sign. Re-read the handoff: an action "
+                        "proposed since it was raised is not the one you were shown"
+                    )
+                },
+                status_code=409,
+            )
         async with runtime.executor.sessions() as session, session.begin():
             live = await repo.live_approvals(session, row.conversation_id)
-            pending = [a for a in live if a.approved_by == "customer"]
-            if not pending:
+            candidates = [
+                approval
+                for approval in live
+                if approval.approved_by == "customer"
+                and approval.run_id == row.run_id
+                and approval.node_id == shown.get("node_id")
+                and approval.tool == shown.get("tool")
+                and dict(approval.args or {}) == dict(shown.get("args") or {})
+            ]
+            if not candidates:
                 return JSONResponse(
                     {
                         "error": (
-                            "this conversation has no action the customer has approved and the "
-                            "system has not yet run, so there is nothing for a human to sign"
+                            f"the action this handoff showed - {shown.get('tool')} - is no "
+                            f"longer awaiting a signature on this run; it has run, been "
+                            f"superseded, or been withdrawn"
                         )
                     },
                     status_code=409,
                 )
-            template = pending[-1]
-            approval_id = await repo.record_human_approval(
-                session, template=template, now=runtime.executor.hooks.clock()
-            )
+            template = candidates[-1]
+            try:
+                approval_id = await repo.record_human_approval(
+                    session, template=template, now=runtime.executor.hooks.clock()
+                )
+            except ValueError as exc:
+                # An approval bound to no run, frame and confirm node could never be consumed
+                # (review finding P9). A legitimate 4xx, not a traceback.
+                return JSONResponse({"error": str(exc)}, status_code=409)
             return JSONResponse(
                 {
                     "ok": True,

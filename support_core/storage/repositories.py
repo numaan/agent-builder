@@ -260,6 +260,31 @@ async def peek_next_pending(session: AsyncSession, conversation_id: uuid.UUID) -
     return result.scalar_one_or_none()
 
 
+async def pending_inbound(
+    session: AsyncSession, conversation_id: uuid.UUID, limit: int = 50
+) -> list[Message]:
+    """Every inbound message still waiting for a turn, oldest first (review finding P6).
+
+    :func:`peek_next_pending` answers "what does the engine run next"; this answers "what has the
+    customer said that nobody has looked at", which is a different question with one caller: the
+    desk. A run parked ``waiting_human`` queues customer messages by design - resuming it early
+    would drop the wait on the floor - and until this they were durable and invisible, which on
+    email, where a customer *will* reply to "a specialist will pick this up", is a swallowed
+    reply.
+    """
+    result = await session.execute(
+        select(Message)
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.direction == "inbound",
+            Message.status == "pending",
+        )
+        .order_by(Message.created_at, Message.id)
+        .limit(limit)
+    )
+    return list(result.scalars())
+
+
 async def claim_and_begin_turn(
     session: AsyncSession,
     *,

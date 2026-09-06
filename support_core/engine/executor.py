@@ -145,6 +145,23 @@ RESUMABLE_BY_CUSTOMER = frozenset(["idle", "done", "waiting_customer"])
 a tool or a timer keeps its queue: the message is stored and stays ``pending`` until the thing
 it is waiting for arrives, because resuming it early would drop that wait on the floor."""
 
+WAIT_ACKNOWLEDGED = "wait_acknowledged"
+"""Key on ``run.awaiting`` recording that the queued-message notice has been said once.
+
+On ``awaiting`` rather than a column because it is a fact about *this* suspension: the next
+handoff parks the run afresh and the customer is entitled to the sentence again."""
+
+WAITING_ON_A_HUMAN_MESSAGE = (
+    "Thank you - I have added that to the conversation, and it is with one of our people. "
+    "I am not able to carry on myself until they have looked at it."
+)
+"""What a customer is told when their message is queued behind a human (review finding P6).
+
+Said once per parking, and true of each clause: the message is a durable row, it is on the
+handoff the desk reads, and the engine really will not act on it until somebody resumes. It
+promises nothing about when, for the same reason
+:data:`~support_core.engine.runners.DEFAULT_HANDOFF_MESSAGE` does not."""
+
 DESK_PATCH_FORBIDDEN = frozenset(["identity_verified"])
 """State field names a desk ``resume`` patch may never write, whatever a graph declares.
 
@@ -598,10 +615,42 @@ class Executor:
                 break
             outcome.messages_processed += 1
             run = await self._turn(conversation, turn)
+        await self._acknowledge_the_wait(run)
         await self._flush_outbound(conversation_id)
         await self._maybe_summarize(conversation_id)
         outcome.status = run.status  # type: ignore[assignment]
         return outcome
+
+    async def _acknowledge_the_wait(self, run: _RunRow) -> None:
+        """Say something, once, to a customer whose message is queued behind a person (P6).
+
+        A run parked ``waiting_human`` is not resumed by a customer message: the message stays
+        ``pending`` and waits for the desk, which is the right refusal - a topic change must not
+        smuggle a workflow past the person it was escalated to. What was wrong was the ending.
+        The customer had just been told a person would pick this up, they answered, and nothing
+        happened at all: on web chat a message into a void, and on email, which phase 7 adds, a
+        silently swallowed reply.
+
+        So core says one sentence - not a turn, no lock beyond the one already held, no
+        checkpoint, because nothing executed - and says it once per parking, recorded on
+        ``run.awaiting`` in the same shape everything else about a suspension is recorded. The
+        desk sees the message itself on the handoff view; this is the customer's half.
+        """
+        if run.status != "waiting_human":
+            return
+        awaiting = dict(run.awaiting or {})
+        if awaiting.get(WAIT_ACKNOWLEDGED):
+            return
+        async with self.sessions() as session, session.begin():
+            if not await repo.pending_inbound(session, run.conversation_id, limit=1):
+                return
+            await repo.add_outbound(
+                session, conversation_id=run.conversation_id, text_=WAITING_ON_A_HUMAN_MESSAGE
+            )
+            awaiting[WAIT_ACKNOWLEDGED] = True
+            await repo.set_run_fields(
+                session, run.id, awaiting=awaiting, updated_at=self.hooks.clock()
+            )
 
     async def _claim_turn(
         self, conversation: Conversation, run: _RunRow, outcome: TurnOutcome
@@ -772,6 +821,11 @@ class Executor:
             )
             for intent in turn.secondary_intents
         )
+
+    def _label_for(self, graph_id: str) -> str | None:
+        """The root graph's edge label for a workflow, where it declares one (finding P8)."""
+        intent = resolve_intent(self._intents(), graph_id)
+        return intent.label if intent is not None else None
 
     def _intents(self) -> tuple[WorkflowIntent, ...]:
         if self._workflow_intents is None:
@@ -1403,7 +1457,12 @@ class Executor:
             and event.target_frame_seq == frame.frame_seq
             and event.target_node_id == node_id
         )
-        offer = return_offer(frame.graph_id)
+        # The pack's own word for this workflow, not the graph file's (review finding P8): the
+        # root graph's edge label is what a customer was offered in the first place, so "shall we
+        # go back to update address?" reads from the same vocabulary as everything else they were
+        # told. It falls back to the graph id for a parked frame the root declares no edge to.
+        label = self._label_for(frame.graph_id)
+        offer = return_offer(frame.graph_id, label)
         if not answering:
             await self._record_offer(turn, frame, sid, started, offer, edge="offer")
             return False
@@ -1436,7 +1495,7 @@ class Executor:
             return False
         frame.offer_return = False
         if decision.answer == "no":
-            turn.notices.append(abandoned_notice(frame.graph_id))
+            turn.notices.append(abandoned_notice(frame.graph_id, label))
             self._pop(turn, frame, {})
             await self._checkpoint(
                 turn,

@@ -291,19 +291,26 @@ async def test_approve_signs_the_action_the_customer_already_approved(
     same run, frame and confirm node, with ``approved_by = 'human'``. There is no way to name a
     different action, because the desk supplies no arguments - which is the whole point of a
     second signature.
+
+    The approval is resolved from the **packet**, so what is signed is what the human read
+    (review finding P4). The proposal is therefore written before the conversation reaches the
+    handoff, which is the order the real path has: a ``requires_human_approval`` tool refuses for
+    want of a second signature, and the packet built on the way out names the action waiting for
+    one.
     """
     app = build_app(ACME, engine, config=_config())
     async with serving(app) as host:
-        row = await _handed_off(host, "desk-approve-0001")
-        conversation_id = uuid.UUID(row["conversation_id"])
+        runtime = app.state.runtime
+        conversation = await runtime.conversation_for_key("web_chat", "desk-approve-0001")
+        conversation_id = conversation.id
         run = await _run_row(engine, conversation_id)
+        await _propose(engine, conversation_id, run["id"], frame_seq=0)
+        row = await _handed_off(host, "desk-approve-0001")
+        assert row["conversation_id"] == str(conversation_id)
         async with httpx.AsyncClient(base_url=f"http://{host}") as client:
-            # Nothing is proposed, so there is nothing to sign.
-            nothing = await client.post(f"/desk/handoffs/{row['id']}/approve", json={})
-            assert nothing.status_code == 409
-            assert "nothing for a human to sign" in nothing.json()["error"]
+            packet = (await client.get(f"/desk/handoffs/{row['id']}")).json()["packet"]
+            assert packet["pending_action"]["tool"] == "issue_refund", "the human read this"
 
-            await _propose(engine, conversation_id, run["id"])
             signed = await client.post(f"/desk/handoffs/{row['id']}/approve", json={})
             assert signed.status_code == 200, signed.text
             body = signed.json()
@@ -316,6 +323,84 @@ async def test_approve_signs_the_action_the_customer_already_approved(
     for field in ("tool", "args", "args_hash", "run_id", "frame_seq", "node_id"):
         assert customer[field] == human[field], f"the human signed a different {field}"
     assert human["step_id"] != customer["step_id"], "two rows, not one overwritten"
+
+
+async def test_approve_signs_only_the_action_the_handoff_showed(engine: AsyncEngine) -> None:
+    """Review finding P4, the three ways the old endpoint could sign the wrong thing.
+
+    It resolved ``live_approvals(conversation)[-1]``: not scoped to the handoff's run, not
+    checked against the packet, and not checked against the handoff's own status. So a human
+    looking at a packet that showed nothing - or showed an unfinished call they must *not*
+    repeat - could put their signature on a different, newer action with one click, and a
+    handoff somebody had already closed could still sign.
+    """
+    app = build_app(ACME, engine, config=_config())
+    async with serving(app) as host:
+        row = await _handed_off(host, "desk-approve-0002")
+        conversation_id = uuid.UUID(row["conversation_id"])
+        run = await _run_row(engine, conversation_id)
+        async with httpx.AsyncClient(base_url=f"http://{host}") as client:
+            # 1. The packet showed no pending action, so there is nothing here to sign.
+            nothing = await client.post(f"/desk/handoffs/{row['id']}/approve", json={})
+            assert nothing.status_code == 409
+            assert "nothing here for a human to sign" in nothing.json()["error"]
+
+            # 2. An action proposed *after* the packet was built is not the one the human read.
+            await _propose(engine, conversation_id, run["id"], frame_seq=0)
+            later = await client.post(f"/desk/handoffs/{row['id']}/approve", json={})
+            assert later.status_code == 409, later.text
+            assert "Re-read the handoff" in later.json()["error"]
+
+            # 3. A handoff nobody is working on any more signs nothing at all.
+            closed = await client.post(f"/desk/handoffs/{row['id']}/close", json={})
+            assert closed.status_code == 200, closed.text
+            resolved = await client.post(f"/desk/handoffs/{row['id']}/approve", json={})
+            assert resolved.status_code == 409
+            assert "this handoff is closed" in resolved.json()["error"]
+
+    assert [a["approved_by"] for a in await _approvals(engine, conversation_id)] == ["customer"]
+
+
+async def test_a_customer_message_on_a_parked_run_is_answered_and_shown_to_the_desk(
+    engine: AsyncEngine,
+) -> None:
+    """Review finding P6. The refusal is right; the silence was not.
+
+    A run parked ``waiting_human`` does not resume on a customer message - the message stays
+    ``pending`` until the desk acts, so a topic change cannot smuggle a workflow past the person
+    it was escalated to. But the customer had just been told a person would pick this up, and
+    replying produced nothing at all: on web chat a message into a void, on email a swallowed
+    reply. Now the engine says one sentence, once, and the desk can read what they said.
+    """
+    app = build_app(ACME, engine, config=_config())
+    async with serving(app) as host:
+        row = await _handed_off(host, "desk-queued-0001")
+        conversation_id = uuid.UUID(row["conversation_id"])
+        async with httpx.AsyncClient(base_url=f"http://{host}") as client:
+            for text in ("are you still there?", "hello?"):
+                sent = await client.post(
+                    "/channels/web_chat/messages",
+                    json={"session": "desk-queued-0001", "text": text},
+                )
+                assert sent.status_code == 200, sent.text
+                assert sent.json()["status"] == "waiting_human", "the run did not move"
+            read = (await client.get(f"/desk/handoffs/{row['id']}")).json()
+
+    waiting = [message["text"] for message in read["waiting_messages"]]
+    assert waiting == ["are you still there?", "hello?"], "the desk reads what they said"
+    said = await _outbound(engine, conversation_id)
+    acknowledged = [text for text in said if "it is with one of our people" in text]
+    assert len(acknowledged) == 1, "said once per parking, not once per message"
+
+    async with engine.connect() as connection:
+        result = await connection.execute(
+            sql_text(
+                "SELECT count(*) FROM message WHERE conversation_id = :c "
+                "AND direction = 'inbound' AND status = 'pending'"
+            ),
+            {"c": conversation_id},
+        )
+        assert result.scalar_one() == 2, "and both are still queued for whoever resumes"
 
 
 async def test_the_desk_refuses_what_it_cannot_find_or_parse(engine: AsyncEngine) -> None:
