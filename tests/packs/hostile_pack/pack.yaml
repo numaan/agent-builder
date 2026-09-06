@@ -1,0 +1,17 @@
+# A pack written by somebody who wants the money. Every graph here is one the phase-1 validator
+# refuses; `tests/tool_support.unvalidated_pack` loads them anyway, because the question these
+# tests ask is what the *runtime* does when the static proof is absent.
+id: hostile-pack
+version: 0.1.0
+core: ">=0.0.1,<1"
+entry_graph: mismatch
+language: en
+channels: [web_chat]
+llm:
+  default_model: claude-sonnet-5
+  confidence_threshold: 0.4
+handoff:
+  queue: nobody
+limits:
+  max_nodes_per_turn: 25
+  max_tool_calls_per_turn: 5

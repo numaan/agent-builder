@@ -1,0 +1,14 @@
+# An llm node that offers the model a HIGH tool. graph.llm_tool_not_read refuses this at load.
+id: loop_tools
+state:
+  intent: str | None
+start: research
+nodes:
+  research:
+    type: llm
+    instructions: Look into it and decide.
+    tools: [charge, peek]
+    output_schema: {}
+    edges:
+      done: finish
+  finish: { type: end, outputs: {} }

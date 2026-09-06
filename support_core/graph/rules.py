@@ -846,12 +846,23 @@ class _Rules:
             self.confirm_reentry(point, node, spec)
 
     def confirm_reentry(self, point: Point, node: ToolNode, spec: ToolSpec) -> None:
-        """A cycle back into a confirmed tool node that passes neither a ``confirm`` nor an ``ask``.
+        """One ``ActionApproval`` must not be able to authorise two calls.
 
-        DESIGN.md section 8.2 binds one ``ActionApproval`` to one proposed action. A loop that
-        re-enters the call without a fresh customer decision lets a single approval authorise
-        unbounded calls, and the run-time hash check cannot see it because the arguments never
-        change (phase-0 deferred finding N1, phase-1 review finding F4).
+        DESIGN.md section 8.2 binds one approval to one proposed action. Two shapes break that,
+        and both are this rule:
+
+        * **a cycle** back into the call without a fresh customer decision (phase-0 deferred
+          finding N1, phase-1 review finding F4). The arguments never change, so the run-time
+          hash check cannot see it;
+        * **a second tool node** naming the same ``confirm`` and reachable from the first without
+          passing one. Two nodes on *mutually exclusive* branches are fine - only one of them can
+          run - which is why this is a reachability question and not "the confirm is named
+          twice".
+
+        Both are caught at run time as well, because an approval is single-use: the second call
+        finds it consumed and is refused. That refusal happens on a customer's turn, though, and
+        a pack whose only failure mode is a refused refund in front of a customer is a pack that
+        should not have loaded.
 
         Intra-graph only, which is sufficient: by the same-graph rule the approving confirm is a
         node in this graph, and a path that leaves the graph can only come back through this
@@ -881,6 +892,23 @@ class _Rules:
             here = graph.nodes[current]
             if isinstance(here, ConfirmNode | AskNode):
                 continue  # the customer decides again on this path
+            if (
+                isinstance(here, ToolNode)
+                and node.requires_approval is not None
+                and here.requires_approval == node.requires_approval
+            ):
+                self.error(
+                    "graph.approval_reused",
+                    f"{current!r} calls {here.tool!r} under the same approval "
+                    f"({node.requires_approval!r}) and is reachable from this node without a "
+                    "fresh confirmation, so one ActionApproval would have to authorise two "
+                    "calls. An approval is single use: the second call is refused at run time, "
+                    "in front of the customer. Confirm each call, or make the two unreachable "
+                    "from one another",
+                    graph=graph,
+                    node=point[1],
+                )
+                return
             stack.extend(t for _label, t in edge_targets(here) if t in graph.nodes)
 
     def covered_out(self, point: Point, incoming: frozenset[Point], label: str) -> frozenset[Point]:

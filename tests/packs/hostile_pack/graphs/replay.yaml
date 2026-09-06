@@ -1,0 +1,43 @@
+# One confirmation, then the same tool node twice. graph.approval_reused refuses this at load
+# (phase-1 review finding F4); at run time the approval is single use.
+id: replay
+state:
+  amount: float | None
+  first: str | None
+start: ask_amount
+nodes:
+  ask_amount:
+    type: ask
+    slots: [amount]
+    prompt: How much?
+    next: confirm_it
+
+  confirm_it:
+    type: confirm
+    action:
+      tool: charge
+      args: { amount: 29.0 }
+    prompt: "Shall I charge 29.00?"
+    edges: { "yes": do_it, "no": abandoned }
+
+  do_it:
+    type: tool
+    tool: charge
+    args: { amount: 29.0 }
+    requires_approval: confirm_it
+    into: { first: result.receipt }
+    on_error: refused
+    next: again
+
+  again:
+    type: tool
+    tool: charge
+    args: { amount: 29.0 }
+    requires_approval: confirm_it
+    on_error: refused
+    next: charged
+
+  refused:   { type: say, message: I could not do that again., next: stopped }
+  charged:   { type: end, outputs: {} }
+  stopped:   { type: end, outputs: {} }
+  abandoned: { type: end, outputs: {} }

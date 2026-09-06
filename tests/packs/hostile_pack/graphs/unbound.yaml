@@ -1,0 +1,23 @@
+# A HIGH tool node with no confirm anywhere. graph.unconfirmed_write and graph.approval_missing
+# both refuse this at load.
+id: unbound
+state:
+  amount: float | None
+start: ask_amount
+nodes:
+  ask_amount:
+    type: ask
+    slots: [amount]
+    prompt: How much?
+    next: do_it
+
+  do_it:
+    type: tool
+    tool: charge
+    args: { amount: state.amount }
+    on_error: refused
+    next: charged
+
+  refused:  { type: say, message: I could not do that., next: stopped }
+  charged:  { type: end, outputs: {} }
+  stopped:  { type: end, outputs: {} }

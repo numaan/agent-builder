@@ -104,6 +104,13 @@ class _Claim:
     tool_call_id: uuid.UUID | None = None
     approval: ApprovalRecord | None = None
     replay: ToolCallResult | None = None
+    refusal: ToolError | None = None
+    """Raised by the caller *after* the claim transaction commits.
+
+    A refusal that must roll the claim back - a missing approval - is raised inside the
+    transaction instead. This one is the opposite case: re-entering a non-idempotent call whose
+    outcome is unknown records that fact on the row, and that record has to survive the refusal
+    it causes, or the next attempt would find the same ``running`` row and learn nothing."""
 
 
 class ToolRuntime:
@@ -172,6 +179,8 @@ class ToolRuntime:
             key=key,
             requires_approval=requires_approval,
         )
+        if claim.refusal is not None:
+            raise claim.refusal
         if claim.replay is not None:
             return claim.replay
         assert claim.tool_call_id is not None
@@ -373,7 +382,7 @@ class ToolRuntime:
                 f"{tool.name!r} already failed under this step and its outcome is recorded: "
                 f"{existing.error}"
             )
-            raise ToolFailed(msg)
+            return _Claim(refusal=ToolFailed(msg))
         # ``running`` or ``indeterminate``: a process died between the claim and the result, so
         # nobody knows whether the side effect happened.
         if tool.idempotent:
@@ -398,7 +407,7 @@ class ToolRuntime:
             f"happened; at-most-once means this call is refused rather than repeated "
             f"(DESIGN.md section 8.1)"
         )
-        raise ToolRefused(msg)
+        return _Claim(refusal=ToolRefused(msg))
 
     def _replayed(
         self, tool: Tool, row: Any, *, pending: bool = False, allow_empty: bool = False
