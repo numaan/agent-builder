@@ -919,8 +919,8 @@ From the repository root with `.venv/Scripts/python.exe`; Postgres 16 in
 | `python -m tests.cassettes.build_cassettes` | four scenarios recorded; the committed cassettes are what the builder produces |
 
 The 1057 are the reviewed 590 plus 467: 423 prompt-injection matrix (28 x 15 plus four properties
-of the token itself), 25 decision matrix, 4 state-write regressions, 5 more golden-conversation
-cases (four scenarios rather than one), and the rest spread across the tool gateway, the
+of the token itself), 25 decision matrix, 4 state-write regressions, 9 more golden-conversation
+cases (four scenarios rather than one), and six more spread across the tool gateway, the
 provider's cache decision and the validator's two new rules. The four `pack validate` warnings
 are unchanged: they are the forward references to graphs phases 4 and 6 add, and the review's
 recommendation that phase 6 close them rather than let them become background noise stands.
