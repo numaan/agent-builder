@@ -243,6 +243,14 @@ From the repository root with `.venv/Scripts/python.exe`; Postgres 16 in
 | `alembic check` (development database) | `No new upgrade operations detected.` |
 | `python -m tests.cassettes.build_cassettes` | seven cassettes; the committed files are what the builder produces |
 
+**If a re-run of that suite fails, check for a second `pytest` first.** Phase-0 finding N9 is
+still open and it bites hard: two `pytest` processes against one database corrupt each other's
+fixtures, and the signature is a dozen unrelated failures - leaked rows, `NoResultFound`,
+websocket timeouts - that do not reproduce individually. It happened here between the first and
+second runs of this suite (a reviewer had started theirs), and every failure of the second run
+vanished when the tests were re-run alone. The number recorded above is from a run with nothing
+else touching `support_test`.
+
 The 1351 are phase W's 1259 plus 92: 23 interrupts, 16 handoff, 8 desk, 21 interrupt-check
 spellings, 9 more golden-conversation cases (two new scenarios), 5 validator (the two new rules
 and the path-sensitive cycle, both ways), and one each for the desk's second signature, the
