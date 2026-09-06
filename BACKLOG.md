@@ -18,6 +18,7 @@ Each phase follows the five-step workflow in [PLAN.md](PLAN.md). Design referenc
 | 9 | Knowledge graph, customer memory, cost controls, packaging | todo | reviews/phase-9.md |
 | 10 | Evaluate mem0 for customer memory (after 8) | todo | reviews/phase-10.md |
 | 11 | Evaluate DSPy for per-node prompt tuning (after 8) | todo | reviews/phase-11.md |
+| 12 | `support pack new` - pack authoring tool | todo | reviews/phase-12.md |
 | F | Final integration review | todo | reviews/final.md |
 
 ---
@@ -145,6 +146,12 @@ Design: sections 9.1 to 9.3, 14 (citation guardrail).
 
 - [ ] `Passage`, `Retriever` protocol, `CompositeRetriever`.
 - [ ] `DocumentRetriever`: chunking by headings, embeddings via provider abstraction (fake embedder in tests), pgvector plus tsvector hybrid search, optional model reranking.
+- [ ] **`ColbertRetriever` as a second `Retriever` implementation** (added 2026-09-06 at the user's request). Late interaction: one vector per token, scored by MaxSim, rather than one vector per chunk. Two reasons it belongs here rather than later. It runs locally, so it removes this phase's worst limitation - there is no embedding API in this deployment (no Anthropic key; the GLM endpoint is Anthropic-compatible and serves no embeddings), so without it the dense path ships with its retrieval quality unmeasured against a stand-in embedder. And late interaction is strongest on exactly this corpus shape: short policy passages where the answer turns on a phrase.
+  - [ ] Decide the index home first, because it is the one architectural cost. A ColBERT index is its own structure (PLAID/FAISS), not a pgvector column, so adopting it breaks DESIGN.md section 4.1's "Postgres is the single stateful dependency". Either accept a second artefact - an index built at sync time, shipped with the deployment or rebuilt on boot - or store token vectors in pgvector and do MaxSim in SQL, which is honest but slow. Write down which and why.
+  - [ ] `source_version` must survive it. The exit criterion is that a wrong answer names the revision that caused it, so the index is versioned with the corpus and a re-sync builds a new one rather than mutating in place.
+  - [ ] Keep it behind the same `Retriever` protocol and the same `CompositeRetriever`, so a pack picks its backend in `sources.yaml` and neither the engine nor a graph knows which is in use.
+  - [ ] Measure it against the pgvector path on the same corpus before making it the default. Two retrievers with no comparison between them is worse than one.
+  - [ ] Passages still pass through phase 3's per-render delimiter token. A ColBERT passage is untrusted text like any other.
 - [ ] Migration fixing `doc_chunk.embedding` to `vector(N)` for the chosen embedding model (while the table is empty) and adding the HNSW index; decide whether downgrade should keep the `vector` extension (phase 0 deferred findings N12, N2).
 - [ ] `LiveLookupRetriever` routing to READ tools.
 - [ ] Ingestion CLI `support pack knowledge sync` for `markdown_dir` and `html_crawl` sources, with `source_version` and stale-chunk marking.
@@ -282,6 +289,43 @@ Exit criterion: a measured before-and-after on the phase 8 suite per node, the a
 still green, and either tuned instructions committed as reviewed pack data or a recorded decision
 not to adopt.
 
+## Phase 12: `support pack new` - a tool for building a pack
+
+Added 2026-09-06 at the user's request. Independent of phases 5 to 11; it needs the validator
+(phase 1), the tool contract (phase 4) and the knowledge source format (phase 5) settled.
+
+The point is not scaffolding for its own sake. A pack is the whole product surface for a new
+domain, and today writing one means reading DESIGN.md section 5 and copying `packs/acme_billing`.
+The tool should make the validator the teacher: a generated pack passes `support pack validate`
+from its first minute, and every later mistake is caught with a rule id and a file location rather
+than at run time in front of a customer.
+
+- [ ] `support pack new <id>` - scaffolds DESIGN.md section 5's layout: manifest, persona,
+      policies, a root graph with a classify node and the `small_talk` / `unclear` / `refused`
+      edges the sample pack has learned it needs, an empty tools module and knowledge directory.
+      Validates clean immediately.
+- [ ] `support pack add-workflow <name>` - a workflow with the shape the two existing ones share:
+      identity gate, read step, slots from the customer, confirm, and the single guarded write.
+      That shape is not a template flourish; it is what the confirm-on-every-path rule and the
+      same-graph approval rule force, so generating it teaches the constraint.
+- [ ] `support pack add-tool <name> --risk read|write|high` - a typed tool stub with its input and
+      output models and its risk tier declared. **Generate a stub, never an implementation**: the
+      body talks to a real system and is the one part a human must write and review.
+- [ ] Guided mode: draft a workflow from a description using the configured model, then hand the
+      draft to the validator and iterate against its findings rather than against a human. The
+      validator is a real scoring function, which is what makes generation defensible here.
+- [ ] Guided mode must refuse to generate what review has already shown a model gets wrong: it may
+      not mark a tool `confirm_exempt` (the reason has to be written by a person), may not set a
+      risk tier without stating why, and may not write `policies.md`.
+- [ ] `support pack doctor` - runs the validator plus the phase 8 adversarial suite against a pack
+      and reports what a release would fail on.
+- [ ] Tests: a generated pack validates; its generated workflow passes the adversarial approval
+      suite; a guided draft that violates a rule is rejected rather than written out.
+
+Exit criterion: `support pack new acme_airline` followed by `support pack add-workflow
+cancel_booking` produces a pack that validates clean and runs an end-to-end conversation against
+the recorded provider.
+
 ## Phase F: Final integration review
 
 - [ ] A fresh agent reviews the whole repository against DESIGN.md sections 3 and 14: every guiding principle and every structural guardrail must be traceable to code and a test.
@@ -320,6 +364,17 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
 ---
 
 ## Decisions log
+
+- 2026-09-06: ColBERT folded into phase 5 as a second retriever rather than added as a later phase,
+  because it changes that phase's design rather than following it. It runs locally, which removes
+  phase 5's worst limitation: no embedding API is available in this deployment, so the dense path
+  alone would ship with its retrieval quality unmeasured. The cost is explicit and must be settled
+  before building - a ColBERT index is not a pgvector column, so adopting it either adds a second
+  stateful artefact or accepts MaxSim in SQL. Neither is free and the phase must say which it took.
+- 2026-09-06: A pack authoring tool added as phase 12. Its principle is that the validator is the
+  teacher: generated packs validate from the first minute, and guided generation iterates against
+  the rules rather than against a reviewer. Tool bodies are never generated, only stubs, and a
+  model may not write policies or grant a confirm exemption.
 
 - 2026-09-06: mem0 and DSPy added to the roadmap as phases 10 and 11, both sequenced after phase 8
   and both scoped narrowly. Neither is used today. The reason for the ordering is the same in both
