@@ -10,6 +10,7 @@ Each phase follows the five-step workflow in [PLAN.md](PLAN.md). Design referenc
 | 2 | Execution engine and durability | done | reviews/phase-2.md |
 | 3 | LLM layer and prompted nodes | self-critique | reviews/phase-3.md |
 | 4 | Tool runtime and safety nodes | todo | reviews/phase-4.md |
+| W | Web chat slice (pulled forward from 7) | todo | reviews/phase-w.md |
 | 5 | Knowledge layer and citations | todo | reviews/phase-5.md |
 | 6 | Interrupts, root graph, handoff | todo | reviews/phase-6.md |
 | 7 | Channels, observability, replay | todo | reviews/phase-7.md |
@@ -108,6 +109,23 @@ Design: sections 8.1 to 8.4, 6.2 (`tool`, `confirm`, `gate`), 6.4.
 
 Exit criterion: adversarial approval tests pass and the refund graph runs with the fake provider through confirm and issue_refund.
 
+## Phase W: Web chat slice (pulled forward from Phase 7)
+
+Design: sections 12, 4.1. Pulled forward on 2026-09-06 so there is a visible, demonstrable
+conversation before the remaining depth is built. Scope is deliberately narrow: only what a
+person needs to type at the agent in a browser and watch the refund flow work.
+
+- [ ] `ChannelAdapter` protocol per DESIGN.md section 12 (`parse_inbound`, `send`, `conversation_key`), general enough that Phase 7's email adapter implements it without changing it.
+- [ ] Web chat adapter over WebSocket, streaming the final message only; intermediate node output is not streamed.
+- [ ] FastAPI app factory `create_app(pack)` wiring the web chat channel and a health endpoint. The desk API and email webhook stay in Phase 7.
+- [ ] Queue-and-return mode for the webhook path (`lock_wait_seconds=0` plus a caller of `Executor.drain`) so an HTTP handler never blocks a connection per waiter. This is half of phase-2 review finding R7; the scheduler half stays in Phase 7.
+- [ ] A minimal static client page good enough to demonstrate a conversation. Not a product UI.
+- [ ] Tests: web chat round trip against the sample pack; a suspend and resume across two WebSocket connections; concurrent clients on different conversations do not serialise.
+
+Exit criterion: `create_app(load_pack("packs/acme_billing"))` starts, and a browser client
+completes the phase-4 refund flow end to end, including the confirmation step, with the
+recorded provider. With `ANTHROPIC_API_KEY` set, the same flow runs against the live model.
+
 ## Phase 5: Knowledge layer and citations
 
 Design: sections 9.1 to 9.3, 14 (citation guardrail).
@@ -143,17 +161,17 @@ Exit criterion: the section 19 worked example runs end to end with the fake prov
 
 Design: sections 12, 15, 4.1.
 
-- [ ] `ChannelAdapter` protocol; web chat over WebSocket with final-message streaming; email adapter mapping `In-Reply-To` to conversations and batching outbound per turn.
-- [ ] FastAPI app factory `create_app(pack)` wiring channels, desk API, health.
+- [ ] Email adapter mapping `In-Reply-To` to conversations and batching outbound per turn. (The `ChannelAdapter` protocol, the web chat adapter and `create_app` land in Phase W; this phase adds email on top of them.)
+- [ ] Extend `create_app` from Phase W with the desk API and the email webhook.
 - [ ] A queue-and-return mode for channel webhooks: `lock_wait_seconds=0` plus something that calls `Executor.drain`, made the default for the webhook path, and a scheduler for `recover_stalled` and `sweep_timeouts` (phase 2 review finding R7). Both mechanisms exist; what is missing is a caller that cannot afford to block a connection per waiter, which is the HTTP handler this phase adds.
 - [ ] OpenTelemetry spans for turn, node, llm_call, tool_call, retrieval, guardrail with the attributes in section 15.
 - [ ] Metrics listed in section 15.
 - [ ] Structured JSON logs with PII redaction applied before emission.
 - [ ] `conversation_replay` endpoint rendering the frame stack over time.
 - [ ] Inbound guardrails: PII tagging and redaction in traces, injection flag, language detection.
-- [ ] Tests: web chat round trip; email thread with a two-day gap resumes the same run; replay output matches trace.
+- [ ] Tests: email thread with a two-day gap resumes the same run; replay output matches trace. (Web chat round trip is covered by Phase W.)
 
-Exit criterion: the service starts with the sample pack, a web chat client completes the refund flow, and the replay endpoint shows the path.
+Exit criterion: an email thread with a multi-day gap resumes the same run, and the replay endpoint shows the path taken.
 
 ## Phase 8: Evaluation harness
 
@@ -213,6 +231,8 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
 ---
 
 ## Decisions log
+
+- 2026-09-06: Web chat pulled forward out of Phase 7 into a new Phase W, sequenced after Phase 4. Reason: nothing is demonstrable until a person can type at the agent, and every later phase then improves something visible. Phase 7 keeps email, observability, replay, guardrails and the scheduler. Target for a demo is Phases 4, W, 5 and 6 complete.
 
 - 2026-09-05: Single repository for core and sample pack until phase 9, to keep early iteration fast. Split at phase 9.
 - 2026-09-05: Tests use real Postgres via docker-compose. Provider calls use a fake with recorded responses; live calls only in an opt-in group.
