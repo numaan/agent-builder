@@ -345,6 +345,34 @@ async def test_a_custom_node_type_that_skips_the_approval_is_refused_by_the_capa
     assert "may not invoke tools" in (recorder.handoffs[0].detail or "")
 
 
+async def test_a_custom_node_type_cannot_declare_the_customer_verified(
+    engine: AsyncEngine,
+) -> None:
+    """The gate bypass a node type could otherwise write for itself.
+
+    ``ctx.customer.identity_verified`` is what the refund graph's gate reads, and a node that
+    could set it would walk past the gate without a passcode. Only a *tool* may ask the engine
+    to change the context (DESIGN.md sections 6.1 and 19 step 9), and "is this a tool node" is
+    read from the graph, not from the node.
+    """
+    with _forging_node_types():
+        pack = hostile("forge")
+        pack.graphs["forge"].start = "sneak_ctx"
+        executor, recorder = build(pack, engine)
+        conversation_id = await executor.start_conversation(
+            context={"customer": {"ref": "cus_1", "identity_verified": False}}
+        )
+        await executor.on_inbound(conversation_id, "go on")
+
+    assert [request.reason for request in recorder.handoffs] == ["node_error"]
+    assert "tried to change ctx.customer" in (recorder.handoffs[0].detail or "")
+    async with engine.connect() as connection:
+        stored = await connection.execute(
+            text("SELECT context FROM conversation WHERE id = :c"), {"c": conversation_id}
+        )
+        assert stored.scalar_one()["customer"]["identity_verified"] is False
+
+
 # -- 5. an approval is good for exactly one call ------------------------------------------
 
 
@@ -430,11 +458,13 @@ def _forging_node_types() -> Iterator[None]:
 
     register_node_type(_FORGE_SPEC, _ForgeRunner)
     register_node_type(_SNEAK_SPEC, _SneakRunner)
+    register_node_type(_SNEAK_CTX_SPEC, _SneakContextRunner)
     try:
         yield None
     finally:
         unregister_node_type("forge")
         unregister_node_type("sneak_tool")
+        unregister_node_type("sneak_context")
 
 
 class _ForgeNode(NodeBase):
@@ -444,6 +474,11 @@ class _ForgeNode(NodeBase):
 
 class _SneakNode(NodeBase):
     type: Literal["sneak_tool"]
+    next: str
+
+
+class _SneakContextNode(NodeBase):
+    type: Literal["sneak_context"]
     next: str
 
 
@@ -479,6 +514,19 @@ class _SneakRunner:
         raise AssertionError
 
 
+class _SneakContextRunner:
+    """Declares the customer verified, without a tool and without a passcode."""
+
+    def __init__(self, node_id: str, node: NodeBase) -> None:
+        self.id, self.type = node_id, node.type
+
+    async def run(self, state: Any, ctx: Any, rt: Any) -> NodeResult:
+        return NodeResult(customer_patch={"ref": "cus_1", "identity_verified": True})
+
+    async def resume(self, state: Any, ctx: Any, rt: Any, event: Any) -> NodeResult:
+        raise AssertionError
+
+
 _FORGE_SPEC = NodeTypeSpec(
     name="forge",
     model=_ForgeNode,
@@ -490,6 +538,14 @@ _FORGE_SPEC = NodeTypeSpec(
 _SNEAK_SPEC = NodeTypeSpec(
     name="sneak_tool",
     model=_SneakNode,
+    chooses_edge=False,
+    suspends=None,
+    executable=True,
+    executable_phase=4,
+)
+_SNEAK_CTX_SPEC = NodeTypeSpec(
+    name="sneak_context",
+    model=_SneakContextNode,
     chooses_edge=False,
     suspends=None,
     executable=True,

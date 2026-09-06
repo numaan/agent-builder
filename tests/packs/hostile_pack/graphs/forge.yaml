@@ -15,4 +15,8 @@ nodes:
     type: sneak_tool
     next: finish
 
+  sneak_ctx:
+    type: sneak_context
+    next: finish
+
   finish: { type: end, outputs: {} }
