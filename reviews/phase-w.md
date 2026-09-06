@@ -581,3 +581,142 @@ items are exactly right, and its fragility list predicted W5's shape. What it mi
    files the auth gap under "for a demo on 127.0.0.1 that is honest" and points at phase 7 - but
    phase 6 then mounted the desk on this app, default on, which turns a self-inflicted risk into
    somebody else's data. That deferral needs re-opening, not re-deferring.
+
+---
+
+## Resolution
+
+Resolver: a fresh agent that wrote none of the phase W code, 2026-09-07 (PLAN.md step 5). **Both
+must-fixes are fixed with regression tests that fail against the reviewed code**, every should-fix
+is fixed, and both actionable nits are fixed; the third nit (W13) is a date-stamp on the section
+it is about. Nothing was deferred whole. Three pieces that are genuinely phase 7's - per-operator
+desk identity, taking the desk off the customer's listener, and carrying transport detail from an
+inbound message to an outbound reply - are in BACKLOG.md's "Deferred findings" with checklist
+lines in phase 7.
+
+The review itself was committed first as `56f5847`; it was sitting uncommitted in the working
+tree, so the diff that resolves it reads against what was actually reviewed.
+
+One thing did not turn out as reported, and one commit is coarser than it should be. **W12** is
+confirmed exactly as the reviewer describes it: the README never said `/health`, the verification
+section claimed a defect that never existed, and that paragraph now says so instead of leaving the
+claim standing. And `8720a81` carries eleven findings in one commit rather than several, because
+`support_core/api/app.py` carries W1, W2, W8 and W9 and `support_core/storage/repositories.py`
+carries W4, W5 and W10 - splitting by file would have split nothing.
+
+| id | severity | action | commit |
+|----|----------|--------|--------|
+| W1 | must-fix | **Fixed.** Three changes, and the order is what makes it a fix rather than a hiding place. `serve_desk` now defaults to `False`, so **a deployment that configures nothing serves no desk at all** - `/desk/*` is not routed and answers 404. `serve_desk` on with no `desk_token` raises `ConfigError` in `create_app`, *before* the runtime is built, so a missing credential stops the application rather than opening a desk; a token under 16 characters is refused the same way. And every `/desk` route sits behind a bearer token compared with `secrets.compare_digest`, attached to the **router** rather than to each endpoint, so a route added later is guarded by construction. The credential is read from the `Authorization` header and nowhere else - never a query parameter, for the reason W9 gives. `tests/test_desk_auth.py` is the reviewer's attempt A12 as eight regression tests, **all eight of which fail against the reviewed code**, including one that enumerates the router and asserts every route it finds answers 401. Before the fix, reproduced on a running server: `GET /desk/handoffs` 200 with the whole queue, `GET /desk/handoffs/{id}` 200 and 1763 bytes of another customer's packet, `GET /desk/conversations/{id}/transcript` 200 with their text, `POST .../reply` 200 and the words written into their transcript. After: 401 on all four, nothing in the body. **The desk stays on this application rather than moving to its own port, and the reasoning is recorded** in the `support_core.api.app` docstring and in the decisions log: DESIGN.md 4.1 makes a deployment one service and section 12 says the desk "uses the same API surface", so a second listener is a change to the design rather than a reading of it; and a desk `reply` reaches a customer's open socket only from the process holding it, so splitting the desk out today would silently stop delivering a human's reply until phase 7's fan-out exists - trading a hole that is now closed for a regression that is not. What made the exposure was the default, not the shared port. Nothing else mounted on that app has the same shape: the two channel endpoints are the customer's own conversation (their access control is the session key, still phase 7's), `/` and `/static` are the demo page, and `/healthz` returns deployment metadata - pack id, version, fingerprint, provider, channels - and no customer data. | 8720a81 |
+| W2 | must-fix | **Fixed.** The socket reads raw frames with `WebSocket.receive()` and branches on whether a text frame arrived. A binary frame is answered with an `error` frame saying what was wrong and closed with 1003 ("unsupported data"), rather than raising `KeyError: 'text'` out of the handler. `test_a_binary_frame_is_refused_rather_than_crashing_the_handler` sends the reviewer's exact input, asserts the error frame and the close code, and then opens a second connection and holds a whole conversation on it, because "the server is still serving" is half of what a clean refusal means. It fails against the reviewed code with the reviewer's own traceback. The opening frame gets the same treatment: a binary hello is refused before any row exists. | 8720a81 |
+| W3 | should-fix | **Fixed as the reviewer suggested.** The `turn` frame is broadcast to every connection watching the conversation, from `AppRuntime.deliver_inbound`, so it reaches a second tab and a customer whose reply arrived on another transport - and it reaches them whoever ran the turn: this socket, another socket, the `POST` handler, or the drain worker. `queued` is out of the frame and into a per-caller `queued` frame on the socket, and stays in the HTTP response where it always was. Re-run of the reviewer's attempt A3: the watching tab received `['message', 'turn']` with the same `awaiting` the sender got, where it previously received `message` only. | 8720a81 |
+| W4 | should-fix | **Fixed in the durable path.** `message.queue_seq` is claimed from `conversation.inbound_seq` by an `UPDATE ... RETURNING` inside `enqueue_inbound`, which takes the conversation's row lock, so concurrent callers serialise at the counter and leave with distinct increasing numbers; `peek_next_pending` and `pending_inbound` order by it. Migration `0009`, with a backfill that numbers existing rows in the order the old query would have produced them. This is the shape of phase 2's R1 and R2 fixes rather than a tighter clock: the order is *decided* when the row is written instead of reconstructed afterwards from `created_at`, which is the transaction-start timestamp and identical for a simultaneous pair, with a random UUID breaking the tie. `tests/test_inbound_order.py` has three tests and **all three fail against the reviewed code**; the first is deterministic - two rows written in one transaction, so they share `created_at` exactly, with their ids forced into the wrong sort order, which is the reviewer's reordering with the coin toss removed. What this does not claim: which of two genuinely simultaneous requests *should* be first is not a question the database can answer. What it claims is that there is exactly one order, that every caller has a place in it, that the place is decided when the row is written, and that the drain follows it. Re-run of attempt C6: the two posts issued together took `queue_seq` 1 and 2 in the order they were issued and ran in that order. `tests/verify_phase_2_resolution.py` reads arrival order from `queue_seq` now instead of from `created_at`; the property it asserts is unchanged. | 8720a81 |
+| W5 | should-fix | **Fixed as the reviewer suggested.** `pending_outbound` selects `FOR UPDATE SKIP LOCKED`, so a desk `reply` concurrent with a turn's `_flush_outbound` cannot read the same `pending_send` rows in both transactions and deliver each message twice. Skipping rather than waiting is right here: a row another transaction is already delivering is a row this one has nothing to do about. | 8720a81 |
+| W6 | should-fix | **Fixed.** `Executor._handoff` emits the same sentence a `handoff` node emits, chosen by the same rule - `DEFAULT_HANDOFF_MESSAGE` when the hook says a human was told, `HANDOFF_UNDELIVERED_MESSAGE` when nobody was - so the turn that raises a handoff is no longer silent. It says nothing about *what* failed: the reason, the rejected decision and the detail belong in the packet a person reads, and three tests assert they are absent from the customer's transcript. `test_a_turn_that_fails_still_says_something_to_the_customer` is the reviewer's attempt A8 over a real socket. Re-run of A8 on a fresh process: the customer is told "I am passing this conversation to one of our people...", where they previously received nothing at all. | 8720a81, cba859c |
+| W7 | should-fix | **Fixed as the reviewer suggested.** `conversation_for` catches `IntegrityError` explicitly instead of suppressing it, and reports `created` from whether its own insert committed. Re-run of attempt C1: twelve simultaneous posts on one key produced one conversation and `created: true` on **one** of twelve, where it was previously true on all twelve. Nothing branches on the flag today; phase 7's email adapter is the caller that would, to decide whether to send a greeting. | 8720a81 |
+| W8 | should-fix | **Fixed as the reviewer suggested, and a little further.** Opening a socket resolves the session key without creating anything and sends `ready` with a null conversation and an empty history; the first *message* creates the row. The extra part is what the one-line version of the fix would have broken: a connection with no conversation yet waits in the registry under its channel key, and `ConnectionRegistry.attach` moves every waiter across when somebody's message creates the row - *before* the turn runs - so two tabs opened together on a fresh key, and a tab watching while the first message arrives by `POST`, both keep receiving what the conversation says. `test_a_client_that_brings_no_session_is_given_one` counts the rows: zero after connecting, one after speaking. | 8720a81 |
+| W9 | should-fix | **Fixed by the reviewer's second option.** The session key arrives in an opening frame - `{"type": "hello", "session": "<key>"}`, or `{"type": "hello"}` to be given one - and the query string is gone from the client, the endpoint and the test helper. Verified in the server log of the manual run: `WebSocket /channels/web_chat/ws [accepted]`, and a count of `session=` across the whole log returns **0**. `Sec-WebSocket-Protocol` was the reviewer's first suggestion and was rejected on a detail: a subprotocol value is an HTTP token and `SESSION_KEY` permits `:`, which is a separator. A connection that says nothing is closed after 15 seconds, since the key no longer arrives with the handshake. | 8720a81 |
+| W10 | should-fix | **Fixed as the reviewer suggested.** `transcript` returns an outbound row only when it is `sent`, so the reconnect path cannot show a customer text that phase 7's send-time guardrail refused to deliver. It changes nothing today - delivery is the only thing that can leave a row `pending_send` - and it puts the seam in the right place before the guardrail arrives, which is the reviewer's argument and it is correct. | 8720a81 |
+| W11 | should-fix | **Fixed as the reviewer suggested.** The client renders three authors: `agent`, `customer`, and anything else as a person at the desk - on the agent's side of the transcript, labelled, with its own style. Only an `agent` message updates `state.lastAgentMessage`, so an approval panel raised after a desk reply still quotes the proposal the approval is bound to. | 8720a81 |
+| W12 | nit | **Fixed - the claim is struck.** The verification section's finding "the README's own instructions say `/health`" is not reproducible and never was: `git show 032fb6a:README.md` says `/healthz` and so does the current README. The paragraph now carries a note saying the claim was false and is withdrawn, rather than leaving a defect in the record that this project never had and never fixed. | cba859c |
+| W13 | nit | **Fixed as the reviewer's first option.** The verification table is date-stamped and prefaced with a note that its 1259 tests, 9 pack warnings and head `0007` are phase W's own numbers, that phase 6 moved all three to 1361, 18 and `0008`, and that none of the three is a regression. The numbers for the tree as it stands are below. | cba859c |
+| W14 | nit | **Fixed.** `RESOLVED` deleted. Unused anywhere in the tree and wrong besides - it did not list `glm`, which `resolve_provider` returns. | 8720a81 |
+| W15 | nit | **Fixed.** A `fatal` error frame stops the client reconnecting, so a malformed key no longer reproduces its own rejection every five seconds for ever. "Restart" clears the flag, because that is the customer's way out. | 8720a81 |
+| W16 | nit | **Fixed by dropping it, with the real gap written down.** `InboundMessage.metadata` is gone. Nothing wrote it, nothing read it, and - decisively, as the reviewer says - it was not reachable from `send`, which is given a `ConversationRef` built from the conversation *row*, so the one job it named was the one job it could not do. A field that looks like a seam and is not is worse than no field, because the next phase builds against it and finds out late. Carrying an inbound message's transport headers to an outbound reply is a real gap and is now a phase 7 checklist line, beside the two neighbouring ones the reviewer's "missed by self-critique" section raises: `customer_ref` never reaching `ctx.customer`, and `send` being unable to refuse a delivery. | 8720a81 |
+
+### Verification, on 2026-09-07
+
+| Command | Result |
+|---|---|
+| `ruff check .` | All checks passed |
+| `ruff format --check .` | 163 files already formatted |
+| `mypy` (strict) | Success: no issues found in 163 source files |
+| `pytest -q` | **1374 passed, 2 deselected, 565 s** |
+| `pytest -m live -q` | 2 skipped, 1374 deselected (no `ANTHROPIC_API_KEY`) |
+| `pytest tests/verify_phase_2_resolution.py -q` | 39 passed, 146 s |
+| `support pack validate packs/acme_billing` | `acme-billing: well-formed (18 warning(s))`, exit 0 |
+| `alembic downgrade base`, `upgrade head`, `check`, `current` | clean; "No new upgrade operations detected"; head is **0009** |
+
+### The conversation, driven by hand
+
+`SUPPORT_APP_CONFIG` pointing at the demo configuration with `serve_desk` on, a `SUPPORT_DESK_TOKEN`
+in the environment, a private `support_w_resolution` database, and `uvicorn app:app --port 8100`.
+The demo servers on 8000 and 8001 were not touched and were still answering afterwards; the
+server started here was stopped and its database dropped.
+
+`GET /healthz` returned 200 with `provider: "replay"`, `channels: ["web_chat"]`, `database: "ok"`
+and the pack fingerprint. `GET /` served the client page. Then, over a real WebSocket:
+
+1. `hello` with no key gave `ready`, a server-assigned session, **`conversation_id: null`** and an
+   empty history. Nothing was written (W8).
+2. *"I got charged twice for the Pro Plan this month; can I have one of them back?"* produced
+   **"I have sent a six-digit code to me@example.com. What is it?"** and `waiting_customer` on
+   `ask_code`. The identity gate before the account, as always.
+3. *"The code is 581139. Also, can you change my address while we are at it?"* produced the
+   deferral sentence, then **"I can refund 29.00 USD for Pro Plan - September (2026-09-03) to your
+   original payment method. Shall I go ahead?"** with `awaiting {kind: confirm, node:
+   confirm_refund, tool: issue_refund}`. Nothing moved.
+4. A **reconnect on a second connection** at that point returned the same conversation id, five
+   messages of transcript and the same `awaiting` - so the approval panel comes back after a
+   reload.
+5. *"Yes please, go ahead and refund it."* produced **"That is refunded. It takes five to seven
+   business days to show on your statement."**, then *"Is there anything else I can help you
+   with?"*
+6. *"Yes please - it is 4 Elm Row, Edinburgh, EH7 4AH, United Kingdom."* produced the address
+   workflow's own confirmation, which is phase 6's deferred intent coming back.
+
+In the database afterwards: one conversation, one `issue_refund` `tool_call` (`high`, `succeeded`,
+carrying an `approval_id`), exactly one `action_approval` - `customer`, `confirm_refund`, consumed -
+and no other WRITE or HIGH call carrying one. In the uvicorn access log: `WebSocket
+/channels/web_chat/ws [accepted]`, with **zero** occurrences of `session=` anywhere in the log
+(W9).
+
+On a second, fresh process on port 8101 - because the sample pack's billing system is an in-memory
+fake seeded at startup, so only one refund conversation per process can succeed, which the README
+says - the four-message recorded refund ran to `done`, and then a message on that finished
+conversation failed a node and the customer was told about it (W6, attempt A8).
+
+### The reviewer's matrices, re-run
+
+Same shape as the review's own logs, against a real uvicorn server on 8100 with the demo
+configuration and a private database. A8 and A13 were re-run on the fresh process on 8101 for the
+reason above; both need the refund to work, and the first run had spent it.
+
+**Channel boundary: 13 attempts. Before: 9 held, 2 broke, 2 as designed. After: 11 held, 0 broke,
+2 as designed and still deferred.**
+
+| # | before | after |
+|---|--------|-------|
+| A1 forged session key | held, but created a durable row | **held**, and creates nothing (W8) |
+| A2 another client's key | as designed - the key is a bearer token | unchanged, and the key is no longer in the access log (W9) |
+| A3 two sockets on one key | only the sender got the `turn` frame (W3) | **held**: the watcher got `message` *and* `turn`, with the same `awaiting` |
+| A4 frame naming another session | held | held; the victim's transcript unchanged |
+| A5 seven malformed frame shapes | held | held, 7 of 7 non-fatal errors, socket still usable |
+| A6 4 001 and 400 000 characters | held | held |
+| A7 binary frame | **broke** - unhandled `KeyError`, ASGI traceback | **held**: error frame, close 1003, next connection served (W2) |
+| A8 message after the conversation is `done` | **broke** - zero outbound messages | **held**: the customer is told (W6) |
+| A9 speaking into a parked run | held and correct | held, acknowledged once, run not resumed |
+| A10 every frame read for leakage | held | held; `awaiting` carries `kind`, `node`, `tool` only |
+| A11 cross-conversation `POST`, hostile `Origin` | writes; known, deferred | unchanged, still deferred to phase 7 |
+| A12 unauthenticated `/desk/*` | **broke badly** - the whole database | **held**: 401 on all seven endpoints and on a wrong token, nothing leaked (W1) |
+| A13 the confirm chain | held | held: one approval, consumed, one refund |
+
+**Concurrency: 7 attempts. Before: 6 held, 1 broke. After: 7 held.**
+
+| # | before | after |
+|---|--------|-------|
+| C1 twelve simultaneous posts on one key | one conversation; `created` wrong on all twelve (W7) | one conversation, 11 queued, **0.32 s** wall, `created: true` on **1** of 12; `queue_seq` 1 to 12, all distinct |
+| C2 six conversations at once | 0.44 s against a 0.10 s baseline | **0.42 s** against a 0.10 s baseline - still no serialising |
+| C3 disconnect 50 ms into the turn | held | held; transcript on reconnect intact |
+| C4 eight back-to-back on one socket | held, in order | held, 8 of 8 in order |
+| C5 reconnect racing an in-flight turn | held | held; the new socket got the turn's `message` and its `turn` frame |
+| C6 two posts together, known order | **reordered**, and parked the conversation for good (W4) | **held**: `queue_seq` 1 and 2 in the order issued, processed in that order |
+| C7 drain worker with a socket watching | held | held |
+
+### What is still open on this surface
+
+The customer channel's own access control is unchanged and still phase 7's: the session key is a
+bearer token, there is no origin check on the socket, no CSRF defence on the webhook, no rate limit
+and no webhook signature verification. A2 and A11 are that gap, and they are recorded above as
+deferred rather than as passes. What changed is that the *desk* is no longer part of it, and that
+the one secret a customer holds is no longer written into every log between the browser and the
+application.

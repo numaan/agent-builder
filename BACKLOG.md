@@ -10,7 +10,7 @@ Each phase follows the five-step workflow in [PLAN.md](PLAN.md). Design referenc
 | 2 | Execution engine and durability | done | reviews/phase-2.md |
 | 3 | LLM layer and prompted nodes | done | reviews/phase-3.md |
 | 4 | Tool runtime and safety nodes | done | reviews/phase-4.md |
-| W | Web chat slice (pulled forward from 7) | in-review | reviews/phase-w.md |
+| W | Web chat slice (pulled forward from 7) | done | reviews/phase-w.md |
 | 5 | Knowledge layer and citations | todo | reviews/phase-5.md |
 | 6 | Interrupts, root graph, handoff | done | reviews/phase-6.md |
 | 7 | Channels, observability, replay | todo | reviews/phase-7.md |
@@ -125,6 +125,10 @@ person needs to type at the agent in a browser and watch the refund flow work.
 - [x] Queue-and-return mode for the webhook path (`lock_wait_seconds=0` plus a caller of `Executor.drain`) so an HTTP handler never blocks a connection per waiter. This is half of phase-2 review finding R7; the scheduler half stays in Phase 7. (`support_core/api/drain.py`. Measured: a second message on a conversation whose turn holds the lock for 1.5 s is answered in milliseconds with `queued`, and the drain worker runs it afterwards, in order.)
 - [x] A minimal static client page good enough to demonstrate a conversation. Not a product UI. (`support_core/api/static/`: HTML, CSS and JavaScript, no build step, no framework and no request to anything but the service. The confirmation is a bordered panel naming the tool and quoting the proposal the approval is bound to.)
 - [x] Tests: web chat round trip against the sample pack; a suspend and resume across two WebSocket connections; concurrent clients on different conversations do not serialise. (`tests/test_web_chat_socket.py`, `tests/test_web_chat_api.py`, `tests/test_channels.py`, `tests/test_drain_queue.py`, `tests/test_app_config.py`: 71 tests over a real uvicorn server on an ephemeral port, driven over TCP.)
+- [x] The desk API is off unless a deployment turns it on, and needs a bearer token when it is; a missing credential refuses to start (review finding W1, a must-fix, and the one that mattered because the demo was running on this build). `tests/test_desk_auth.py` is the reviewer's own attack as eight regression tests, all of which fail against the reviewed code.
+- [x] A binary WebSocket frame is refused with an error frame and close 1003 rather than crashing the handler with an unhandled `KeyError` (review finding W2, a must-fix), with the reviewer's exact input as a regression test.
+- [x] The `turn` frame - the only thing that raises the approval panel - reaches every connection on the conversation rather than only the one that sent the message (review finding W3), so a second tab sees the confirmation.
+- [x] The pending inbound queue is ordered by `message.queue_seq`, claimed from `conversation.inbound_seq` under the conversation's row lock, rather than by a transaction-start timestamp with a random tie-break (review finding W4, migration `0009`). A reorder that dead-ends a conversation is the family of bug phase 2's R1 and R2 were, and it is fixed in durable state for the same reason.
 
 Exit criterion: `create_app(load_pack("packs/acme_billing"))` starts, and a browser client
 completes the phase-4 refund flow end to end, including the confirmation step, with the
@@ -133,11 +137,29 @@ Met on 2026-09-06, twice over: `tests/test_web_chat_socket.py` drives the four-m
 conversation through the real HTTP and WebSocket path and asserts one refund in the billing
 system authorised by one consumed approval, and the same conversation was run by hand in a
 browser against `SUPPORT_APP_CONFIG=demo/acme_web_chat.json` (reviews/phase-w.md records what
-was on the screen). 1257 tests green, two deselected - the `live` group. **The live half of the
-criterion is unproven**: there is no `ANTHROPIC_API_KEY` in this environment, so what is
-demonstrated is that the provider is chosen by configuration and that `provider: "auto"` resolves
-to `anthropic` when a key is present - not that a live turn works. That is the same gap phase 3
-recorded for `AnthropicProvider`, and it stays open until somebody runs it with a key.
+was on the screen). **The live half of the criterion is unproven**: there is no
+`ANTHROPIC_API_KEY` in this environment, so what is demonstrated is that the provider is chosen
+by configuration and that `provider: "auto"` resolves to `anthropic` when a key is present -
+not that a live turn works. That is the same gap phase 3 recorded for `AnthropicProvider`, and
+it stays open until somebody runs it with a key.
+
+Met again after review resolution on 2026-09-07: 1374 tests green (two deselected - the `live`
+group), and the four-message conversation driven by hand once more, over a real socket against a
+private database, reaching the confirmation and the refund. The reviewer judged the channel
+itself sound - every attack they made on the channel boundary held, and the exit criterion
+reproduced independently - and broke what had been mounted *beside* it: phase 6's desk API,
+served on the customer's own port, on by default and with no authentication, so an anonymous
+browser listed every conversation in the deployment, read another customer's transcript and
+handoff packet, and wrote into it. That is fixed three ways over - off by default, a credential
+required to turn it on, and a missing credential refusing to start - with eight regression tests
+that reproduce the reviewer's own attack and fail against the reviewed code. A binary WebSocket
+frame, which crashed the connection handler with an unhandled `KeyError`, is refused cleanly with
+its own regression test. Nine should-fixes and three nits went with them, including two the
+demo depends on: only the tab that sent a message learned the conversation's status, so a second
+tab never raised the approval panel; and two messages posted at the same instant could run in
+the wrong order and park the conversation for good, which is now decided by a claimed
+per-conversation sequence rather than by a transaction-start timestamp with a random tie-break.
+Resolution recorded in reviews/phase-w.md.
 
 ## Phase 5: Knowledge layer and citations
 
@@ -215,8 +237,12 @@ Design: sections 12, 15, 4.1.
       against a graph that has no such node (phase 6 review finding P10).
 - [ ] Replay an LLM call from the trace when a step re-executes (DESIGN.md 7.3: "LLM calls replay from the trace if the step already completed"). `trace_step.llm_response` is written and never read back, so a crash between the model answering and the checkpoint committing pays for the question again and may get a different answer. The step id on `NodeRuntime` is the documented cache key (phase 3 self-critique fragility item 1, endorsed by the phase-3 review).
 - [ ] Inbound guardrails: PII tagging and redaction in traces, injection flag, language detection.
-- [ ] Authentication and abuse control on the channel surface: the web chat session key is currently the whole of the access control, and there is no WebSocket origin check, no rate limit and no webhook signature verification (phase W self-critique). This phase adds the desk API, where the same gap is somebody else's customer data.
+- [ ] Authentication and abuse control on the **customer** channel surface: the web chat session key is still the whole of the access control, and there is no WebSocket origin check, no CSRF defence on the webhook, no rate limit and no webhook signature verification (phase W self-critique, sharpened by its review's attempts A2 and A11). The desk half of this is **closed**: phase W's resolution turned `serve_desk` off by default and put every `/desk` route behind a bearer token, because phase 6 had mounted that API on the customer's own listener, on by default and open (finding W1). What is left here is the customer's own key and the abuse controls, plus per-operator desk identity and rotation, which one shared token is not.
+- [ ] Take the desk off the customer's listener, once live delivery can cross a process. Phase W's resolution kept it on the same application deliberately: DESIGN.md 4.1 says one service, 12 says the same API surface, and a desk `reply` reaches a customer's open socket only from the process that holds that socket, so a separate desk process would silently stop delivering a human's reply until the fan-out below exists. With the fan-out, a `create_desk_app` on its own port costs nothing and matches what section 12 means by "not a customer channel".
 - [ ] Live delivery beyond one process: the web chat connection registry is in-memory, so a second app process delivers only to the sockets it holds and a customer whose turn ran elsewhere sees nothing until they reconnect (phase W self-critique). Postgres `LISTEN/NOTIFY` is the obvious fan-out, since the database is already there. DESIGN.md 4.1's "horizontal scaling is safe" is true of execution and not yet of delivery.
+- [ ] Carry a message's transport detail from inbound to outbound. `InboundMessage.metadata` was removed in phase W's resolution (finding W16) rather than left as a seam pointing the wrong way: nothing wrote it, nothing read it, and `send` could not reach it, because `send` is given a `ConversationRef` built from the conversation *row*. An email adapter still cannot set `In-Reply-To` from the message it is answering without a second lookup of its own, which is the thing the protocol was supposed to spare it. Design it with the item below, which is the same seam from the other end.
+- [ ] Seed a new conversation's `ctx.customer` from what the transport knows. `InboundMessage.customer_ref` reaches `conversation.customer_ref` and never reaches `ctx.customer`, which is what gates and prompts read; `ChannelHub.conversation_for` seeds every new conversation from the one constant `AppConfig.new_conversation_context` instead. For email the `From` header is the whole point (phase W review, "missed by self-critique" item 2). It needs the CRM seam the phase W self-critique names, which is why it is here and not there.
+- [ ] Let `ChannelAdapter.send` refuse a delivery. It returns `None` and `ChannelHub.deliver` swallows every exception by design, so `mark_sent` is unconditional for every channel and no adapter can say "this one is a permanent bounce, do not mark it sent" (phase W review, "missed by self-critique" item 3).
 - [ ] Outbound message identity and the per-turn email batch: `EngineHooks.send` receives text with no message id, so a transport cannot de-duplicate the at-least-once redelivery a crash between commit and send produces; and the engine flushes after every checkpoint that spoke, so nothing tells an adapter that a turn ended (phase W self-critique, "where email will strain this protocol"). One turn of the refund conversation produces two messages, which is two emails unless this is settled. Decide between a fourth protocol method and a flush driven by the runtime, and note that `send` runs inside the transaction that marks a message `sent`, so a buffering adapter is recorded as having delivered what it has only queued.
 - [ ] Tests: email thread with a two-day gap resumes the same run; replay output matches trace. (Web chat round trip is covered by Phase W.)
 
@@ -378,7 +404,9 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
 - [phase 2] R7: a caller that cannot take the conversation lock waits, holding a connection each, so N+1 concurrent inbound messages on one conversation with a bounded pool is a stall (reviewer measured five OS processes, four of them blocked for a whole turn), should-fix, deferred to phase 7. The mechanism for the fix already exists (`lock_wait_seconds=0` returns `queued=True`, `drain` is the poller's entry point); what R7 asks for is a *default* for channel webhooks and a poller to make it safe, and phase 2 has neither a channel adapter nor a scheduler - the same reason `sweep_timeouts` and `recover_stalled` are methods rather than a daemon (checklist line added there).
 - [phase 2] R6 (registry-scoping half): `register_node_type` writes into one process-wide table, so DESIGN.md 6.7's two pack versions side by side, and phase 9's core/pack split, can still collide over a node type name - a conflicting duplicate is now refused loudly rather than silently overwriting, which is the safe half, nit, deferred to phase 9. Scoping the registry per `Pack` means the loader and the validator carry it too, because `NODE_TYPES` is what turns node YAML into models (checklist line added there).
 - [phase 3] LLM calls are not replayed from the trace, so a crash between the model answering and the checkpoint committing re-asks and re-pays for the question and may get a different answer, should-fix (named by the phase-3 self-critique as fragility item 1 and endorsed by its review; every review finding V1 to V11 is fixed, this is the one open item promoted from the critique), deferred to phase 7, which owns replay and the trace endpoint; the cache key - the step id - is already on `NodeRuntime` (checklist line added there).
-- [phase W] The web chat endpoints have no authentication: a session key is an unguessable token and is the whole of the access control, with no WebSocket origin check, no CSRF defence on the webhook, no rate limit and no webhook signature verification, should-fix, deferred to phase 7, which owns the channel surface and adds a desk API where the same gap would expose somebody else's conversation (checklist line added there).
+- [phase W] The web chat endpoints have no authentication: a session key is an unguessable token and is the whole of the access control, with no WebSocket origin check, no CSRF defence on the webhook, no rate limit and no webhook signature verification, should-fix, deferred to phase 7, which owns the channel surface. **Re-opened and half closed by the phase W review**: the deferral's stated premise was that phase 7 "adds a desk API where the same gap would expose somebody else's conversation", and phase 6 had already shipped that desk on this listener, on by default and open (finding W1). The desk half is fixed - off by default, bearer token required, missing credential refuses to start. The customer's own key, the origin check, the rate limit and the webhook signature are still phase 7's. The key at least no longer travels in the URL (finding W9).
+- [phase W] W1's remainder: one shared desk token is not per-operator identity, rotation, or an audit of who did what, should-fix, deferred to phase 7, which owns this surface. The desk already takes a `human_id` on every action, so the audit half has a place to go; what is missing is anything that makes the `human_id` believable (checklist line added there).
+- [phase W] W16's replacement: an inbound message's transport detail (`Message-ID`, `References`) still cannot reach `send`, and `InboundMessage.customer_ref` still does not reach `ctx.customer`, and an adapter still cannot refuse a delivery, should-fix, deferred to phase 7, which writes the email adapter that needs all three. The misleading `metadata` field is gone rather than left as a seam that could not work (three checklist lines added there).
 - [phase W] Live delivery is process-local - the connection registry is a dictionary in one process - so with two app processes a customer sees a turn run elsewhere only when they reconnect, should-fix, deferred to phase 7; nothing is lost (the messages are rows and a reconnecting client is sent the transcript) but DESIGN.md 4.1's horizontal scaling claim is not yet true of delivery (checklist line added there).
 - [phase W] Outbound delivery has no message identity and no turn boundary: a crash between the checkpoint and the send re-offers every pending row with nothing a transport could de-duplicate on, and an adapter is handed messages several times per turn, so DESIGN.md 12's "batched per turn into one email" cannot be expressed, should-fix, deferred to phase 7, which writes the email adapter that needs both (checklist line added there).
 - [phase 0] N12: `doc_chunk.embedding` is dimensionless, so no HNSW index is possible and mixed-dimension rows fail only at query time, nit (admitted by the implementer, measured by the reviewer), deferred to phase 5 which picks the embedding model (checklist line added there).
@@ -407,6 +435,76 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
 ---
 
 ## Decisions log
+
+- 2026-09-07: **the human desk is off unless a deployment turns it on, and cannot be turned on
+  without a credential** (phase W review finding W1, a must-fix). It was mounted on the customer
+  chat's own application and port, on by default, with no authentication - so an anonymous
+  browser listed every conversation in the deployment, read another customer's transcript and
+  handoff packet, and wrote into it, and could countersign its own `requires_human_approval`
+  action. Three parts, and the order is what makes it a fix rather than a hiding place: the
+  default is off, so a deployment that configures nothing serves no desk; `serve_desk` on with no
+  `desk_token` raises at `create_app`, so a missing credential stops the application rather than
+  opening a desk; and the token is checked on the *router*, so a route added later is behind it
+  by construction rather than by whoever writes it remembering.
+
+  It stays on the same application rather than moving to its own port, and that is the part worth
+  writing down, because DESIGN.md section 12 calls the desk "not a customer channel". Three
+  reasons. Section 4.1 makes a deployment one service and section 12 says the desk "uses the same
+  API surface", so a second listener is a change to the design rather than a reading of it. The
+  connection registry is a dictionary in one process, so a desk `reply` reaches a customer's open
+  socket only from the process holding it - splitting the desk out today would quietly stop
+  delivering a human's reply, trading a hole that is now closed for a regression that is not. And
+  the exposure was never the shared port: it was a default that served customer data to anyone
+  who asked, and a shared port with a credential is what every admin API on a service port is.
+  Phase 7 owns both the `LISTEN/NOTIFY` fan-out and this surface and can split it then, with a
+  checklist line saying so.
+
+  One shared token, not operator accounts. It is the smallest thing that makes the failure mode a
+  refusal, which is what the finding asks for; identity, rotation and an audit of who did what
+  are phase 7's, and the desk already takes a `human_id` on every action for the last of those.
+
+- 2026-09-07: **the pending inbound queue is ordered by a number the database hands out, not by a
+  timestamp** (phase W review finding W4). `message.queue_seq` is claimed from
+  `conversation.inbound_seq` by an `UPDATE ... RETURNING` that takes the conversation's row lock,
+  so concurrent callers serialise there and leave with distinct, increasing numbers (migration
+  `0009`, with a backfill). The old ordering was `created_at, id`: `created_at` is the
+  *transaction start* timestamp, identical to the microsecond for two callers who arrive
+  together, and the tie then fell to a random UUID - the reviewer posted two messages at once in
+  a known order, got them back in the other one, and watched the second run against a
+  conversation the first had not started, which parked the run for good.
+
+  What this does and does not claim. It does not claim to know which of two simultaneous requests
+  "should" be first; they were simultaneous, and no clock in the database can answer that. It
+  claims there is exactly *one* order, that every caller has a place in it, that the place is
+  decided when the row is written rather than reconstructed afterwards from a clock, and that the
+  drain follows it. Phase 2's review found two message-loss bugs of this family and fixed both in
+  durable state rather than in timing; a reorder that dead-ends a conversation is the same class
+  of problem and this is the same kind of fix. The cost is that concurrent messages on *one*
+  conversation serialise for the length of a transaction that writes one row.
+
+- 2026-09-07: **a turn that fails tells the customer so** (phase W review finding W6). Every
+  DESIGN.md 7.3 failure path already parked the run and paged a person; the turn that did it said
+  nothing at all, so a web chat client had a status pill to render and an email customer had
+  silence after asking a question. `Executor._handoff` now emits the same sentence a `handoff`
+  node emits, chosen by the same rule - `DEFAULT_HANDOFF_MESSAGE` when a human was told,
+  `HANDOFF_UNDELIVERED_MESSAGE` when nobody was - and no failure detail, because what went wrong
+  belongs in the packet a person reads and not in the customer's transcript.
+
+- 2026-09-07: **the web chat session key travels in the socket's first frame, and connecting
+  creates nothing** (phase W review findings W9 and W8). The key was in the query string, where
+  uvicorn writes it verbatim into the access log and so would any proxy, CDN or APM in front of
+  it - and the key is the whole of this channel's access control, so the one secret a customer
+  holds was being written down by four systems with no use for it. The client now opens with
+  `{"type": "hello", "session": "<key>"}`, or `{"type": "hello"}` to be given one. The
+  `Sec-WebSocket-Protocol` header was the other candidate and was rejected because a subprotocol
+  value is an HTTP token and a session key may contain `:`.
+
+  Connecting no longer creates a `conversation` and a `run` before the customer has said
+  anything: a connect resolves the key and reports an empty conversation, and the first *message*
+  creates the row. A connection with no conversation yet waits in the registry under its channel
+  key and is attached when somebody's message creates it, which is what keeps two tabs opened
+  together on a fresh key - and a tab watching while the first message arrives by `POST` -
+  receiving what the conversation says.
 
 - 2026-09-06: **when no sink takes a handoff packet, the customer is told so**, in core's words
   rather than the pack's. The handoff hook now answers whether a human was actually told, and a
