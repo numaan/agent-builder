@@ -12,7 +12,11 @@ support_core/        the library; one subpackage per DESIGN.md section 18 entry
   storage/           SQLAlchemy models, Alembic migrations, the engine's repositories
   graph/             pack manifest, graph schema, expression language, templates, validator
   engine/            the turn loop, frame stack, checkpoints, advisory lock, node runners
+  channels/          the channel adapter protocol and the web chat adapter (DESIGN.md 12)
+  api/               create_app, the health endpoint, the web chat endpoints, the demo client
   cli/               the `support` command
+app.py               the service, as DESIGN.md 4.1 writes it: create_app(load_pack(...))
+demo/                configuration for the demo: which pack, which provider, which customer
 packs/acme_billing/  sample domain pack (DESIGN.md section 5 layout)
 tests/               pytest suite; database tests run against real Postgres
   packs/             reference packs the validator and engine tests load
@@ -144,6 +148,51 @@ optional values and a state field typed as a pack model.
 `support pack knowledge sync`, `support pack eval` and `support replay` exist but exit with
 status 3 and name the phase that delivers them.
 
+## Running the demo
+
+A browser, a conversation, and a refund that stops for your approval before it moves any money.
+Three commands from a clean checkout, run from the repository root:
+
+```sh
+sh scripts/db-up.sh                                       # Postgres 16 + pgvector on 5432
+python -m alembic upgrade head                            # create the schema
+SUPPORT_APP_CONFIG=demo/acme_web_chat.json python -m uvicorn app:app --port 8000
+```
+
+Then open <http://127.0.0.1:8000/>. On Windows use `.venv/Scripts/python.exe` in place of
+`python` (Git Bash accepts the `VAR=value command` prefix); on Linux or macOS use `.venv/bin/python`.
+
+The page offers the four messages of the recorded conversation as buttons. Send them in order:
+
+1. *I got charged twice for the Pro Plan this month; can I have one of them back?*
+2. *The code is 581139.*  (the passcode the pack's fake sends to `me@example.com`)
+3. *Yes please, go ahead and refund it.*
+4. *No, that is all. Thanks!*
+
+What to watch for: the workflow verifies the customer's identity **before** it looks at the
+account; the proposed refund appears in a bordered panel that names the tool it is asking to run
+(`issue_refund`) and quotes the exact proposal the approval is bound to; nothing happens until
+you answer it. Reload the page mid-conversation and the transcript comes back and the
+conversation carries on - it is identified by a session key, not by the connection.
+
+Two things worth knowing:
+
+- **Say the recorded messages.** With no `ANTHROPIC_API_KEY` the app answers from the cassettes
+  in `tests/cassettes/`, which are keyed by the SHA-256 of the whole prompt: an unrecorded
+  message is refused rather than guessed at, and the conversation ends up waiting for a human.
+  Use the buttons. With `ANTHROPIC_API_KEY` set, the same configuration (`"provider": "auto"`)
+  uses the live model instead and you can type whatever you like.
+- **Restart the app to run the refund again, and run one process.** The sample pack's billing
+  system and passcodes are in-memory fakes seeded at startup (`packs/acme_billing/tools`), so a
+  charge that has been refunded stays refunded until the process restarts, and a second worker
+  would have a second, different account.
+
+`GET /healthz` reports the pack, its fingerprint, the provider in use and whether the database is
+reachable. The channel endpoints are `WS /channels/web_chat/ws?session=<key>` and
+`POST /channels/web_chat/messages` with `{"session": "...", "text": "..."}`; the POST answers
+`202` with `"queued": true` when another turn holds that conversation's lock, rather than holding
+the connection until it frees.
+
 ## Running a conversation
 
 ```python
@@ -209,10 +258,15 @@ What the engine guarantees (DESIGN.md 7.1 to 7.3, 17), and what it does not yet 
 - **A rolling summary every K turns** (`memory.summarize_every_turns`), stored on the
   conversation with the turn it covers. It is prompt context only: nothing a turn depends on is
   read from it, and a lost summary changes no durable outcome.
+- **A message reaches the customer only after the checkpoint that wrote it commits.** A channel
+  adapter (DESIGN.md 12) is given committed messages and nothing else, so nobody sees text that
+  an outbound guardrail (phase 7) would have stopped; delivery towards a channel is
+  at-least-once, and a transport that fails cannot abort the turn behind it. `create_app` serves
+  the web chat channel; the email adapter and the desk are phase 7 and implement the same
+  protocol.
 - Everything a later phase owns is a hook on `EngineHooks` with a default that does nothing
   surprising: the interrupt check answers `continue` (phase 6), handoff records nothing but the
-  run still parks for a human (phase 6), no summary is written unless one is wired up, and
-  outbound messages stay `pending_send` because there is no channel adapter (phase 7). A
+  run still parks for a human (phase 6), and no summary is written unless one is wired up. A
   `handoff` node refuses to run and names its phase.
 
 ## Writing a pack's graphs
