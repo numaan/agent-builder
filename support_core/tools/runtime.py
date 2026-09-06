@@ -152,34 +152,48 @@ class ToolRuntime:
             known = ", ".join(self.registry.names) or "none"
             msg = f"no tool named {tool_name!r} is registered by this pack; it exports {known}"
             raise ToolRefused(msg)
-        if allowed is not None and tool_name not in allowed:
-            msg = (
-                f"{site.node_id}: {tool_name!r} is not a tool this step may call "
-                f"({', '.join(allowed) or 'none'})"
-            )
-            raise ToolRefused(msg)
-        if caller == "model_loop" and tool.risk not in MODEL_CALLABLE:
-            # The read-only gateway of DESIGN.md 8.4 refused this already. Refusing it a second
-            # time is deliberate: the gateway is one object away from the model, and this is the
-            # object that would otherwise do the thing.
-            msg = (
-                f"{tool_name!r} is {tool.risk.value} risk and cannot be called from a model tool "
-                f"loop; DESIGN.md section 8.2 allows read-tier tools there and nothing else"
-            )
-            raise ToolRefused(msg)
-
-        args_hash, canonical = hash_for(tool, args)
         key = site.step_id + key_suffix
+        canonical: dict[str, Any] = {}
+        try:
+            if allowed is not None and tool_name not in allowed:
+                msg = (
+                    f"{site.node_id}: {tool_name!r} is not a tool this step may call "
+                    f"({', '.join(allowed) or 'none'})"
+                )
+                raise ToolRefused(msg)
+            if caller == "model_loop" and tool.risk not in MODEL_CALLABLE:
+                # The read-only gateway of DESIGN.md 8.4 refused this already. Refusing it a
+                # second time is deliberate: the gateway is one object away from the model, and
+                # this is the object that would otherwise do the thing.
+                msg = (
+                    f"{tool_name!r} is {tool.risk.value} risk and cannot be called from a model "
+                    f"tool loop; DESIGN.md section 8.2 allows read-tier tools there and nothing "
+                    f"else"
+                )
+                raise ToolRefused(msg)
 
-        claim = await self._claim(
-            tool=tool,
-            canonical=canonical,
-            args_hash=args_hash,
-            site=site,
-            key=key,
-            requires_approval=requires_approval,
-        )
+            args_hash, canonical = hash_for(tool, args)
+
+            claim = await self._claim(
+                tool=tool,
+                canonical=canonical,
+                args_hash=args_hash,
+                site=site,
+                key=key,
+                requires_approval=requires_approval,
+            )
+        except ToolRefused as exc:
+            # An attempt that never claimed its key leaves no ``tool_call`` row, because the
+            # refusal rolls the claim back so a refused call does not burn the key. That is
+            # right, and it left "show me every attempted movement of money" answerable only
+            # from ``trace_step.error`` - the wrong table for DESIGN.md section 20's compliance
+            # story (review finding R6). A side-effecting tool's refusal is now recorded on a
+            # key of its own, which cannot collide with the real claim.
+            await self._record_refusal(tool, site, canonical, key, str(exc))
+            raise
         if claim.refusal is not None:
+            # A re-entry refusal already has a row - the one it re-entered, now marked - so
+            # there is nothing to record here.
             raise claim.refusal
         if claim.replay is not None:
             return claim.replay
@@ -346,7 +360,13 @@ class ToolRuntime:
             node_id=requires_approval,
             tool=tool.name,
             args_hash=args_hash,
-            approved_by=("customer", "human"),
+            # ``customer`` only, so the two consumes below cannot compete for one row (review
+            # finding R7). Accepting a human's row here made the outcome of a
+            # ``requires_human_approval`` tool depend on which approval was recorded first:
+            # a human who approved before the customer had their row eaten by this query and
+            # the second one then found nothing. It failed safe in every ordering, but by
+            # accident rather than by rule.
+            approved_by=("customer",),
             now=now,
             tool_call_id=tool_call_id,
         )
@@ -592,6 +612,38 @@ class ToolRuntime:
             msg = f"{tool.name!r} patched ctx.customer with something it cannot hold: {exc}"
             raise ToolFailed(msg) from exc
         return output_json, merged
+
+    async def _record_refusal(
+        self, tool: Tool, site: CallSite, canonical: Mapping[str, Any], key: str, error: str
+    ) -> None:
+        """Write a ``refused`` row for a call that never claimed its key (finding R6).
+
+        Only for a tool that could have a side effect: a READ tool refused from a model loop is
+        the loop working as designed, and the gateway already counts it. The key carries a
+        suffix that no step id can produce, so it can never be mistaken for - or collide with -
+        the claim of a real call; a second attempt under the same step writes a second row,
+        which is the truth about a second attempt.
+        """
+        if tool.risk not in SIDE_EFFECTING:
+            return
+        now = self.clock()
+        async with self.sessions() as session, session.begin():
+            await repo.start_tool_call(
+                session,
+                repo.ToolCallStart(
+                    idempotency_key=f"{key}#refused:{uuid.uuid4().hex[:12]}",
+                    run_id=site.run_id,
+                    step_id=site.step_id,
+                    node_id=site.node_id,
+                    tool=tool.name,
+                    risk=tool.risk.value,
+                    args=dict(canonical),
+                    created_at=now,
+                    status="refused",
+                    error=error,
+                    finished_at=now,
+                ),
+            )
 
     async def _fail(self, tool_call_id: uuid.UUID, error: str) -> None:
         async with self.sessions() as session, session.begin():

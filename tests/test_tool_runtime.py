@@ -169,6 +169,168 @@ async def test_a_tool_needing_human_approval_is_refused_without_one(engine: Asyn
         assert unconsumed.scalar_one() == 1
 
 
+async def test_a_human_who_approved_first_still_satisfies_the_human_requirement(
+    engine: AsyncEngine,
+) -> None:
+    """Review finding R7: the two consumes must not compete for one row.
+
+    ``requires_human_approval`` takes a customer's approval *and* a human's. While the first
+    query accepted either, a human who approved before the customer had their row taken by it,
+    and the second query then found nothing - so the outcome depended on the order the rows
+    happened to be written in rather than on the rule. Approving in that order now works, and
+    both rows are spent.
+    """
+    conversation_id, run_id = await conversation_and_run(engine)
+    args = canonical_args(CHARGE, {"amount": 5.0})
+    await approve(
+        engine,
+        conversation_id=conversation_id,
+        run_id=run_id,
+        tool="human_only",
+        args=args,
+        step="step-desk",
+        approved_by="human",
+    )
+    await approve(
+        engine, conversation_id=conversation_id, run_id=run_id, tool="human_only", args=args
+    )
+
+    result = await runtime(engine).invoke(
+        tool_name="human_only",
+        args={"amount": 5.0},
+        site=site(conversation_id, run_id),
+        caller="tool_node",
+        requires_approval="confirm_it",
+    )
+
+    assert result.output_json["total"] == 5.0
+    async with engine.connect() as connection:
+        live = await connection.execute(
+            text("SELECT count(*) FROM action_approval WHERE consumed_at IS NULL")
+        )
+        assert live.scalar_one() == 0, "one customer decision and one human decision, both spent"
+
+
+async def test_re_recording_a_confirm_step_does_not_leave_args_and_hash_disagreeing(
+    engine: AsyncEngine,
+) -> None:
+    """Review finding R5: the stored ``args`` is what a human reads instead of a sha256.
+
+    ``record_approval`` is idempotent under ``(run_id, step_id)`` so a re-executed confirm step
+    records one approval rather than two. It used to update the hash and nothing else, which
+    could leave the hash describing one action and the arguments another. Now the first write
+    stands - the one made when the customer was actually asked.
+    """
+    conversation_id, run_id = await conversation_and_run(engine)
+    first = await approve(
+        engine,
+        conversation_id=conversation_id,
+        run_id=run_id,
+        tool="charge",
+        args=canonical_args(CHARGE, {"amount": 29.0}),
+        step="step-confirm",
+    )
+    again = await approve(
+        engine,
+        conversation_id=conversation_id,
+        run_id=run_id,
+        tool="charge",
+        args=canonical_args(CHARGE, {"amount": 2900.0}),
+        step="step-confirm",
+    )
+
+    assert again == first, "one approval, not two"
+    async with engine.connect() as connection:
+        rows = list(
+            (
+                await connection.execute(text("SELECT args, args_hash, tool FROM action_approval"))
+            ).mappings()
+        )
+    assert len(rows) == 1
+    assert rows[0]["args"] == {"amount": 29.0, "label": None}
+    assert rows[0]["args_hash"] == approval_hash("charge", canonical_args(CHARGE, {"amount": 29.0}))
+
+
+# -- what a refused call leaves behind (DESIGN.md section 20) -----------------------------
+
+
+async def test_a_refused_write_leaves_a_row_in_the_table_built_for_tool_calls(
+    engine: AsyncEngine,
+) -> None:
+    """Review finding R6: "show me every attempted movement of money" needs this table.
+
+    The claim is still rolled back, so the refusal does not burn the idempotency key and the
+    call can be made properly later. The record of the attempt is written separately, under a
+    key no step id can produce.
+    """
+    conversation_id, run_id = await conversation_and_run(engine)
+    where = site(conversation_id, run_id)
+    with pytest.raises(ToolRefused, match="no live approval"):
+        await runtime(engine).invoke(
+            tool_name="charge",
+            args={"amount": 29.0},
+            site=where,
+            caller="tool_node",
+            requires_approval="confirm_it",
+        )
+
+    async with engine.connect() as connection:
+        recorded = await connection.execute(
+            text(
+                "SELECT idempotency_key, tool, args, risk, status, error, node_id, step_id, "
+                "       run_id, finished_at "
+                "FROM tool_call ORDER BY created_at"
+            )
+        )
+        rows = [dict(row) for row in recorded.mappings()]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["status"] == "refused"
+    assert row["tool"] == "charge"
+    assert row["args"] == {"amount": 29.0, "label": None}, "what was attempted, in full"
+    assert row["risk"] == "high"
+    assert "no live approval" in row["error"]
+    assert row["run_id"] == run_id and row["step_id"] == where.step_id
+    assert row["finished_at"] is not None
+    assert row["idempotency_key"].startswith(f"{where.step_id}#refused:")
+    assert row["idempotency_key"] != where.step_id, "the real key is still unclaimed"
+
+    # And the key really is still available: the properly approved call can now be made.
+    await approve(
+        engine,
+        conversation_id=conversation_id,
+        run_id=run_id,
+        tool="charge",
+        args=canonical_args(CHARGE, {"amount": 29.0}),
+    )
+    result = await runtime(engine).invoke(
+        tool_name="charge",
+        args={"amount": 29.0},
+        site=where,
+        caller="tool_node",
+        requires_approval="confirm_it",
+    )
+    assert result.idempotency_key == where.step_id
+    assert LEDGER.executed == [("charge", 29.0)]
+
+
+async def test_a_refused_read_does_not_fill_the_table_with_rows(engine: AsyncEngine) -> None:
+    """Only a side-effecting tool's refusal is recorded; a model asking for a read it may not
+    have is the loop working, and the gateway already counts it against the turn's budget."""
+    conversation_id, run_id = await conversation_and_run(engine)
+    with pytest.raises(ToolRefused, match="not a tool this step may call"):
+        await runtime(engine).invoke(
+            tool_name="peek",
+            args={"amount": 1.0},
+            site=site(conversation_id, run_id),
+            caller="tool_node",
+            allowed=("nudge",),
+        )
+    async with engine.connect() as connection:
+        count = await connection.execute(text("SELECT count(*) FROM tool_call"))
+        assert count.scalar_one() == 0
+
+
 # -- the approval binding (DESIGN.md section 8.2) -----------------------------------------
 
 

@@ -92,16 +92,16 @@ Exit criterion: `packs/acme_billing` has a `root.yaml` with a classify node and 
 Design: sections 8.1 to 8.4, 6.2 (`tool`, `confirm`, `gate`), 6.4.
 
 - [x] `Tool`, `Risk`, `ToolContext`; registry with duplicate and schema checks. (`support_core/tools/base.py`, `registry.py`; `FunctionTool` wraps a coroutine for packs that would rather not subclass. `ToolContext.patch_customer` is how DESIGN.md 19 step 9's `verify_otp` sets `ctx.customer.identity_verified` without a node writing `ctx`.)
-- [x] Risk policy enforcement in the runtime, not in prompts: READ only from llm loops, WRITE and HIGH only from tool nodes with approval, `confirm_exempt` reporting. (`support_core/tools/runtime.py`. The tier check is made twice - once in phase 3's gateway, once in the runtime - so a bug in the gateway is not sufficient to execute a write.)
+- [x] Risk policy enforcement in the runtime, not in prompts: READ only from llm loops, WRITE and HIGH only from tool nodes with approval, `confirm_exempt` reporting. (`support_core/tools/runtime.py`. The tier check is made twice - once in phase 3's gateway, once in the runtime - so a bug in the gateway is not sufficient to execute a write, and since review finding R2 the node's declared tool list is checked in both places too.)
 - [x] Idempotency: `tool_call` row keyed by step id; at-most-once for non-idempotent tools. (The row is claimed *before* the call, so a dead process leaves a `running` row - a call whose outcome nobody knows - and a non-idempotent tool is then refused rather than repeated. `tests/test_tool_crash_recovery.py` kills a real OS process inside the tool, after the side effect and before the record.)
 - [x] Migration adding `run_id` (FK, indexed) and `step_id` to `tool_call` so calls can be joined to a run and conversation without parsing the idempotency key (phase 0 deferred finding F6). (Migration `0006`, which also adds `node_id`, `error`, `attempts`, `finished_at` and `context_patch`.)
 - [x] `confirm` node computing `sha256(tool_name + canonical_json(args))`, storing `action_approval`, yes/no edges. (`ConfirmRunner`. The hash is taken when the proposal is *shown* and travels with the suspension, so the customer's answer is read against what they were asked; a difference re-presents rather than approving. The yes/no reading is the `confirm_decision` hook, with a conservative keyword default and `StructuredConfirmClassifier` where a provider is configured - and a third answer, `unclear`, which asks again.)
 - [x] `action_approval` is single-use: `consumed_by_tool_call_id`/`consumed_at`, and a consumed approval is treated as absent; covered by the adversarial tests (phase 0 deferred finding N1). (Also bound to the run, the frame and the confirm node, so an approval from an earlier invocation of the same graph is refused before single use has to catch it.)
 - [x] `tool` node with `args` expressions, `into` mapping, `on_error`, `requires_approval` hash check. (`ToolRunner`; both `into` forms, and a refusal or a failure is a `NodeError` with a distinguishable `reason`.)
 - [x] `gate` node pushing the redirect graph and re-evaluating. (Executable since phase 2; `tests/test_adversarial_approvals.py` shows the re-check stopping a refund whose identity stopped holding while the confirmation was suspended.)
-- [x] Async tools completing via callback (`waiting_async_tool`). (`Tool.async_`; the node suspends after the dispatch and `Executor.resume_async_tool` completes the row.)
+- [x] Async tools completing via callback (`waiting_async_tool`). (`Tool.async_`; the node suspends after the dispatch and `Executor.resume_async_tool` completes the row. The dispatch's idempotency key travels on the suspension, because the step id computed when the callback arrives names a later attempt - review finding R1, and the reason the path had never completed end to end. `tests/test_async_tool_flow.py` drives it through the executor.)
 - [x] MCP adapter with mandatory risk map, unknown tools default HIGH. (`support_core/tools/mcp.py`, over a client protocol the `mcp` package's `ClientSession` satisfies; a wrapped tool is an ordinary `Tool`, so the same registry, approval binding and idempotency key apply.)
-- [x] Sample pack tools: `list_recent_charges`, `get_charge`, `check_refund_eligibility`, `issue_refund`, `send_otp`, `verify_otp`, backed by an in-memory fake billing system. (`packs/acme_billing/tools/`. `issue_refund` is HIGH and *not* idempotent, which is the honest setting for money.)
+- [x] Sample pack tools: `list_recent_charges`, `get_charge`, `check_refund_eligibility`, `issue_refund`, `send_otp`, `verify_otp`, backed by an in-memory fake billing system. (`packs/acme_billing/tools/`. `issue_refund` is HIGH and *not* idempotent, which is the honest setting for money. `verify_otp` gives the customer three wrong guesses and then stops checking, because a six-digit code with unlimited attempts is not a verification and it is what opens the refund gate - review finding R3.)
 - [x] `verify_identity.yaml` and `refund.yaml` graphs from section 6.4. (In `packs/acme_billing/graphs/`, reachable from `root.yaml`'s new `refund` edge.)
 - [x] The registry built from the imported `TOOLS` is authoritative for risk tiers; the validator reports drift against `tools/tools.yaml` (phase 1 deferred finding I: a HIGH tool declared `read` removes every check today). (`support_core/graph/tools_source.py`: a tier that disagrees is `tools.registry_drift` (ERROR), a shape that disagrees `tools.declaration_stale` (WARNING), and a pack that declares tools but exports none `tools.declared_not_exported` (WARNING).)
 - [x] The engine's approval hash classifies scalars with the same `parse_value` rule the validator canonicalises with, so a static pass is not followed by a run-time refusal (phase 1 review F7, run-time half). (Both nodes evaluate their arguments through `value_of`, which is `parse_value`, and then coerce through the tool's own input model - so `{amount: 100}` and `{amount: 100.0}` are the same call and `{amount: "100"}` is not.)
@@ -155,6 +155,7 @@ Design: sections 6.5, 6.6, 13, 7.3.
 - [ ] Desk API: list handoffs, reply, resume with state patch, close.
 - [ ] All failure paths from section 7.3 route to handoff with the right reason.
 - [ ] Revisit the confirm-coverage control-flow graph for interrupts: model the interrupt push and the return-and-resume, and make `graph.subgraph_cycle` check the cycle path rather than the whole graph (phase 1 deferred finding N3).
+- [ ] An `on_error` edge that returns to its own `tool` node repeats the call under a fresh idempotency key. Harmless for a tool with an approval (spent) and bounded for a non-idempotent one, but a `confirm_exempt` WRITE tool repeats its side effect once per failure and the validator says nothing (phase 4 resolution, the shape behind finding R1). Decide whether it is a load-time finding, a per-node attempt cap, or both, while rebuilding the failure routing of DESIGN.md 7.3.
 - [ ] `update_address.yaml` graph in the sample pack.
 
 Exit criterion: the section 19 worked example runs end to end with the fake provider as an integration test, including the interrupt at step 7 and the secondary intent at step 15.
@@ -196,7 +197,8 @@ Design: sections 9.1 (knowledge graph), 10, 20, 4.1.
 - [ ] `KnowledgeGraphRetriever` over `kg_entity` and `kg_relation`, entity extraction via structured call, one to two hop expansion, rendered passages with locators.
 - [ ] Knowledge graph ingestion from YAML in `support pack knowledge sync`.
 - [ ] Customer memory as a WRITE-tier internal tool; never treated as identity.
-- [ ] Per-conversation cost cap and per-turn tool call cap enforced by the engine; cheap model for interrupt checks and summaries.
+- [ ] Per-conversation cost cap and per-turn tool call cap enforced by the engine; cheap model for interrupt checks and summaries. Includes phase-4 finding R9: `max_tool_calls_per_turn` counts model-loop calls only, so a graph that walks five `tool` nodes spends none of it. Widening the counter changes what an existing manifest key means, so record the compatibility decision with it.
+- [ ] Let a graph's `state:` name a model the pack's tools export, so `state.charge: Charge` type-checks instead of degrading to `Any` (phase-4 finding R8). The loader and the validator both have to carry the pack's registry to do it, which is the same plumbing the registry scoping below needs.
 - [ ] Graph version migration hook (section 6.7) with a test that a changed state shape triggers handoff when no hook exists.
 - [ ] Scope the node type registry per `Pack` (a `Pack.node_types` consulted by `build_runner` and by the loader that parses node YAML), so two packs loaded side by side cannot fight over one name (phase 2 review finding R6). Refusing a conflicting duplicate registration is already in place; the registry itself is still process-wide, and `NODE_TYPES` is what parses YAML, so the loader and validator have to carry it too.
 - [ ] Split into two distributable packages: `support-core` and the sample pack depending on a pinned version; Dockerfile for the pack.
@@ -231,6 +233,9 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
 - [phase 2] R6 (registry-scoping half): `register_node_type` writes into one process-wide table, so DESIGN.md 6.7's two pack versions side by side, and phase 9's core/pack split, can still collide over a node type name - a conflicting duplicate is now refused loudly rather than silently overwriting, which is the safe half, nit, deferred to phase 9. Scoping the registry per `Pack` means the loader and the validator carry it too, because `NODE_TYPES` is what turns node YAML into models (checklist line added there).
 - [phase 3] LLM calls are not replayed from the trace, so a crash between the model answering and the checkpoint committing re-asks and re-pays for the question and may get a different answer, should-fix (named by the phase-3 self-critique as fragility item 1 and endorsed by its review; every review finding V1 to V11 is fixed, this is the one open item promoted from the critique), deferred to phase 7, which owns replay and the trace endpoint; the cache key - the step id - is already on `NodeRuntime` (checklist line added there).
 - [phase 0] N12: `doc_chunk.embedding` is dimensionless, so no HNSW index is possible and mixed-dimension rows fail only at query time, nit (admitted by the implementer, measured by the reviewer), deferred to phase 5 which picks the embedding model (checklist line added there).
+- [phase 4] R8: `refund.yaml`'s `state.charge: Charge` names a model the pack's tools export, which core cannot resolve, so it is typed `Any` and `state.charge.amount` is unchecked in both the confirm action and the tool args (`graph.state_type_unresolved`), nit, deferred to phase 9. No money risk - the two expressions are identical, `graph.approval_args_mutated` covers the path between them, and the hash is taken over arguments coerced through the tool's input model at both ends. Both fixes are bigger than a resolution pass should carry: flattening the state rewrites the arguments of the one HIGH-risk call in the pack, and letting a graph name a pack-exported model is loader work that belongs with phase 9's core/pack split (checklist line added there).
+- [phase 4] R9: the per-turn tool budget counts only model-loop calls, so a graph that walks five `tool` nodes spends none of `max_tool_calls_per_turn` and only `max_nodes_per_turn` bounds it, nit, deferred to phase 9 on the reviewer's own recommendation: widening the counter changes what an existing manifest key means, which is a compatibility decision rather than a fix, and phase 9 owns the cost caps (checklist line added there).
+- [phase 4] An `on_error` edge that returns to its own `tool` node re-enters at the next attempt, claims a fresh idempotency key, and calls the tool again. For a tool that needs an approval the second attempt is refused (the approval was spent by the first), and for a non-idempotent tool the at-most-once rule applies within one key - but a `confirm_exempt` WRITE tool with such an edge repeats its side effect once per failure, and nothing at load says so. Found while fixing R1, which is one instance of it; the async instance is closed, the shape is not. Should-fix, deferred to phase 6, which owns DESIGN.md 7.3's failure routing and the `handoff` node that a self-returning `on_error` is usually standing in for (checklist line added there).
 
 ---
 
@@ -247,7 +252,28 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
   approval from an earlier trip through the same graph is refused before single use has to catch
   it, and neither binding can be satisfied by getting the arguments right.
 
-- 2026-09-06: a **tool may change `ctx.customer`**, and nothing else may. DESIGN.md 19 step 9
+- 2026-09-06: a tool **declares which `ctx.customer` fields it may change**, in a
+  `patches_context` frozenset on `Tool`, and a patch outside the declaration fails the call
+  (phase-4 review finding R4). This adds a field DESIGN.md 8.1's class does not have, which is
+  why it is written down here: the decision below establishes that *a tool* is the thing that
+  may change the customer, and this narrows it from "any WRITE or HIGH tool may set any field,
+  `identity_verified` included" to "the tool that checks the passcode may set
+  `identity_verified`". The difference is the whole identity gate, because a WRITE tool may also
+  be `confirm_exempt`, so nothing else stood between a careless tool and a verified customer.
+  Empty is the default and the names are checked against `CustomerContext` when the tool is
+  built, so a typo is a load error rather than a patch that silently never lands.
+
+- 2026-09-06: an async `tool` node **carries the idempotency key its dispatch claimed on the
+  suspension**, and `complete_async` takes it explicitly (phase-4 review finding R1). The step
+  id is `run_id:frame_seq:node_id:attempt` and the checkpoint that records a suspension
+  increments the attempt, so a key derived from the site as it stands when the callback arrives
+  names a call nobody claimed - which stranded the `tool_call` row and, on a graph whose
+  `on_error` returned to the tool node, dispatched a second time. The same device the `confirm`
+  node already uses for its argument hash: what the resuming pass needs is what the suspending
+  pass knew, and durable state is the only place the two meet. The key is checked rather than
+  trusted - the row it names must belong to this run, this node and this tool.
+
+- 2026-09-06: a tool **may change `ctx.customer`**, and nothing else may. DESIGN.md 19 step 9
   has `verify_otp` set `ctx.customer.identity_verified` while 6.1 says `ctx` is read-only *to
   nodes*; both hold if the node does not write it and the tool does, through
   `ToolContext.patch_customer`, with the engine committing the patch in the checkpoint

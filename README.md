@@ -237,6 +237,19 @@ Three things are worth knowing before the first one:
 - **`confirm_exempt`** (DESIGN.md 8.2, for a side effect the customer cannot be asked about,
   such as a passcode) is available on `write` tools only, requires a written reason, and is
   reported as a warning so `--strict` fails until somebody has looked at it.
+- **`patches_context`** names the `ctx.customer` fields a tool may change, and it is empty by
+  default. A tool that patches a field it did not declare fails the call. `verify_otp` declares
+  `identity_verified` because setting it is what the tool is *for*; nothing else in the sample
+  pack declares anything.
+
+**A pack author is inside the trust boundary, so reviewing a pack is a security review.**
+Everything above constrains the model, the customer and the graph - the model cannot act, the
+customer's yes is bound to exact arguments, the graph cannot route around the runtime. None of
+it constrains the pack's Python. A tool runs in-process with the service's credentials, and the
+tier it declares is the tier it gets: a tool that says `read` and moves money is callable from a
+model loop with no confirmation, and core cannot tell. That is the boundary DESIGN.md 4.1 draws
+(one domain, one repository, one image, one service) and it is a deliberate one, but it means
+`tools/` deserves the same attention as the code that reads it.
 
 The rule that matters most: a `write` or `high` risk tool node must have a `confirm` node on every
 path from the last customer input, and must name that confirm in `requires_approval` with matching

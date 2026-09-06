@@ -300,7 +300,10 @@ class ToolCall(Base):
         ForeignKey("action_approval.id", ondelete="SET NULL")
     )
     status: Mapped[str] = mapped_column(nullable=False, server_default="pending")
-    """``running``, ``succeeded``, ``failed``, ``awaiting_callback`` or ``indeterminate``."""
+    """``running``, ``succeeded``, ``failed``, ``awaiting_callback``, ``indeterminate`` - or
+    ``refused``, an attempt the runtime would not run at all, recorded on a key of its own so
+    that "every attempted movement of money" is answerable from this table rather than only
+    from ``trace_step.error`` (review finding R6)."""
 
     error: Mapped[str | None] = mapped_column()
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")

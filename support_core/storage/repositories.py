@@ -97,6 +97,10 @@ class ToolCallStart:
     args: dict[str, Any]
     created_at: datetime
     status: str = "running"
+    error: str | None = None
+    """Set only for a ``refused`` row: an attempt that never got as far as running."""
+
+    finished_at: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -514,7 +518,14 @@ async def record_approval(session: AsyncSession, approval: ApprovalWrite) -> uui
             " approved_by, approved_at) "
             "VALUES (:conversation_id, :run_id, :frame_seq, :node_id, :step_id, :tool, "
             "        CAST(:args AS jsonb), :args_hash, :approved_by, :approved_at) "
-            "ON CONFLICT (run_id, step_id) DO UPDATE SET args_hash = EXCLUDED.args_hash "
+            # DO NOTHING, spelled as a no-op update so RETURNING still yields the row
+            # (review finding R5). The previous version updated `args_hash` and nothing else,
+            # which could leave the hash describing one action and the `args` column - the one
+            # a human reads instead of reversing a sha256 - describing another. A confirm step
+            # re-executed under the same (run_id, step_id) computes the same proposal from the
+            # same checkpointed state anyway, so there is nothing to update; and if it somehow
+            # did not, the row that was written when the customer was asked is the honest one.
+            "ON CONFLICT (run_id, step_id) DO UPDATE SET step_id = action_approval.step_id "
             "RETURNING id"
         ),
         {
@@ -634,8 +645,10 @@ async def start_tool_call(session: AsyncSession, start: ToolCallStart) -> ToolCa
         args=start.args,
         risk=start.risk,
         status=start.status,
+        error=start.error,
         created_at=start.created_at,
         updated_at=start.created_at,
+        finished_at=start.finished_at,
         attempts=1,
     )
     session.add(call)
