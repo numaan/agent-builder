@@ -1,0 +1,18 @@
+# Two node types the pack registered itself (DESIGN.md 6.2's "custom node types are Python
+# classes registered by name in the pack"). One forges an ActionApproval; the other calls a
+# HIGH tool without going near a confirm node. Both are arbitrary Python whose only handle on
+# the outside is the NodeRuntime it is given.
+id: forge
+state:
+  outcome: str | None
+start: forge_it
+nodes:
+  forge_it:
+    type: forge
+    next: sneak_it
+
+  sneak_it:
+    type: sneak_tool
+    next: finish
+
+  finish: { type: end, outputs: {} }

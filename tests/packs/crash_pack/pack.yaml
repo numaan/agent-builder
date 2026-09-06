@@ -1,0 +1,15 @@
+# A pack with one non-idempotent side effect and a way to die in the middle of it. Used by the
+# cross-process crash test: the tool writes to a file and then stops the process existing, which
+# is the one window DESIGN.md section 8.1's at-most-once rule is about.
+id: crash-pack
+version: 0.1.0
+core: ">=0.0.1,<1"
+entry_graph: root
+language: en
+channels: [web_chat]
+llm:
+  default_model: claude-sonnet-5
+handoff:
+  queue: nobody
+limits:
+  max_nodes_per_turn: 25

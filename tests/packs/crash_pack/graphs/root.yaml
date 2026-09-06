@@ -1,0 +1,22 @@
+id: root
+description: Spend once, and route to a human if the spend cannot be established.
+state:
+  receipt: str | None
+start: spend
+nodes:
+  spend:
+    type: tool
+    tool: spend
+    args: { amount: 7.0 }
+    into: { receipt: result.receipt }
+    on_error: gave_up
+    next: done
+
+  gave_up:
+    type: say
+    message: >-
+      I am not going to try that again in case it already went through. A person will check.
+    next: stopped
+
+  done:    { type: end, outputs: {} }
+  stopped: { type: end, outputs: {} }

@@ -78,7 +78,7 @@ from support_core.storage.models import Conversation, Run
 from support_core.storage.repositories import ApprovalWrite, RunUpdate, StepWrite
 from support_core.storage.session import make_session_factory
 from support_core.tools.approval import hash_for
-from support_core.tools.base import ToolRefused
+from support_core.tools.base import ToolError, ToolRefused
 from support_core.tools.runtime import (
     CallSite,
     RegistryToolRunner,
@@ -780,7 +780,21 @@ class Executor:
                     result = await runner.resume(state, ctx, runtime, event)
                 else:
                     result = await runner.run(state, ctx, runtime)
-                self._check_outputs(turn, frame, result)
+                self._check_result(turn, frame, node, result)
+            except ToolError as exc:
+                # A pack-registered node type is arbitrary Python and may call the tool runtime
+                # without translating its refusal. A refusal is a run-time failure of the node,
+                # which DESIGN.md section 7.3 routes; letting it escape the loop would turn "the
+                # runtime said no" into a dead turn.
+                reason = "tool_refused" if isinstance(exc, ToolRefused) else "tool_failed"
+                refused = NodeError(f"{frame.node_id}: {exc}", reason=reason)
+                turn.turn_tool_calls += _spent(opened)
+                if delivering:
+                    turn.pending_event = None
+                if not await self._route_error(turn, graph, frame, node, sid, started, refused):
+                    return turn.pending_event
+                check_gates = False
+                continue
             except NodeError as exc:
                 turn.turn_tool_calls += _spent(opened)
                 if delivering:
@@ -916,12 +930,7 @@ class Executor:
         """
         if result.approval is None:
             return None
-        if not isinstance(node, ConfirmNode):
-            msg = (
-                f"{node_id}: only a 'confirm' node may record an ActionApproval, and this is a "
-                f"{node.type!r} node (DESIGN.md section 8.2)"
-            )
-            raise NodeError(msg)
+        assert isinstance(node, ConfirmNode)  # _check_result refused anything else
         return ApprovalWrite(
             conversation_id=turn.conversation_id,
             run_id=turn.run_id,
@@ -946,12 +955,7 @@ class Executor:
         """
         if result.customer_patch is None:
             return None
-        if not isinstance(node, ToolNode):
-            msg = (
-                f"{node.type!r} node tried to change ctx.customer; the context is read-only to "
-                f"nodes (DESIGN.md section 6.1) and only a tool may ask the engine to change it"
-            )
-            raise NodeError(msg)
+        assert isinstance(node, ToolNode)  # _check_result refused anything else
         customer = dict(result.customer_patch)
         ctx.customer = CustomerContext.model_validate(customer)
         return customer
@@ -1126,6 +1130,33 @@ class Executor:
             caller.state[state_field] = clean.get(output_name)
         if frame.return_node is not None:
             caller.node_id = frame.return_node
+
+    def _check_result(self, turn: _Turn, frame: Frame, node: NodeBase, result: NodeResult) -> None:
+        """Everything a node's result must satisfy before the executor acts on any of it.
+
+        Called inside the loop's ``try``, so a violation is routed like any other node failure
+        (DESIGN.md section 7.3) instead of ending the turn. Two of the three checks are about a
+        node claiming a power its *declared type* does not have, which is the only defence
+        against a pack-registered node type (section 6.2) writing its own authorisation:
+
+        * only a node the graph declares ``type: confirm`` may record an ``ActionApproval``;
+        * only a node it declares ``type: tool`` may carry a tool's ``ctx.customer`` change out;
+        * a sub-graph's outputs must fit the caller's state (phase-2 review finding R12).
+        """
+        if result.approval is not None and not isinstance(node, ConfirmNode):
+            msg = (
+                f"{frame.node_id}: only a 'confirm' node may record an ActionApproval, and this "
+                f"is a {node.type!r} node (DESIGN.md section 8.2)"
+            )
+            raise NodeError(msg)
+        if result.customer_patch is not None and not isinstance(node, ToolNode):
+            msg = (
+                f"{frame.node_id}: a {node.type!r} node tried to change ctx.customer; the "
+                f"context is read-only to nodes (DESIGN.md section 6.1) and only a tool may ask "
+                f"the engine to change it"
+            )
+            raise NodeError(msg)
+        self._check_outputs(turn, frame, result)
 
     def _check_outputs(self, turn: _Turn, frame: Frame, result: NodeResult) -> None:
         """Refuse an output mapping the caller's state has no field for (finding R12).
