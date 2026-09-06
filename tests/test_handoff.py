@@ -226,11 +226,12 @@ async def test_a_summariser_that_fails_does_not_stop_the_handoff(engine: AsyncEn
 
     from support_core.handoff import PacketRequest
 
-    packet = await handoff.raise_handoff(
+    packet, delivered = await handoff.raise_handoff(
         PacketRequest(
             conversation_id=conversation_id, run_id=None, reason="llm_unavailable", detail="down"
         )
     )
+    assert delivered, "the summary failed; the queue did not"
 
     assert packet.summary.startswith("No model summary was available.")
     assert "Reason: llm_unavailable" in packet.summary
@@ -357,11 +358,12 @@ async def test_a_sink_that_refuses_never_fails_the_turn(engine: AsyncEngine) -> 
 
     from support_core.handoff import PacketRequest
 
-    packet = await handoff.raise_handoff(
+    packet, delivered = await handoff.raise_handoff(
         PacketRequest(conversation_id=conversation_id, run_id=None, reason="node_error")
     )
 
     assert packet.reason == "node_error"
+    assert delivered is False, "nothing took it, and the service says so (review finding P2)"
     assert handoff.failures and "RuntimeError" in handoff.failures[0]
 
 
@@ -402,6 +404,46 @@ async def test_the_handoff_node_parks_the_run_and_queues_a_packet(engine: AsyncE
     said = await outbound_texts(engine, conversation_id)
     assert "passed this to a billing specialist" in said[-1]
     assert "They will reply here." in said[-1]
+
+
+async def test_a_queue_that_is_down_does_not_promise_a_specialist(engine: AsyncEngine) -> None:
+    """Review finding P2. DESIGN.md section 14: never promise an escalation that did not happen.
+
+    The same conversation as the test above, with every sink refusing. The pack's sentence -
+    "I have passed this to a billing specialist ... They will reply here" - is the promise this
+    phase's own pack change was written to make true, and it is a lie when nothing took the
+    packet. So core replaces it, the suspension records that nobody was told, and the queue has
+    no row claiming otherwise. The run is still parked and the conversation is still durable,
+    which is all the replacement sentence claims.
+    """
+    from support_core.llm.fake import FakeProvider
+    from support_core.llm.recording import Cassette
+    from tests.cassettes.scenarios import ACME_ACCOUNT_QUESTION, play
+
+    class Refusing:
+        name = "refusing"
+
+        async def deliver(self, packet: HandoffPacket) -> str | None:
+            msg = "the queue is down"
+            raise RuntimeError(msg)
+
+    conversation_id, _executor = await play(
+        ACME_ACCOUNT_QUESTION,
+        engine,
+        FakeProvider(Cassette.load(ACME_ACCOUNT_QUESTION.cassette_path)),
+        sink=Refusing(),
+    )
+
+    row = await run_row(engine, conversation_id)
+    assert row["status"] == "waiting_human", "the conversation is still parked and still durable"
+    assert row["awaiting"]["detail"]["queued"] is False, "'the hook did not raise' is not a page"
+    assert not await _handoffs(engine, conversation_id), "nothing took it, so there is no row"
+
+    said = await outbound_texts(engine, conversation_id)
+    assert "passed this to a billing specialist" not in said[-1]
+    assert "They will reply here" not in said[-1]
+    assert "do not want to tell you somebody has it" in said[-1]
+    assert "Nothing you have told me is lost" in said[-1]
 
 
 async def test_the_handoff_nodes_message_promises_only_what_happens(

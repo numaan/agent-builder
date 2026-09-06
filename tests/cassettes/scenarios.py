@@ -20,7 +20,7 @@ from support_core import load_pack
 from support_core.engine import Executor
 from support_core.engine.hooks import EngineHooks
 from support_core.engine.interrupts import workflow_intents
-from support_core.handoff import HandoffService, default_sink
+from support_core.handoff import HandoffService, HandoffSink, default_sink
 from support_core.llm.fake import Rule
 from support_core.llm.provider import LLMProvider
 from support_core.llm.types import ToolCall
@@ -655,9 +655,17 @@ SCENARIOS: tuple[Scenario, ...] = (
 
 
 async def play(
-    scenario: Scenario, engine: AsyncEngine, provider: LLMProvider
+    scenario: Scenario,
+    engine: AsyncEngine,
+    provider: LLMProvider,
+    *,
+    sink: HandoffSink | None = None,
 ) -> tuple[uuid.UUID, Executor]:
-    """Run a scenario's turns against the real engine and the given provider."""
+    """Run a scenario's turns against the real engine and the given provider.
+
+    ``sink`` overrides the queue the handoff packet goes to, which is how a test drives a whole
+    real conversation into a desk that is down (review finding P2).
+    """
     if scenario.setup is not None:
         scenario.setup()
     pack = load_pack(scenario.pack_path)
@@ -679,7 +687,7 @@ async def play(
     hooks.handoff = HandoffService(
         pack,
         executor.sessions,
-        sink=default_sink(executor.sessions),
+        sink=sink or default_sink(executor.sessions),
         llm=service,
     )
     conversation_id = await executor.start_conversation(

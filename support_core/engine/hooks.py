@@ -16,7 +16,7 @@ hook                          owner phase  default
 ``resume_offer``              6            an explicit yes or no word, else ``unclear``
 ``extract_slots``             3            the whole reply fills the first declared slot
 ``confirm_decision``          4            an explicit yes or no word, else ``unclear``
-``handoff``                   6            record nothing; the run still suspends for a human
+``handoff``                   6            record nothing, report False; the run still suspends
 ``send``                      7            do not deliver; rows stay ``pending_send``
 ``summarize``                 3            no summary; ``conversation.summary`` is left alone
 ``probe``                     -            nothing (tests use it to kill a turn mid-flight)
@@ -262,7 +262,16 @@ class Summarizer(Protocol):
 
 
 class HandoffHook(Protocol):
-    async def __call__(self, request: HandoffRequest) -> None: ...
+    async def __call__(self, request: HandoffRequest) -> bool:
+        """Deliver the packet. Returns whether *somebody was actually told*.
+
+        A boolean rather than ``None`` because the engine records the answer in the suspension
+        detail and, for a ``handoff`` node, decides what the customer is told from it. A hook
+        that returns ``False`` has not raised and has not failed the turn - it has said that the
+        page did not land, which is the difference between a run parked for a human who knows
+        and one parked for a human who does not (review finding P2).
+        """
+        ...
 
 
 class ChannelSend(Protocol):
@@ -322,9 +331,14 @@ async def no_summary(request: SummaryRequest) -> str | None:
     return None
 
 
-async def no_handoff(request: HandoffRequest) -> None:
-    """Record nothing. The run still suspends ``waiting_human``, which is the part of
-    DESIGN.md section 7.3 phase 2 owns; the packet, the queue and the sinks are phase 6."""
+async def no_handoff(request: HandoffRequest) -> bool:
+    """Record nothing, and say so. The run still suspends ``waiting_human``, which is the part
+    of DESIGN.md section 7.3 phase 2 owns; the packet, the queue and the sinks are phase 6.
+
+    It returns ``False`` because nobody was told, and an engine built without a desk should not
+    be able to report otherwise. DESIGN.md section 14 forbids promising an escalation that did
+    not happen, and the promise is made from this answer (review finding P2)."""
+    return False
 
 
 async def no_send(conversation_id: uuid.UUID, messages: Sequence[OutboundMessage]) -> None:

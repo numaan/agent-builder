@@ -62,6 +62,10 @@ class Recorder:
     """Every interrupt check the engine ran, so a test can assert it did *not* run one."""
 
     slots: dict[str, Any] | None = None
+    handoff_delivers: bool = True
+    """Whether the recorded handoff hook reports that a human was actually told (finding P2).
+    Set it to False to stand in for a queue nothing would take the packet from."""
+
     now: datetime = datetime(2026, 9, 5, 12, 0, tzinfo=UTC)
     seen: dict[str, int] = field(default_factory=dict)
 
@@ -80,8 +84,9 @@ class Recorder:
         self.now += timedelta(milliseconds=1)
         return self.now
 
-    async def _handoff(self, request: HandoffRequest) -> None:
+    async def _handoff(self, request: HandoffRequest) -> bool:
         self.handoffs.append(request)
+        return self.handoff_delivers
 
     async def _send(self, conversation_id: uuid.UUID, messages: Sequence[OutboundMessage]) -> None:
         self.sent.extend(message.text for message in messages)

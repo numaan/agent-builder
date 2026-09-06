@@ -65,6 +65,7 @@ from support_core.engine.interrupts import (
 from support_core.engine.locks import conversation_lock
 from support_core.engine.runners import (
     DESK_ACTION,
+    HANDOFF_UNDELIVERED_MESSAGE,
     NO_TOOL_ACCESS,
     GateRunner,
     NodeRuntime,
@@ -1260,6 +1261,7 @@ class Executor:
         # an ordinary loop through a node is not a retry (see :meth:`_route_error`).
         frame.errors.pop(node_id, None)
         detail = result.suspend.detail if result.suspend else None
+        outbound = [message.text for message in result.outbound]
         if result.suspend is not None and isinstance(node, HandoffNode):
             # DESIGN.md section 13's packet, built and delivered *before* the checkpoint that
             # parks the run. After it would leave a window in which the run is waiting_human and
@@ -1267,7 +1269,7 @@ class Executor:
             # stalled one. Before it, a crash re-executes the node, and delivery is idempotent
             # under (run, step).
             detail = dict(detail or {})
-            detail["queued"] = await self._tell_a_human(
+            queued = await self._tell_a_human(
                 turn,
                 node_id,
                 node.reason,
@@ -1275,6 +1277,17 @@ class Executor:
                 sid,
                 next_steps=list(node.next_steps),
             )
+            detail["queued"] = queued
+            if not queued:
+                # DESIGN.md section 14: never promise an escalation that did not happen. The
+                # pack's own sentence is written for the case where somebody was paged - the
+                # sample pack's says "I have passed this to a billing specialist ... They will
+                # reply here" - and saying it when no sink took the packet is exactly the
+                # forbidden promise this phase's pack change was made to remove. Core replaces
+                # it with one that claims only what is true (review finding P2). The run is
+                # still parked and the packet is still in the trace: what changed is that
+                # nobody was told, and the customer is not told otherwise.
+                outbound = [HANDOFF_UNDELIVERED_MESSAGE]
             turn.outcome.handoff_reason = node.reason
         await self._checkpoint(
             turn,
@@ -1289,7 +1302,7 @@ class Executor:
                 started_at=started,
                 ended_at=self.hooks.clock(),
             ),
-            outbound=[*turn.take_notices(), *(message.text for message in result.outbound)],
+            outbound=[*turn.take_notices(), *outbound],
             suspend_detail=detail,
             suspend_status=result.suspend.status if result.suspend else None,
             suspend_node=node_id if result.suspend else None,
@@ -1617,30 +1630,36 @@ class Executor:
         *,
         next_steps: Sequence[str] = (),
     ) -> bool:
-        """Hand the failure to the handoff hook. Returns whether it took it.
+        """Hand the failure to the handoff hook. Returns whether a human was actually told.
 
         A hook that raises must not take the turn down with it: the run is about to be parked
         durably either way, and a customer waiting for a person who was never paged is recoverable
         from the queue, while a turn that died mid-checkpoint is another crash to re-enter. Core's
         own :class:`~support_core.handoff.service.HandoffService` never raises; this guard is for
         a pack's or a deployment's.
+
+        The answer used to be "the hook did not raise", which is not the same fact: the service
+        swallowed every sink failure, so a queue that was down still reported a page. It is now
+        the hook's own answer, and a ``handoff`` node reads it before deciding what to promise
+        the customer (review finding P2).
         """
         try:
-            await self.hooks.handoff(
-                HandoffRequest(
-                    conversation_id=turn.conversation_id,
-                    run_id=turn.run_id,
-                    reason=reason,
-                    detail=detail,
-                    frames=list(turn.frames),
-                    node_id=node_id,
-                    step_id=sid,
-                    next_steps=list(next_steps),
+            return bool(
+                await self.hooks.handoff(
+                    HandoffRequest(
+                        conversation_id=turn.conversation_id,
+                        run_id=turn.run_id,
+                        reason=reason,
+                        detail=detail,
+                        frames=list(turn.frames),
+                        node_id=node_id,
+                        step_id=sid,
+                        next_steps=list(next_steps),
+                    )
                 )
             )
         except Exception:
             return False
-        return True
 
     # -- frame stack ---------------------------------------------------------------------
 

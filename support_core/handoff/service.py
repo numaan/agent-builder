@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any
 from support_core.graph.pack import Pack
 from support_core.handoff.builder import PacketRequest, assemble, fallback_summary, gather
 from support_core.handoff.packet import HandoffPacket
-from support_core.handoff.sinks import HandoffSink, NullSink, transcript_url
+from support_core.handoff.sinks import HandoffSink, NullSink, SinkError, transcript_url
 from support_core.llm.prompt import TranscriptMessage
 from support_core.llm.service import HandoffSummaryRequest, LlmService
 
@@ -82,14 +82,17 @@ class HandoffService:
 
     # -- the EngineHooks.handoff seam -----------------------------------------------------
 
-    async def __call__(self, request: "HandoffRequest") -> None:
+    async def __call__(self, request: "HandoffRequest") -> bool:
         """What phase 2 left as ``hooks.handoff``, filled (DESIGN.md section 7.3).
 
         Every failure the engine routes - a limit, a node error, a timeout, a pack it cannot
         run, a recovery it gave up on - arrives here with the reason the engine gave it, and
         leaves as a packet carrying that reason.
+
+        Returns whether a sink took it, which is what the engine turns into what the customer is
+        told (review finding P2).
         """
-        await self.raise_handoff(
+        _packet, delivered = await self.raise_handoff(
             PacketRequest(
                 conversation_id=request.conversation_id,
                 run_id=request.run_id,
@@ -101,14 +104,19 @@ class HandoffService:
                 suggested_next_steps=list(request.next_steps),
             )
         )
+        return delivered
 
     # -- the whole job --------------------------------------------------------------------
 
-    async def raise_handoff(self, request: PacketRequest) -> HandoffPacket:
-        """Build the packet, deliver it, and return it. Never raises."""
+    async def raise_handoff(self, request: PacketRequest) -> tuple[HandoffPacket, bool]:
+        """Build the packet and deliver it. Never raises.
+
+        Returns the packet and whether a sink took it. The second half is not decoration: the
+        sample pack's own handoff node tells the customer a specialist has their question, and
+        DESIGN.md section 14 forbids that sentence when nobody does (review finding P2).
+        """
         packet = await self.build(request)
-        await self.deliver(packet)
-        return packet
+        return packet, await self.deliver(packet)
 
     async def build(self, request: PacketRequest) -> HandoffPacket:
         """DESIGN.md section 13's packet, from durable state plus one model call."""
@@ -127,14 +135,30 @@ class HandoffService:
             now=self.clock(),
         )
 
-    async def deliver(self, packet: HandoffPacket) -> None:
-        """Push a packet at the sink, recording rather than raising a refusal."""
+    async def deliver(self, packet: HandoffPacket) -> bool:
+        """Push a packet at the sink. Returns whether anybody took it; never raises.
+
+        "Anybody" is deliberate. :class:`~support_core.handoff.sinks.CompositeSink` raises when
+        *any* of its sinks refused, and carries the ones that did not on
+        :attr:`~support_core.handoff.sinks.SinkError.delivered`: a webhook that is down while the
+        Postgres queue row was written is a page a desk can still find, so the customer may still
+        be told a person has it. Nothing taking it at all is the case that must not be reported
+        as success (review finding P2).
+        """
         self.delivered.append(packet)
         try:
             await self.sink.deliver(packet)
+        except SinkError as exc:
+            self._failed(f"{packet.conversation_id}: {exc}")
+            return bool(exc.delivered)
         except Exception as exc:
-            self.failures.append(f"{packet.conversation_id}: {type(exc).__name__}: {exc}")
-            del self.failures[:-SUMMARY_FAILURES_KEPT]
+            self._failed(f"{packet.conversation_id}: {type(exc).__name__}: {exc}")
+            return False
+        return True
+
+    def _failed(self, line: str) -> None:
+        self.failures.append(line)
+        del self.failures[:-SUMMARY_FAILURES_KEPT]
 
     async def _summary(
         self,
@@ -168,8 +192,7 @@ class HandoffService:
                 )
             )
         except Exception as exc:
-            self.failures.append(f"summary: {type(exc).__name__}: {exc}")
-            del self.failures[:-SUMMARY_FAILURES_KEPT]
+            self._failed(f"summary: {type(exc).__name__}: {exc}")
             return fallback_summary(request.reason, request.detail, list(actions))
 
 

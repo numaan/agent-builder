@@ -905,6 +905,29 @@ customer, and DESIGN.md section 14 makes an unbacked promise a defect.
 """
 
 
+HANDOFF_UNDELIVERED_MESSAGE = (
+    "I have not been able to pass this to one of our people just now, and I do not want to tell "
+    "you somebody has it when they may not. Nothing you have told me is lost - this conversation "
+    "is saved exactly as it is. Please try us again shortly."
+)
+"""What the customer is told instead when no sink would take the packet (review finding P2).
+
+Core's sentence, not the pack's, and it replaces the pack's rather than following it: the pack's
+message is written for the case where somebody was paged - the sample pack's says "I have passed
+this to a billing specialist ... They will reply here" - and saying that when the queue is down
+is precisely DESIGN.md section 14's forbidden promise, which is the defect the sample pack's own
+wording was corrected for earlier in this project.
+
+What it claims is what the engine can still guarantee with every sink refusing: the run is parked
+``waiting_human`` and checkpointed, so the conversation, its frame stack and its transcript are
+durable and a later attempt resumes exactly here. What it does not claim is that anybody will
+come. "Try us again shortly" is the only next step the customer has, because the thing that would
+have paged a person is the thing that failed; a deployment that wants a better one gives the pack
+a second sink (:func:`~support_core.handoff.sinks.default_sink` composes the Postgres queue with a
+webhook precisely so that one being down still leaves a row a desk can find).
+"""
+
+
 class HandoffRunner(_Runner):
     """Hand the conversation to a person (DESIGN.md sections 6.2, 13).
 
