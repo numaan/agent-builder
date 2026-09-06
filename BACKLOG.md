@@ -8,7 +8,7 @@ Each phase follows the five-step workflow in [PLAN.md](PLAN.md). Design referenc
 | 0 | Skeleton, tooling, database | done | reviews/phase-0.md |
 | 1 | Graph model, loader, validator, expression language | done | reviews/phase-1.md |
 | 2 | Execution engine and durability | done | reviews/phase-2.md |
-| 3 | LLM layer and prompted nodes | self-critique | reviews/phase-3.md |
+| 3 | LLM layer and prompted nodes | in-review | reviews/phase-3.md |
 | 4 | Tool runtime and safety nodes | todo | reviews/phase-4.md |
 | W | Web chat slice (pulled forward from 7) | todo | reviews/phase-w.md |
 | 5 | Knowledge layer and citations | todo | reviews/phase-5.md |
