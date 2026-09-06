@@ -465,3 +465,231 @@ Two things, both committed rather than recorded: an idempotency key re-entered w
 arguments now refuses instead of executing the new ones under the old approval (`14c5e32`), and
 the two node-type defences the mutation testing showed were untested got the tests that
 mutation-kill them (`78da4a5`, `c73effa`). The rest of this section stands as written.
+
+## Independent review
+
+Reviewer: a separate agent that did not write this code. Reviewed commits `e65e4a6..e4a9e08`
+against DESIGN.md sections 3, 4.1, 6.2, 6.4, 7.2, 7.3, 8.1-8.4 and 17, PLAN.md, BACKLOG.md and
+reviews/phase-0.md to phase-3.md.
+
+**Verdict.** The money is safe. I ran twenty-five distinct approval-bypass attacks against the
+runtime and could not get a WRITE or HIGH tool to execute without a live, matching, unconsumed
+`action_approval`: not by reusing an approval from another run, frame, confirm node, tool or
+conversation; not by re-recording the confirm step to un-consume one; not by racing two callers
+for one row; not by approving one argument form and executing another; not through the model
+loop even holding a valid approval; not by smuggling a tool through the `confirm_exempt` slot.
+The read-only gateway held under every attack including a forged READ spec for a HIGH tool, and
+the runtime's second lock held when I bypassed the gateway entirely. The exit criterion holds
+independently of the implementer's tests, and it is node logic that drives it: replacing the
+cassette-backed confirm classifier with a hook that answers `no` produces zero approvals and
+zero refunds, and `unclear` re-presents. Every claim in the implementer's command table
+reproduced exactly. The one thing I did break is the async tool: an async `tool` node dispatched
+by the executor can never be completed by its callback, because the idempotency key it is looked
+up under is not the one it was claimed under - and on a graph whose `on_error` returns to the
+tool node, that made a WRITE tool's side effect happen **twice** from one customer intent and one
+callback. That is a must-fix, and the self-critique's "async tools are thin" does not reach it.
+The rest is should-fix and nit. On the headline caveat: the pack-code trust boundary is
+acceptable per DESIGN.md 4.1, but the `ctx.customer` write capability inside it is not, and
+should be narrowed (see the last subsection).
+
+### Findings
+
+| id | severity | location | finding | suggested fix |
+|----|----------|----------|---------|----------------|
+| R1 | must-fix | `support_core/engine/executor.py:726-727` and `:896`; `support_core/tools/runtime.py:197-216` | An async `tool` node's callback can never find its dispatched call, and the failure can repeat the side effect. `_run_node` computes `attempt = frame.attempts.get(node_id, 0)`; the dispatching pass then increments `frame.attempts[node_id]` in `_advance` before checkpointing. So the dispatch claims `run:frame:node:0` and the `resume_async_tool` pass looks up `run:frame:node:1`. `complete_async` finds no row and raises `ToolRefused("no dispatched call ... to complete")`. The `tool_call` row is stranded at `awaiting_callback` for ever. With `on_error` pointing back at the tool node, the node re-enters at attempt 2, claims a *third* key, and dispatches again: I measured the handler running twice for one intent and one callback. A tool needing an approval is saved by single-use (the approval was consumed at dispatch, so the retry is refused) - but a `confirm_exempt` WRITE async tool repeats without limit, and DESIGN.md 7.2's `waiting_async_tool` status is unusable either way. No test covers the executor round trip: `test_an_async_tool_is_dispatched_and_completed_by_its_callback` calls `ToolRuntime.complete_async` directly with the same `CallSite`, and `tests/test_engine_suspension.py` suspends into `waiting_async_tool` through a *registered custom node type*, not a real `tool` node. | Carry the dispatch's idempotency key on the suspension detail the way `confirm` carries `args_hash`, and have `NodeToolAccess.complete` use it; or take the attempt for a resuming node from the run's suspension record rather than from the incremented counter. Add an executor-level test: dispatch, resume, assert one `succeeded` row and one handler invocation. |
+| R2 | should-fix | `support_core/tools/runtime.py:602-626` (`RegistryToolRunner.invoke`) | The model-loop path never re-checks the node's allow-list. `ToolRuntime.invoke` accepts `allowed=`, and the `tool_node` path passes it, but `RegistryToolRunner.invoke` omits it, so the `tools:` list is enforced in exactly one place - `ReadOnlyToolGateway`. I called `RegistryToolRunner.invoke("peek", ...)` for a runner whose node declared only `charge`, and the tool ran. READ tier only, so no money, but this is precisely the "the gateway is one object away from the model, and this is the object that would otherwise do the thing" argument the module docstring makes for the tier check - and the allow-list does not get it. | Have `RegistryToolRunner` carry the node's declared list and pass it as `allowed=`. |
+| R3 | should-fix | `packs/acme_billing/graphs/verify_identity.yaml` (`wrong_code` -> `send_code`) | The OTP loop has no attempt cap. `check_code` -> `verified_router` -> `wrong_code` -> `send_code` -> `ask_code` -> `check_code` cycles for ever, one customer message per pass, and the pack's code is a pure function of the address so it does not change between passes. A six-digit code with unlimited guesses is not a verification. `max_nodes_per_turn` bounds one turn, not the sequence. Because `verify_otp` is the tool that sets `ctx.customer.identity_verified`, this is the cheapest route past the refund graph's gate in the sample pack. | Count attempts in the graph's state and route to `not_verified` after three; and say in the module docstring that a real pack must rate-limit. |
+| R4 | should-fix | `support_core/tools/base.py:88-105`, `support_core/tools/runtime.py:528-562` | Any WRITE or HIGH tool may write any `CustomerContext` field, including `identity_verified`, and a WRITE tool may be `confirm_exempt`. So a `tool` node can declare the customer verified with no confirmation and no approval anywhere in the picture. The sample pack does exactly this legitimately (`verify_otp`), which is why it is invisible; `send_otp`, and `boom`/`dispatch`/`ping` in the test pack, are all equally entitled. The self-critique names this and explicitly defers the decision to the reviewer. My judgement: narrow it. | Add `patches_context: frozenset[str] = frozenset()` to `Tool` and have `_settle` refuse a key the tool did not declare. Fifteen lines, and it turns "any write tool can verify anyone" into something an author has to write down and a validator can report. |
+| R5 | should-fix | `support_core/storage/repositories.py:504-533` | `record_approval`'s `ON CONFLICT (run_id, step_id) DO UPDATE SET args_hash = EXCLUDED.args_hash` updates the hash but not `args`, `tool`, `frame_seq` or `node_id`. The row can therefore end up with an `args_hash` for one action and an `args` column recording another - and `args` exists precisely so the audit reader does not have to reverse a sha256. I confirmed the update does *not* clear `consumed_at`, so there is no bypass here; this is an integrity problem in the audit record, not in the gate. | Either extend the update to `args` and `tool`, or make it `DO NOTHING` on the observation that a re-executed confirm step computes the same proposal anyway. |
+| R6 | should-fix | `support_core/tools/runtime.py:291-341` | A refused call leaves no `tool_call` row: `_authorise` raises inside the claim transaction, rolling back the insert so the key is not burnt. The consequence is that "show me every attempted movement of money" is answerable only from `trace_step.error`, and the table built for tool calls has no record of the attempt. The self-critique names this. For DESIGN.md 20's compliance story it is the wrong table. | Write a `refused` row in its own transaction under a key that cannot collide with the real claim (the step id plus a `#refused<n>` suffix), or keep the claim and mark it `refused` rather than rolling it back. |
+| R7 | should-fix | `support_core/tools/runtime.py:342-360` | `requires_human_approval` consumes the customer approval with `approved_by IN ('customer','human')` and *then* consumes a second row with `approved_by = 'human'`, ordered by `approved_at`. It fails safe in every ordering I tried, but the first query can eat the human's row when the human approved first, so the outcome depends on row order rather than on the rule. Once phase 6's desk exists this is a bug waiting. | Restrict the first consume to `('customer',)` so the two queries cannot compete for one row. |
+| R8 | nit | `packs/acme_billing/graphs/refund.yaml` (`state.charge: Charge`) | Validator warning `graph.state_type_unresolved`: `Charge` is not a type core knows, so `state.charge` is `Any` and `state.charge.amount` is unchecked in both the `confirm` action and the `issue_refund` args. No money risk - the two expressions are identical, `graph.approval_args_mutated` covers the path between them, and the hash is taken over coerced arguments at both ends - but the one type in the pack that carries an amount is the one the validator cannot see. | Declare `charge_amount: float | None` and `charge_description: str | None` in the graph's state, or teach the loader to resolve a model the pack's tools export. |
+| R9 | nit | `support_core/engine/executor.py:734` | The per-turn tool budget still counts only model-loop calls, so a graph that walks five `tool` nodes spends none of `max_tool_calls_per_turn`. The self-critique names it and declines to change what an existing manifest key means; I agree with the reasoning, and record it here so it becomes a backlog item rather than a note in a review. | Backlog for phase 9 with the manifest-compatibility decision attached. |
+
+I judged the nine `support pack validate` warnings individually. Four `assignment_optional`
+warnings (`str | None` into `str`) are real but harmless: the input model refuses `None` in
+`canonical_args`, so the failure mode is a refused call routed to `on_error`, not a call with a
+null charge id. Two `manifest.interrupt_graph_unknown` warnings name graphs phase 6 will add.
+Two `graph.confirm_exempt` warnings are the exemption report DESIGN.md 8.2 asks for and both
+carry a reason that argues the case. One - `graph.state_type_unresolved` - hides something worth
+knowing, and is R8 above. None of the nine hides a way to move money.
+
+### Approval bypass attempts
+
+All against `ToolRuntime` and the executor, on real Postgres (`support_test`). Scripts were
+written for this review under `reviews/scratch-phase-4/` and deleted afterwards; every scenario
+is reproducible from its description.
+
+| # | attempt | result |
+|---|---------|--------|
+| 1 | Call a HIGH tool with no approval row at all | **held** - `ToolRefused`, no ledger entry |
+| 2 | Call a HIGH tool with a valid approval but `requires_approval` omitted by the graph | **held** - refused for naming no confirm node |
+| 3 | Forge an `action_approval` row directly in the database with every binding field correct, then call | **executed** - by design: the row *is* the authorisation and the database is the trust root. Recorded, not a finding |
+| 4 | Spend one approval on two sequential calls of the same tool and arguments | **held** - second refused, ledger has one entry |
+| 5 | Present an approval recorded in frame 1 to a call in frame 2 | **held** |
+| 6 | Present an approval from an earlier run of the same conversation | **held** |
+| 7 | Present an approval recorded by a different `confirm` node | **held** |
+| 8 | Present an approval recorded for a different tool | **held** |
+| 9 | Present an approval from a different conversation | **held** |
+| 10 | Approve `{label, amount}`, execute `{amount, label}` (key order) | **executed** - correct: `canonical_json` sorts keys, it is the same call |
+| 11 | Approve `29`, execute `29.00` | **executed** - correct: both coerce to `29.0` through the input model |
+| 12 | Approve `"29"`, execute `29.0` | **executed** - correct, same coercion |
+| 13 | Approve `29.0`, execute `29.01` | **held** |
+| 14 | Approve `-5.0`, execute `5.0` | **held** |
+| 15 | Approve a label as NFC `café`-composed, execute it decomposed | **held** - different bytes, different hash. Safe direction, and no false refusal is possible because both ends call one function |
+| 16 | Add a nested key the input model does not declare | **held** - `extra="forbid"` refuses before the hash is taken |
+| 17 | Two concurrent callers, one approval, one tool | **held** - one succeeded, one refused, ledger has one entry |
+| 18 | Re-record the confirm step under the same `(run_id, step_id)` to clear `consumed_at`, then call again | **held** - the `ON CONFLICT` update touches only `args_hash`; see R5 |
+| 19 | Call a HIGH tool from `caller="model_loop"` holding a valid approval | **held** - refused on tier before the claim |
+| 20 | Smuggle `charge` through the slot of a `confirm_exempt` tool (`allowed=("ping",)`) | **held** - `'charge' is not a tool this step may call` |
+| 21 | `requires_human_approval` tool with one human-approved row | **held** - refused; no desk exists to make the pair. See R7 |
+| 22 | Pack-supplied node type returning an `ApprovalProposal` | **held** by `_check_result` (`executor.py:1146`); read in source, and the implementer's mutation test covers it |
+| 23 | Non-`tool` node invoking through `rt.tools.invoke` | **held** - `NO_TOOL_ACCESS.invoke` refuses, and the approval check refuses underneath it |
+| 24 | Node id carrying `#` or `:` to collide a `tool` node's key with a model-loop key | **not reachable** - `NODE_ID = ^[a-z][a-z0-9_]*$` is enforced by `read_graphs`, which even an unvalidated pack goes through |
+| 25 | A tool mutating its own arguments after the hash is taken | **inert** - the tool receives a fresh `input_model.model_validate(canonical)`, and the recorded `args` and the hash were both taken from `canonical` before execution. A hostile pack can still lie about what it did with them, which is the trust boundary, not a bypass |
+
+### Double-payment attempts
+
+| # | attempt | result |
+|---|---------|--------|
+| 1 | Kill the process before the claim | **safe** - no row, no side effect; the retry runs the call once. Covered by the implementer's cross-process test |
+| 2 | Kill after the claim, before the side effect | **safe** - row left `running`; a non-idempotent tool is refused and marked `indeterminate`, an idempotent one repeats. Cannot be told apart from #3 by construction, which is why the refusal is the right answer |
+| 3 | Kill after the side effect, before the record (real OS process, `os._exit` inside the tool) | **safe** - `tests/test_tool_crash_recovery.py` passes; the file-backed ledger shows one side effect |
+| 4 | Kill during the record's commit | **safe** - the same `running` state as #2; the retry replays or refuses |
+| 5 | Two processes racing one step id | **safe** - the unique `idempotency_key` makes one the claimant; the loser re-enters and replays or refuses |
+| 6 | Two concurrent callers spending one approval | **safe** - `FOR UPDATE SKIP LOCKED` plus `consumed_at IS NULL` gives exactly one winner (measured, attempt 17 above) |
+| 7 | Resume a run whose step id collides with a live one | **safe** - the key carries `run_id` and the monotonic `frame_seq`, neither of which is reused |
+| 8 | Two different logical calls under one step id | **safe** - `_reenter` compares the stored `args` against the new canonical form and refuses a mismatch (commit `14c5e32`); I could not construct a pair that shared a key and matched |
+| 9 | One logical call whose id changes across a crash | **safe for synchronous tools** - `frame.attempts` lives in the checkpointed frame, so a crash before the checkpoint leaves the attempt unchanged. **Broken for async tools**: the id changes between dispatch and callback because the suspending pass increments the counter. This is R1 |
+| 10 | Retry after the executor's error path, with `on_error` returning to the tool node | **safe for approval-bound tools** (the approval was consumed by the first attempt, so the second is refused); **unsafe for a `confirm_exempt` WRITE async tool** - two dispatches, two side effects, measured. This is R1 |
+
+### Commands run
+
+| command | result |
+|---------|--------|
+| `.venv/Scripts/python.exe -m ruff check .` | `All checks passed!` (exit 0) |
+| `.venv/Scripts/python.exe -m ruff format --check .` | `124 files already formatted` (exit 0) |
+| `.venv/Scripts/python.exe -m mypy` | `Success: no issues found in 124 source files` |
+| `.venv/Scripts/python.exe -m pytest -q -p no:randomly` | `1138 passed, 2 deselected in 280.07s` |
+| `.venv/Scripts/python.exe -m pytest -q -m live` | `2 skipped, 1138 deselected in 0.85s` |
+| `.venv/Scripts/python.exe -m pytest -q tests/verify_phase_2_resolution.py` | `39 passed in 125.44s` |
+| `.venv/Scripts/python.exe -m support_core.cli.main pack validate packs/acme_billing` | `acme-billing: well-formed (9 warning(s))`, exit 0 |
+| `.venv/Scripts/python.exe -m alembic downgrade base` | down to base, exit 0 |
+| `.venv/Scripts/python.exe -m alembic upgrade head` | `Running upgrade 0005 -> 0006`, exit 0 |
+| `.venv/Scripts/python.exe -m alembic check` | `No new upgrade operations detected.` |
+| reviewer script: 25 approval-bypass scenarios | 21 held, 1 not reachable, 3 executed and correct (key order, `29` vs `29.00`, `"29"` vs `29.0`); plus the forged database row, which is by design |
+| reviewer script: gateway, MCP and registry attacks | all held. MCP undeclared tier -> `high`, `needs_confirm=True`; a duplicate tool name is rejected whether it comes from the pack or from MCP; a forged READ spec for a HIGH tool is refused by the runtime underneath |
+| reviewer script: async `tool` node dispatch plus `resume_async_tool` | **callback refused, and the handler ran twice on the `on_error` loop** (R1) |
+| reviewer script: refund conversation with the confirm answer forced to `yes`/`no`/`unclear` | `yes` -> one approval, one refund, path `confirm_refund -> issue_refund -> tell_done -> done`; `no` -> zero approvals, zero refunds, path to `abandon`; `unclear` -> re-presented, zero of both |
+
+Every command in the implementer's own table reproduced. `alembic downgrade base` then
+`upgrade head` then `check` is clean, and migration 0006 matches DESIGN.md 17's `tool_call` and
+`action_approval` rows plus the additions the phase argues for; every added column is nullable or
+defaulted, so it is genuinely additive.
+
+### Design conformance
+
+- **8.1 Tool contract**: every field of the design's class is present with the design's default,
+  plus `confirm_exempt`/`confirm_exempt_reason` (8.2 asks for the flag; 8.1's class omits it) and
+  `ToolContext.patch_customer`. `ToolContext` carries the idempotency key, the customer identity,
+  the step id standing in for the trace span, and the approval - all four the design names.
+- **8.2 Risk policy**: `support_core/tools/risk.py` transcribes the table once and both the
+  validator and the runtime read it. The hash is `sha256(tool_name + canonical_json(args))`
+  exactly, over coerced arguments - a deviation the phase argues for and I agree with. The
+  binding being stronger than the design's can only cause refusals, never permissions. The
+  `requires_human_approval` cell has never run green (R7).
+- **8.3 Registry and MCP**: duplicate names rejected, JSON-schema check present, an undeclared
+  MCP tier defaults to HIGH (measured), tool outputs treated as untrusted data (see below).
+- **8.4 Model-facing loop**: bounded, READ-only, and validated against the node's list - with the
+  allow-list checked in one layer where the tier is checked in two (R2).
+- **6.4 graphs**: `refund.yaml`'s `confirm_refund` and `issue_refund` are byte-identical to the
+  design's; the additions (`on_error` edges, `say` nodes standing in for `handoff` until phase 6,
+  a router `default`) are declared in the phase notes.
+- **17 data model**: covered above.
+- **The `requires_human_approval` seam**: the shape is right - the runtime asks for a second
+  approval row with `approved_by = 'human'`, and phase 6's desk is the only thing that can write
+  one, so a pack that sets the flag fails closed today. The ordering is wrong (R7) and should be
+  fixed now rather than discovered in phase 6.
+
+### Regression check
+
+- **Phase 3's prompt boundary.** Tool results reach the model through `data_block(..., nonce=
+  prompt.nonce)` in `support_core/llm/service.py:334-340`, the same per-render delimiter path as
+  retrieved documents, and the fence label is the *resolved* tool's name rather than the model's
+  string (finding V10 still holds). I fed a tool result containing the live nonce and a
+  well-formed `-----END UNTRUSTED DATA <nonce>-----` line: `neutralise` prefixed it so it is no
+  longer a line-initial delimiter. `tests/test_prompt_injection_matrix.py` already carries
+  `tool_result_content` and `tool_result_name` as injection points and both pass.
+- **Phase 2's durability.** Nothing the turn depends on is memory-only in core: the approval, the
+  `tool_call` row, the `ctx.customer` patch and the frame's `attempts` all go through the
+  checkpoint transaction. `frame.attempts` being durable is what makes the idempotency key stable
+  across a crash - and, in the async case, what makes it *unstable* across a suspension (R1). The
+  one memory-only thing is the sample pack's `BILLING`/`OTP` singletons, which is a property of a
+  fake backend and is written down.
+- `tests/verify_phase_2_resolution.py` passes (39), so nothing in phases 0-3 regressed.
+
+### Exit criterion
+
+Both halves hold independently of the implementer's tests. `tests/test_adversarial_approvals.py`
+passes inside the full green suite, and my own twenty-five scenarios above are a superset of what
+it covers. The refund graph runs through `confirm_refund` and `issue_refund` against the fake
+provider with one approval, one consumed marker and one `issue_refund:ch_1002:29.0` ledger entry.
+And the conversation is driven by node logic, not by the cassette: with the cassette supplying
+every other model call and the confirm classifier replaced by a hook answering `no`, the graph
+takes the `no` edge to `abandon`, writes no approval and moves no money; `unclear` re-presents
+the proposal indefinitely and also moves nothing. The cassette supplies the model's words; the
+graph decides what they buy.
+
+### On the headline caveat: is "a pack's Python is trusted completely" acceptable?
+
+**Yes as a trust boundary, no as it is currently drawn.** DESIGN.md 4.1 is explicit - one domain,
+one repository, one image, one service - and 8.3 gives the exported `Tool` as the only source of
+a risk tier. A pack is first-party code shipping in the same image as core; sandboxing it would
+mean a process boundary and an RPC contract, which is a different design rather than a fix to
+this one. The controls this phase builds are aimed at the model, the customer and the graph, and
+those are the right targets: the model cannot act, the customer's yes is bound to arguments, the
+graph cannot route around the runtime. That is the correct answer to the threat model DESIGN.md
+declares.
+
+Two narrowings are worth making anyway, because they cost little and they turn a capability every
+pack has by default into one an author must ask for:
+
+1. **`ctx.customer` writes should be declared per tool** (R4). "Any WRITE tool may declare the
+   customer verified" is a far wider grant than "the tool that checks the passcode may set
+   `identity_verified`", and the difference is a `frozenset` on the `Tool` model and four lines in
+   `_settle`. It also gives the validator something to report, which is what makes review
+   possible.
+2. **`confirm_exempt` deserves a machine-checkable narrowing, not only a sentence.** The required
+   reason is a real improvement over an INFO line, but the flag still means "this WRITE tool needs
+   no approval, trust me", and it is the flag that makes R1's double dispatch and R3's OTP loop
+   reachable. At minimum the validator should report the *arguments* a `confirm_exempt` tool's
+   nodes pass it, so a reviewer sees `send_otp(email: state.email)` - a model-written address -
+   differently from `send_otp(email: ctx.customer.email)`. The self-critique raises exactly this
+   as its attack 7 and it is the sharpest thing in that list.
+
+What should be written on the front of the box, and today is written only in module docstrings,
+is that a pack author is inside the trust boundary and a pack review is therefore a security
+review. That belongs in the README's pack section and in DESIGN.md 4.1.
+
+### Missed by self-critique
+
+- **R1, the async tool.** The self-critique says async tools are "thin" and lists the transport,
+  the poller and the callback authentication as untested. It does not notice that the feature has
+  never run end to end through the executor at all, that the callback path is unreachable, and
+  that the resulting `on_error` re-entry repeats a WRITE tool's side effect. The gap is exactly
+  the one its own "which tests are weak" section describes - "the async tool tests use a tool that
+  dispatches synchronously" - one inference short of the bug.
+- **R2, the allow-list has one layer where the tier has two.** The phase's central argument is
+  defence in depth and the runtime's module docstring makes it explicitly for the tier. The
+  allow-list is the other half of DESIGN.md 8.4's sentence and it lives only in the gateway.
+- **R5, `record_approval`'s partial `ON CONFLICT` update.** Not a bypass, but the phase went to
+  the trouble of storing `args` for the human reader and then left a path on which `args` and
+  `args_hash` can disagree.
+- **R3, the unbounded OTP loop.** The self-critique's attack list covers the pack thoroughly -
+  two identical charges, `send_otp` to a model-written address, two conversations for one customer
+  - and does not include "the passcode can be guessed as many times as the customer likes". Given
+  that `verify_otp` is what opens the refund gate, that is the pack's shortest path.
+- The self-critique is otherwise good, and unusually honest about what its mutation table does and
+  does not prove. Its attacks 2 (the approval covers the arguments, not the sentence) and 4 (a
+  gate redirect between confirmation and call is not statically analysed) are both real and both
+  correctly scoped to later phases; I have nothing to add to either.
