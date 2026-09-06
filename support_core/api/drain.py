@@ -62,6 +62,9 @@ class DrainStats:
     coalesced: int = 0
     """Submissions that joined a conversation already queued or in flight."""
 
+    requeued: int = 0
+    """Conversations put back because a message arrived while they were being drained."""
+
 
 @dataclass(slots=True)
 class DrainQueue:
@@ -115,6 +118,9 @@ class DrainQueue:
             self._again.add(conversation_id)
             self.stats.coalesced += 1
             return
+        self._enqueue(conversation_id)
+
+    def _enqueue(self, conversation_id: uuid.UUID) -> None:
         self._known.add(conversation_id)
         self._idle.clear()
         self._queue.put_nowait(conversation_id)
@@ -146,7 +152,8 @@ class DrainQueue:
                 self._queue.task_done()
                 if conversation_id in self._again:
                     self._again.discard(conversation_id)
-                    self.submit(conversation_id)
+                    self.stats.requeued += 1
+                    self._enqueue(conversation_id)
                 if self._queue.empty() and self._in_flight == 0 and not self._known:
                     self._idle.set()
 
