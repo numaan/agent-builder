@@ -38,6 +38,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from support_core.api.runtime import AppRuntime
+from support_core.engine.errors import StatePatchError
 from support_core.storage import repositories as repo
 from support_core.storage.models import Handoff
 
@@ -69,9 +70,15 @@ class ResumeBody(BaseModel):
 
     patch: dict[str, Any] = Field(default_factory=dict)
     """A state patch for the frame the run is suspended in - the design's own example is
-    "marking an override as approved". It is applied to the *frame's* state and validated by the
-    graph's own state model on the next node entry, so a patch a graph cannot hold is a node
-    error rather than a corrupted frame."""
+    "marking an override as approved".
+
+    Checked against that frame's own declared state model **before** anything is written
+    (:meth:`~support_core.engine.executor.Executor._check_patch`), so a field the graph does not
+    declare is a 400 naming it and the run does not move. It used to be written first and
+    validated on the next node entry, which meant one mistyped field parked the conversation for
+    ever under a ``pack_incompatible`` handoff - blaming the pack for a typo at the desk (review
+    finding P1). It may never set ``identity_verified``, and it is refused while an approval is
+    live on that frame."""
 
     human_id: str | None = None
 
@@ -181,9 +188,19 @@ def desk_router(runtime: AppRuntime) -> APIRouter:
         row = await _load(handoff_id)
         if row is None:
             return JSONResponse({"error": "no such handoff"}, status_code=404)
-        if body.text:
-            await runtime.say(row.conversation_id, body.text, author=DESK_AUTHOR)
-        outcome = await runtime.executor.resume_human(row.conversation_id, patch=body.patch or None)
+        try:
+            # Checked before the customer is told anything, so a refused patch is an error the
+            # operator can act on rather than a message sent for a resume that did not happen.
+            # `resume_human` checks it again under the conversation lock, which is the
+            # authoritative one; this is the one that keeps the ordering honest (finding P1).
+            await runtime.executor.check_state_patch(row.conversation_id, body.patch)
+            if body.text:
+                await runtime.say(row.conversation_id, body.text, author=DESK_AUTHOR)
+            outcome = await runtime.executor.resume_human(
+                row.conversation_id, patch=body.patch or None
+            )
+        except StatePatchError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
         await _resolve(handoff_id, "resumed", body.human_id)
         await runtime.announce(row.conversation_id)
         return JSONResponse(

@@ -167,6 +167,97 @@ async def test_resume_continues_from_the_handoff_nodes_resumed_edge(
     assert texts[-1] == "Is there anything else I can help you with?"
 
 
+async def test_a_resume_patch_naming_an_undeclared_field_is_refused(
+    engine: AsyncEngine,
+) -> None:
+    """Review finding P1, reproduced as the reviewer reproduced it.
+
+    A desk operator mistypes one field name. Before the fix the key was written straight into
+    ``run.frames`` where no API call could remove it, every later entry to the frame failed the
+    graph's state model, and the conversation was parked for ever with
+    ``handoff_reason = 'pack_incompatible'`` - which blames the pack for a typo at the desk.
+
+    What the operator is owed instead is an error they can act on: the field they got wrong, the
+    fields the graph actually declares, and a run that has not moved.
+    """
+    app = build_app(ACME, engine, config=_config())
+    async with serving(app) as host:
+        row = await _handed_off(host, "desk-patch-0001")
+        async with httpx.AsyncClient(base_url=f"http://{host}") as client:
+            refused = await client.post(
+                f"/desk/handoffs/{row['id']}/resume",
+                json={"patch": {"identity_verified": True, "not_a_field": "x"}, "human_id": "u1"},
+            )
+            assert refused.status_code == 400, refused.text
+            message = refused.json()["error"]
+            assert "not_a_field" in message, "the operator is told which field is wrong"
+            assert "charge_hint" in message, "and which fields the graph does allow"
+            after = (await client.get(f"/desk/handoffs/{row['id']}")).json()
+
+            # And the conversation is still workable: a patch the graph *can* hold still lands.
+            accepted = await client.post(
+                f"/desk/handoffs/{row['id']}/resume",
+                json={"patch": {"intent": "handled_by_a_person"}, "human_id": "u1"},
+            )
+            assert accepted.status_code == 200, accepted.text
+
+    conversation_id = uuid.UUID(row["conversation_id"])
+    assert after["status"] == "open", "a refused resume does not resolve the queue row"
+    run = await _run_row(engine, conversation_id)
+    assert run["frames"][0]["state"] == {"intent": "handled_by_a_person"}
+    assert "not_a_field" not in run["frames"][0]["state"]
+    assert run["status"] == "waiting_customer", "the conversation was never bricked"
+    assert (run["awaiting"] or {}).get("kind") != "handoff", "the pack was never at fault"
+
+
+async def test_a_resume_patch_may_not_set_identity_verified(engine: AsyncEngine) -> None:
+    """DESIGN.md section 10: only the ``verify_identity`` sub-graph sets it, via a tool.
+
+    The same rule ``AppConfig`` is already held to for a new conversation's context. A desk that
+    could grant it would open every identity gate in the pack from an unauthenticated endpoint.
+    """
+    app = build_app(ACME, engine, config=_config())
+    async with serving(app) as host:
+        row = await _handed_off(host, "desk-patch-0002")
+        async with httpx.AsyncClient(base_url=f"http://{host}") as client:
+            refused = await client.post(
+                f"/desk/handoffs/{row['id']}/resume", json={"patch": {"identity_verified": True}}
+            )
+            assert refused.status_code == 400, refused.text
+            assert "identity_verified" in refused.json()["error"]
+
+    run = await _run_row(engine, uuid.UUID(row["conversation_id"]))
+    assert run["status"] == "waiting_human", "the run did not move"
+    assert run["frames"][0]["state"] == {"intent": "account_question"}
+
+
+async def test_a_resume_patch_cannot_reach_a_live_approval(engine: AsyncEngine) -> None:
+    """A patch may not be a way to authorise, revive or re-price an approved action (8.2).
+
+    The frame holds a proposal the customer agreed to. Editing the state that proposal was
+    computed from, from an endpoint with no authentication, is either a silent change to what
+    they agreed to or a run-time hash refusal nobody at the desk can see. The desk has one route
+    to an action and it is ``approve``, which copies the customer's own row.
+    """
+    app = build_app(ACME, engine, config=_config())
+    async with serving(app) as host:
+        row = await _handed_off(host, "desk-patch-0003")
+        conversation_id = uuid.UUID(row["conversation_id"])
+        run = await _run_row(engine, conversation_id)
+        await _propose(engine, conversation_id, run["id"], frame_seq=run["frames"][-1]["frame_seq"])
+        async with httpx.AsyncClient(base_url=f"http://{host}") as client:
+            refused = await client.post(
+                f"/desk/handoffs/{row['id']}/resume", json={"patch": {"intent": "whatever"}}
+            )
+            assert refused.status_code == 409, refused.text
+            assert "issue_refund" in refused.json()["error"]
+
+    assert [a["approved_by"] for a in await _approvals(engine, conversation_id)] == ["customer"]
+    after = await _run_row(engine, conversation_id)
+    assert after["status"] == "waiting_human"
+    assert after["frames"][0]["state"] == {"intent": "account_question"}
+
+
 async def test_close_takes_the_handoff_nodes_closed_edge(engine: AsyncEngine) -> None:
     """ "Take over fully" is a decision the *pack* expresses, not one the engine imposes.
 
@@ -297,7 +388,9 @@ async def _approvals(engine: AsyncEngine, conversation_id: uuid.UUID) -> list[di
         return [dict(row) for row in result.mappings()]
 
 
-async def _propose(engine: AsyncEngine, conversation_id: uuid.UUID, run_id: uuid.UUID) -> None:
+async def _propose(
+    engine: AsyncEngine, conversation_id: uuid.UUID, run_id: uuid.UUID, *, frame_seq: int = 1
+) -> None:
     """Write the customer's approval of a refund, as a ``confirm`` node's checkpoint would.
 
     By hand, because the conversation under test is an account question rather than a refund:
@@ -309,12 +402,13 @@ async def _propose(engine: AsyncEngine, conversation_id: uuid.UUID, run_id: uuid
             sql_text(
                 "INSERT INTO action_approval (conversation_id, run_id, frame_seq, node_id, "
                 "step_id, tool, args, args_hash, approved_by, approved_at) VALUES "
-                "(:c, :r, 1, 'confirm_refund', 'step:1', 'issue_refund', CAST(:args AS jsonb), "
+                "(:c, :r, :f, 'confirm_refund', 'step:1', 'issue_refund', CAST(:args AS jsonb), "
                 " 'deadbeef', 'customer', now())"
             ),
             {
                 "c": conversation_id,
                 "r": run_id,
+                "f": frame_seq,
                 "args": json.dumps({"charge_id": "ch_1002", "amount": 29.0}),
             },
         )

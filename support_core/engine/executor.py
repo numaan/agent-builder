@@ -39,6 +39,7 @@ from support_core.engine.errors import (
     EngineError,
     IncompatiblePackError,
     NodeError,
+    StatePatchError,
 )
 from support_core.engine.hooks import (
     ConfirmDecision,
@@ -140,6 +141,14 @@ RESUMABLE_BY_CUSTOMER = frozenset(["idle", "done", "waiting_customer"])
 """Statuses in which a customer message starts or continues a turn. A run waiting for a human,
 a tool or a timer keeps its queue: the message is stored and stays ``pending`` until the thing
 it is waiting for arrives, because resuming it early would drop that wait on the floor."""
+
+DESK_PATCH_FORBIDDEN = frozenset(["identity_verified"])
+"""State field names a desk ``resume`` patch may never write, whatever a graph declares.
+
+One name so far, and it is the one that matters: DESIGN.md section 10 says
+``identity_verified`` is set by the ``verify_identity`` sub-graph alone, through a tool.
+``AppConfig`` is held to the same rule for a new conversation's starting context; this is that
+rule on the other unauthenticated surface (review finding P1)."""
 
 
 @dataclass(slots=True)
@@ -425,6 +434,26 @@ class Executor:
             expected="waiting_human",
             patch=patch,
         )
+
+    async def check_state_patch(
+        self, conversation_id: uuid.UUID, patch: Mapping[str, Any] | None
+    ) -> None:
+        """Would :meth:`resume_human` accept this patch? Raises if not (review finding P1).
+
+        For a caller that has to do something *before* the resume it cannot take back - the desk
+        writes the human's parting message into the transcript first - so that a refused patch is
+        an error the operator reads rather than a message the customer reads about a hand-back
+        that never happened. Takes no lock and writes nothing; :meth:`resume_human` checks again
+        inside the lock, and that check is the authoritative one.
+        """
+        if not patch:
+            return
+        run = await self._run_for(conversation_id)
+        turn = self._turn_state(run, TurnOutcome(conversation_id=conversation_id, run_id=run.id))
+        if not turn.frames:
+            msg = "this run has no frame a state patch could apply to"
+            raise StatePatchError(msg, status_code=409)
+        await self._check_patch(turn, patch)
 
     async def _node_is_waiting(self, conversation_id: uuid.UUID) -> bool:
         """Whether a node suspended this run, as opposed to the engine parking it."""
@@ -835,6 +864,10 @@ class Executor:
                 raise EngineError(msg)
             turn = self._turn_state(run, outcome)
             if patch:
+                # Checked before anything at all is written, and raising leaves the run exactly
+                # as it was: nothing in this method has touched the database yet, and the frame
+                # stack is still the in-memory copy `_turn_state` built (review finding P1).
+                await self._check_patch(turn, patch)
                 turn.frame.state.update(to_jsonable_python(patch))
             # A run parked by the engine itself (a limit, a node failure, a timeout) has no
             # node waiting on an event: re-run the node the human unblocked.
@@ -857,6 +890,73 @@ class Executor:
             await self._maybe_summarize(conversation_id)
             outcome.status = (await self._run_for(conversation_id)).status  # type: ignore[assignment]
         return outcome
+
+    async def _check_patch(self, turn: _Turn, patch: Mapping[str, Any]) -> None:
+        """Refuse a desk state patch the frame may not hold (review finding P1).
+
+        DESIGN.md section 13 lets a human "hand back (``resume`` with optional state patch, for
+        example marking an override as approved)". It does not say the patch is arbitrary, and
+        treating it as arbitrary is what made one mistyped field unrecoverable: the key went into
+        ``run.frames`` where no endpoint could remove it, every later entry to the frame failed
+        the graph's state model, and the run was parked for ever under ``pack_incompatible`` -
+        the wrong DESIGN.md section 7.3 reason, because the pack was never at fault.
+
+        Three rules, checked against the frame the run is actually suspended in. Nothing has run
+        since that suspension, so the suspended frame is the top of the stack (see
+        :meth:`_suspended_at`), and it is the frame the patch is applied to.
+
+        1. **Every field is one the graph declares.** The refusal names the offending fields and
+           lists the ones that exist, because the person reading it is a desk operator who has
+           mistyped something, not a programmer reading a traceback.
+        2. **Never** :attr:`identity_verified`. DESIGN.md section 10 gives that to the
+           ``verify_identity`` sub-graph alone, which sets it through a tool; ``AppConfig`` is
+           already held to the same rule for a new conversation's context, and a desk with no
+           authentication that could grant it would open every identity gate in the pack.
+        3. **Not while an approval is live on this frame.** An unconsumed ``action_approval`` is
+           a proposal the customer agreed to, computed from this frame's state. Editing that
+           state underneath it either changes what they agreed to or produces a hash mismatch at
+           the tool nobody at the desk can see. The desk's one route to an action is ``approve``,
+           which copies the customer's own row (DESIGN.md section 8.2).
+        """
+        frame = turn.frame
+        model = self._graph(frame).state.model
+        declared = model.model_fields
+        forbidden = [name for name in patch if name in DESK_PATCH_FORBIDDEN]
+        unknown = [name for name in patch if name not in declared and name not in forbidden]
+        problems: list[str] = []
+        if forbidden:
+            problems.append(
+                f"a desk patch may not set {forbidden}: DESIGN.md section 10 gives "
+                f"identity_verified to the verify_identity sub-graph alone, which sets it "
+                f"through a tool"
+            )
+        if unknown:
+            problems.append(
+                f"graph {frame.graph_id!r} does not declare the state field(s) {unknown}; "
+                f"it declares {sorted(declared)}"
+            )
+        if problems:
+            raise StatePatchError("; ".join(problems))
+        try:
+            model.model_validate({**frame.state, **to_jsonable_python(dict(patch))})
+        except ValidationError as exc:
+            msg = f"the patch does not fit the state shape of graph {frame.graph_id!r}: {exc}"
+            raise StatePatchError(msg) from exc
+        async with self.sessions() as session, session.begin():
+            live = await repo.live_approvals(session, turn.conversation_id)
+        blocking = [
+            approval
+            for approval in live
+            if approval.run_id == turn.run_id and approval.frame_seq == frame.frame_seq
+        ]
+        if blocking:
+            names = sorted({approval.tool for approval in blocking})
+            msg = (
+                f"this frame holds an approval the customer has already given for {names} and "
+                f"nothing has yet run; a state patch here would change what they agreed to. "
+                f"Approve or let the action lapse first"
+            )
+            raise StatePatchError(msg, status_code=409)
 
     async def _close(self, conversation_id: uuid.UUID) -> TurnOutcome:
         async with conversation_lock(

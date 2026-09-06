@@ -35,6 +35,24 @@ class NodeNotExecutableError(EngineError):
     """
 
 
+class StatePatchError(EngineError):
+    """A desk ``resume`` offered a state patch the frame may not hold (review finding P1).
+
+    Refused *before* anything is written, and reported to the caller rather than routed: a patch
+    is a human's typing at an API, so the answer is a 4xx naming the field they got wrong and the
+    fields the graph declares. Writing it and letting the next node entry fail is what produced
+    an unrecoverable frame and a ``pack_incompatible`` handoff that blamed the pack for a typo.
+
+    ``status_code`` distinguishes the two refusals: a patch the graph cannot hold is a malformed
+    request (400), while a patch blocked by a live approval is a conflict with the conversation's
+    own state (409).
+    """
+
+    def __init__(self, message: str, *, status_code: int = 400) -> None:
+        self.status_code = status_code
+        super().__init__(message)
+
+
 class IncompatiblePackError(EngineError):
     """A suspended run cannot continue on the pack now loaded (DESIGN.md section 6.7).
 

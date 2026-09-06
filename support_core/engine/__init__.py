@@ -13,6 +13,7 @@ from support_core.engine.errors import (
     IncompatiblePackError,
     NodeError,
     NodeNotExecutableError,
+    StatePatchError,
 )
 from support_core.engine.executor import Executor
 from support_core.engine.hooks import (
@@ -63,6 +64,7 @@ __all__ = [
     "NodeToolAccess",
     "OutboundMessage",
     "ResumeEvent",
+    "StatePatchError",
     "SuspendReason",
     "TurnOutcome",
     "build_runner",
