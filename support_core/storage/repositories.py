@@ -125,15 +125,36 @@ async def get_conversation(
     return await session.get(Conversation, conversation_id)
 
 
+async def conversation_by_channel_key(
+    session: AsyncSession, *, channel: str, channel_key: str
+) -> Conversation | None:
+    """The conversation a channel knows by its own name (DESIGN.md section 12).
+
+    A web chat session key across a reconnect, a mail thread across days: the durable key, never
+    a connection. ``uq_conversation_channel_key`` makes the answer unique per channel.
+    """
+    result = await session.execute(
+        select(Conversation).where(
+            Conversation.channel == channel, Conversation.channel_key == channel_key
+        )
+    )
+    return result.scalar_one_or_none()
+
+
 async def create_conversation(
     session: AsyncSession,
     *,
     channel: str,
     customer_ref: str | None = None,
     context: dict[str, Any] | None = None,
+    channel_key: str | None = None,
 ) -> Conversation:
     conversation = Conversation(
-        channel=channel, customer_ref=customer_ref, context=context or {}, status="open"
+        channel=channel,
+        channel_key=channel_key,
+        customer_ref=customer_ref,
+        context=context or {},
+        status="open",
     )
     session.add(conversation)
     await session.flush()
@@ -477,6 +498,25 @@ async def pending_outbound(session: AsyncSession, conversation_id: uuid.UUID) ->
         .order_by(Message.created_at, Message.ordinal, Message.id)
     )
     return list(result.scalars())
+
+
+async def transcript(
+    session: AsyncSession, conversation_id: uuid.UUID, limit: int = 200
+) -> list[Message]:
+    """The conversation as the customer saw it, oldest first, newest ``limit`` messages.
+
+    Distinct from :func:`recent_messages`, which is the prompt window of DESIGN.md section 10
+    and therefore excludes anything not committed into the conversation's history. This is what
+    a channel shows a client that reconnected: it includes a customer message still ``pending``
+    in the queue, because the customer typed it and would otherwise watch it disappear.
+    """
+    result = await session.execute(
+        select(Message)
+        .where(Message.conversation_id == conversation_id)
+        .order_by(Message.created_at.desc(), Message.ordinal.desc(), Message.id.desc())
+        .limit(limit)
+    )
+    return list(reversed(list(result.scalars())))
 
 
 async def trace(session: AsyncSession, run_id: uuid.UUID) -> list[TraceStep]:

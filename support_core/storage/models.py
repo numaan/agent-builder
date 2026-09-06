@@ -71,9 +71,25 @@ class Conversation(Base):
     """One customer conversation on one channel (section 17; section 10 "Customer context")."""
 
     __tablename__ = "conversation"
+    __table_args__ = (
+        Index(
+            "uq_conversation_channel_key",
+            "channel",
+            "channel_key",
+            unique=True,
+            postgresql_where=sql_text("channel_key IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     channel: Mapped[str] = mapped_column(nullable=False)
+    channel_key: Mapped[str | None] = mapped_column()
+    """The channel's own name for this conversation (section 12: "thread id, session id").
+
+    Unique per channel among the rows that have one, so a reconnecting web chat client and a
+    mail thread both resolve to the conversation they belong to rather than starting a second
+    one. ``None`` for a conversation nothing outside the database named."""
+
     customer_ref: Mapped[str | None] = mapped_column(index=True)
     status: Mapped[str] = mapped_column(nullable=False, server_default="open")
     context: Mapped[JsonObject] = mapped_column(nullable=False, server_default=_EMPTY_OBJECT)

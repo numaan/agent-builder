@@ -271,19 +271,26 @@ class Executor:
         customer_ref: str | None = None,
         context: dict[str, Any] | None = None,
         inputs: dict[str, Any] | None = None,
+        channel_key: str | None = None,
     ) -> uuid.UUID:
         """Create a conversation and its run. Returns the conversation id.
 
         ``context`` is the :class:`~support_core.graph.context.ConversationContext` the pack's
         expressions read as ``ctx``; ``inputs`` seeds the entry graph's state (see
-        :data:`ENTRY_INPUTS_KEY`).
+        :data:`ENTRY_INPUTS_KEY`); ``channel_key`` is the channel's own name for the conversation
+        (DESIGN.md section 12), unique per channel, by which a reconnecting client or a mail
+        thread finds it again.
         """
         stored = dict(context or {})
         if inputs:
             stored[ENTRY_INPUTS_KEY] = to_jsonable_python(inputs)
         async with self.sessions() as session, session.begin():
             conversation = await repo.create_conversation(
-                session, channel=channel, customer_ref=customer_ref, context=stored
+                session,
+                channel=channel,
+                customer_ref=customer_ref,
+                context=stored,
+                channel_key=channel_key,
             )
             await repo.create_run(
                 session,
