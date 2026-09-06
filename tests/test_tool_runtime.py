@@ -475,7 +475,7 @@ async def test_a_model_loop_call_gets_its_own_key_per_call(engine: AsyncEngine) 
 
     conversation_id, run_id = await conversation_and_run(engine)
     where = site(conversation_id, run_id, node_id="find_it")
-    runner = RegistryToolRunner(runtime(engine), where)
+    runner = RegistryToolRunner(runtime(engine), where, allowed=("peek",))
     first = await runner.invoke("peek", {"amount": 1.0}, call_id="a", step_id=where.step_id)
     second = await runner.invoke("peek", {"amount": 2.0}, call_id="b", step_id=where.step_id)
     assert not first.is_error and not second.is_error
@@ -483,6 +483,29 @@ async def test_a_model_loop_call_gets_its_own_key_per_call(engine: AsyncEngine) 
     async with engine.connect() as connection:
         keys = await connection.execute(text("SELECT idempotency_key FROM tool_call ORDER BY 1"))
         assert [row[0] for row in keys] == [f"{where.step_id}#tool1", f"{where.step_id}#tool2"]
+
+
+async def test_the_model_loop_runner_refuses_a_tool_its_node_did_not_declare(
+    engine: AsyncEngine,
+) -> None:
+    """Review finding R2: the node's allow-list is checked in the runtime too, not only above.
+
+    DESIGN.md section 8.4 makes the declared list and the READ tier one sentence, and the tier
+    was checked twice while the list was checked once. Here the gateway is bypassed entirely -
+    the runner is called directly, which is what a bug in the gateway amounts to - and the tool
+    the node never declared still does not run.
+    """
+    from support_core.tools.runtime import RegistryToolRunner
+
+    conversation_id, run_id = await conversation_and_run(engine)
+    where = site(conversation_id, run_id, node_id="find_it")
+    runner = RegistryToolRunner(runtime(engine), where, allowed=("charge",))
+
+    outcome = await runner.invoke("peek", {"amount": 1.0}, call_id="a", step_id=where.step_id)
+
+    assert outcome.is_error
+    assert "not a tool this step may call" in outcome.content
+    assert LEDGER.executed == []
 
 
 # -- failure, timeouts and the context patch ----------------------------------------------

@@ -596,11 +596,19 @@ class RegistryToolRunner:
     holds it. It reports each tool's *true* tier - including a WRITE tool a pack wrongly listed
     on an ``llm`` node - because reporting the truth is what lets the gateway refuse it, and the
     runtime refuses it again underneath.
+
+    ``allowed`` is the node's own ``tools:`` list, read by the executor from the validated graph
+    and carried in this object. DESIGN.md section 8.4 makes the node's list and the READ tier
+    one sentence, and the tier was checked twice while the list was checked once, in the gateway
+    alone (review finding R2). Now both are: the gateway refuses an undeclared tool before the
+    runner is spoken to, and a caller that got past the gateway - or around it - meets the same
+    list again in :meth:`ToolRuntime.invoke`, from a copy the gateway never touched.
     """
 
-    def __init__(self, runtime: ToolRuntime, site: CallSite) -> None:
+    def __init__(self, runtime: ToolRuntime, site: CallSite, *, allowed: Sequence[str]) -> None:
         self.runtime = runtime
         self.site = site
+        self.allowed = tuple(allowed)
         self.sequence = 0
 
     async def describe(self, names: Sequence[str]) -> Sequence[ModelToolSpec]:
@@ -637,6 +645,7 @@ class RegistryToolRunner:
                 args=arguments,
                 site=self.site,
                 caller="model_loop",
+                allowed=self.allowed,
                 key_suffix=suffix,
             )
         except ToolRefused as exc:

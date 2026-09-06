@@ -64,7 +64,7 @@ from support_core.engine.types import (
 )
 from support_core.graph.context import ConversationContext, CustomerContext
 from support_core.graph.manifest import Channel, SuspendStatus
-from support_core.graph.nodes import ConfirmNode, GateNode, NodeBase, ToolNode
+from support_core.graph.nodes import ConfirmNode, GateNode, LlmNode, NodeBase, ToolNode
 from support_core.graph.pack import Pack
 from support_core.graph.schema import Graph
 from support_core.llm.prompt import TranscriptMessage
@@ -163,6 +163,16 @@ def _spent(gateways: Sequence[ReadOnlyToolGateway]) -> int:
     not a way to buy an unbounded turn either (review finding V6).
     """
     return sum(len(gateway.calls) for gateway in gateways)
+
+
+def _model_tools(node: NodeBase) -> tuple[str, ...]:
+    """The tools this node offers the model, from the validated graph (DESIGN.md section 8.4).
+
+    Read here and given to the runner, so the node's allow-list is enforced in the runtime as
+    well as in the gateway (review finding R2). A node that is not an ``llm`` node offers the
+    model nothing, so a model-loop call from one is refused whatever it asks for.
+    """
+    return tuple(node.tools) if isinstance(node, LlmNode) else ()
 
 
 def _action_hasher(
@@ -753,7 +763,8 @@ class Executor:
                 llm=self.llm,
                 history=await self._history(turn.conversation_id),
                 tool_gateway=tool_gateway_factory(
-                    self.tool_runner or RegistryToolRunner(self.tools, site),
+                    self.tool_runner
+                    or RegistryToolRunner(self.tools, site, allowed=_model_tools(node)),
                     tool_risk=self._tool_risk,
                     max_calls=budget,
                     step_id=sid,
