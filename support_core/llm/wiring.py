@@ -22,7 +22,12 @@ from support_core.llm.service import SlotRequest as ServiceSlotRequest
 
 
 def service_for_pack(
-    pack: Any, provider: LLMProvider, *, sleep: Sleeper | None = None
+    pack: Any,
+    provider: LLMProvider,
+    *,
+    sleep: Sleeper | None = None,
+    default_model: str | None = None,
+    escalation_model: str | None = None,
 ) -> LlmService:
     """An :class:`~support_core.llm.service.LlmService` configured from ``pack.yaml``.
 
@@ -36,7 +41,8 @@ def service_for_pack(
         persona=pack.persona,
         policies=pack.policies,
         models=ModelChoice(
-            default=manifest.llm.default_model, escalation=manifest.llm.escalation_model
+            default=default_model or manifest.llm.default_model,
+            escalation=escalation_model or manifest.llm.escalation_model,
         ),
         budget=PromptBudget(**manifest.llm.prompt_budget),
         confidence_threshold=manifest.llm.confidence_threshold,

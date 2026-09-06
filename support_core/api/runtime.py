@@ -100,6 +100,13 @@ def build_provider(config: AppConfig, resolved: str) -> LLMProvider | None:
         from support_core.llm.anthropic_provider import AnthropicProvider
 
         return AnthropicProvider()
+    if resolved == "glm":
+        from support_core.llm.glm_provider import GlmProvider, api_key_present
+
+        if not api_key_present():
+            msg = "provider 'glm' needs GLM_API_KEY (or ZAI_API_KEY) in the environment"
+            raise ConfigError(msg)
+        return GlmProvider()
     msg = f"unknown provider {resolved!r}"
     raise ConfigError(msg)
 
@@ -276,7 +283,16 @@ def build_runtime(
     if provider is not None:
         resolved = provider.name
 
-    service = service_for_pack(pack, model_provider) if model_provider is not None else None
+    service = (
+        service_for_pack(
+            pack,
+            model_provider,
+            default_model=config.models.default,
+            escalation_model=config.models.escalation,
+        )
+        if model_provider is not None
+        else None
+    )
     engine_hooks = hooks or EngineHooks()
     if service is not None:
         engine_hooks.extract_slots = StructuredSlotExtractor(service)

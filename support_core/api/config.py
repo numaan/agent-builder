@@ -27,7 +27,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-ProviderChoice = Literal["auto", "replay", "anthropic", "none"]
+ProviderChoice = Literal["auto", "replay", "anthropic", "glm", "none"]
 """What answers an ``llm`` node.
 
 ``auto`` is the deployable default: a live provider where there is an API key, the recorded
@@ -42,10 +42,28 @@ ENV_PACK = "SUPPORT_PACK"
 ENV_PROVIDER = "SUPPORT_LLM_PROVIDER"
 ENV_CASSETTES = "SUPPORT_CASSETTE_DIR"
 ENV_API_KEY = "ANTHROPIC_API_KEY"
+ENV_MODEL = "SUPPORT_MODEL"
+ENV_ESCALATION_MODEL = "SUPPORT_ESCALATION_MODEL"
 
 
 class ConfigError(ValueError):
     """The application configuration is missing, unreadable or contradictory."""
+
+
+class ModelOverride(BaseModel):
+    """Model ids for this deployment, overriding the ones ``pack.yaml`` names.
+
+    DESIGN.md section 11.1 puts model choice in the pack, which is right: a pack author knows
+    which model their prompts were written for. It is wrong the moment the same pack is served
+    against a different vendor, because ``claude-sonnet-5`` is not a name GLM answers to. Making
+    that a deployment setting keeps the vendor out of the pack, which is what having a provider
+    abstraction was for.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    default: str | None = None
+    escalation: str | None = None
 
 
 class AppConfig(BaseModel):
@@ -57,6 +75,10 @@ class AppConfig(BaseModel):
     """The domain pack to serve. Relative paths resolve against the working directory."""
 
     provider: ProviderChoice = "auto"
+
+    models: ModelOverride = Field(default_factory=lambda: ModelOverride())
+    """Model ids for this deployment. Empty means the pack's own choice stands."""
+
     cassette_dir: Path | None = None
     """Recorded responses for the ``replay`` provider: every ``*.json`` cassette in the
     directory, merged. A request the recording has never seen is refused rather than guessed at,
@@ -108,6 +130,10 @@ class AppConfig(BaseModel):
             values["provider"] = source[ENV_PROVIDER]
         if source.get(ENV_CASSETTES):
             values["cassette_dir"] = Path(source[ENV_CASSETTES])
+        if source.get(ENV_MODEL):
+            values["models"]["default"] = source[ENV_MODEL]
+        if source.get(ENV_ESCALATION_MODEL):
+            values["models"]["escalation"] = source[ENV_ESCALATION_MODEL]
         try:
             return cls.model_validate(values)
         except ValidationError as exc:
@@ -143,4 +169,6 @@ class AppConfig(BaseModel):
         source = env if env is not None else os.environ
         if source.get(ENV_API_KEY):
             return "anthropic"
+        if source.get("GLM_API_KEY") or source.get("ZAI_API_KEY"):
+            return "glm"
         return "replay" if self.cassette_dir is not None else "none"

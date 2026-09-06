@@ -193,6 +193,49 @@ reachable. The channel endpoints are `WS /channels/web_chat/ws?session=<key>` an
 `202` with `"queued": true` when another turn holds that conversation's lock, rather than holding
 the connection until it frees.
 
+## Using GLM instead of Claude
+
+The model provider is configuration, not code (DESIGN.md section 11.1). Z.ai serves GLM through
+an endpoint that speaks the Anthropic message API, so GLM needs no second client: it is the same
+provider pointed at a different base URL, with prompt caching and `strict` tool schemas turned
+off because that endpoint does not implement them. Neither is load-bearing - the answer is still
+a tool call carrying the node's own schema, and it is still validated against the Pydantic model
+on the way back, so dropping `strict` costs a retry rather than a guarantee.
+
+```sh
+export GLM_API_KEY=your-key                               # ZAI_API_KEY also accepted
+sh scripts/db-up.sh
+python -m alembic upgrade head
+SUPPORT_APP_CONFIG=demo/acme_web_chat_glm.json python -m uvicorn app:app --port 8000
+```
+
+Unlike the recorded demo, this one answers whatever you type.
+
+`demo/acme_web_chat_glm.json` differs from the recorded configuration in three lines:
+
+```json
+{ "provider": "glm", "models": { "default": "glm-4.6", "escalation": "glm-4.6" } }
+```
+
+The `models` override exists because `pack.yaml` names Claude model ids, and a pack should not
+have to be edited to serve a different vendor. Set it per deployment, or with `SUPPORT_MODEL`
+and `SUPPORT_ESCALATION_MODEL`.
+
+| Variable | Meaning |
+|---|---|
+| `GLM_API_KEY` or `ZAI_API_KEY` | The key. Either name works. |
+| `GLM_BASE_URL` | A regional or self-hosted endpoint. Defaults to `https://api.z.ai/api/anthropic`. |
+| `SUPPORT_MODEL` | Overrides the pack's default model id. |
+| `SUPPORT_ESCALATION_MODEL` | Overrides the pack's escalation model id. |
+
+With `provider: "auto"` the app prefers Anthropic when `ANTHROPIC_API_KEY` is set, then GLM when
+a GLM key is set, then the recorded cassettes, then no provider at all.
+
+**Not yet verified against a live GLM endpoint.** No key was available when this was written, so
+the payload shape is tested but the round trip is not. The two things to watch on a first live
+run are whether the forced `tool_choice` is honoured and whether the tool-call answer comes back
+in the content blocks the parser expects.
+
 ## Running a conversation
 
 ```python

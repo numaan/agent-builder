@@ -1,0 +1,21 @@
+{
+  "title": "Acme Billing support (GLM)",
+  "pack": "packs/acme_billing",
+  "provider": "glm",
+  "new_conversation_context": {
+    "customer": {
+      "ref": "cus_acme_1",
+      "name": "Sam",
+      "email": "me@example.com"
+    }
+  },
+  "suggestions": [
+    "I got charged twice for the Pro Plan this month; can I have one of them back?",
+    "What is your refund policy?",
+    "I need to change the address on my account."
+  ],
+  "models": {
+    "default": "glm-4.6",
+    "escalation": "glm-4.6"
+  }
+}

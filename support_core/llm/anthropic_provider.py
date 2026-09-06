@@ -31,6 +31,7 @@ validation requires every object in the schema to close itself, which
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any
 
 from support_core.llm.prompt import estimate_tokens
@@ -85,7 +86,38 @@ def min_cacheable_tokens(model: str) -> int:
     return max(matches)[1] if matches else DEFAULT_MIN_CACHEABLE_TOKENS
 
 
-def build_payload(req: CompletionRequest) -> dict[str, Any]:
+@dataclass(frozen=True, slots=True)
+class ProviderCapabilities:
+    """What a given endpoint of the Anthropic message API actually supports.
+
+    The message API has more than one implementation. Anthropic's own supports prompt caching
+    and ``strict`` tool schemas; an Anthropic-compatible endpoint in front of another vendor's
+    model may support neither, and silently ignoring an unsupported field is the good case - the
+    bad case is a 400 that looks like a bug in the pack. Sending only what an endpoint supports
+    is cheaper than discovering the difference in front of a customer.
+    """
+
+    supports_cache_control: bool = True
+    """Whether a ``cache_control`` breakpoint on a system block does anything."""
+
+    supports_strict_tools: bool = True
+    """Whether a tool may carry ``strict: true``. Without it the schema is still sent and the
+    answer is still validated on the way back by ``StructuredByCompletion``, so the guarantee is
+    kept; it just costs a retry when the model strays instead of being refused up front."""
+
+
+ANTHROPIC_CAPABILITIES = ProviderCapabilities()
+"""Anthropic's own API."""
+
+COMPATIBLE_ENDPOINT_CAPABILITIES = ProviderCapabilities(
+    supports_cache_control=False, supports_strict_tools=False
+)
+"""The conservative assumption for a third-party Anthropic-compatible endpoint."""
+
+
+def build_payload(
+    req: CompletionRequest, capabilities: ProviderCapabilities = ANTHROPIC_CAPABILITIES
+) -> dict[str, Any]:
     """The keyword arguments for ``messages.create``. Pure, so it is testable without a key."""
     minimum = min_cacheable_tokens(req.model)
     prefix = 0
@@ -94,7 +126,9 @@ def build_payload(req: CompletionRequest) -> dict[str, Any]:
         entry: dict[str, Any] = {"type": "text", "text": block.text}
         prefix += estimate_tokens(block.text)
         if block.cache:
-            if prefix >= minimum:
+            if not capabilities.supports_cache_control:
+                log.debug("prompt cache breakpoint skipped: this endpoint does not support caching")
+            elif prefix >= minimum:
                 entry["cache_control"] = {"type": "ephemeral"}
             else:
                 log.info(
@@ -118,14 +152,14 @@ def build_payload(req: CompletionRequest) -> dict[str, Any]:
     if system:
         payload["system"] = system
     if req.structured is not None:
-        tools.append(
-            {
-                "name": req.structured.name,
-                "description": req.structured.description,
-                "input_schema": req.structured.json_schema,
-                "strict": True,
-            }
-        )
+        answer_tool: dict[str, Any] = {
+            "name": req.structured.name,
+            "description": req.structured.description,
+            "input_schema": req.structured.json_schema,
+        }
+        if capabilities.supports_strict_tools:
+            answer_tool["strict"] = True
+        tools.append(answer_tool)
         # Forced only when there is nothing else the model could legitimately do. With read
         # tools present, forcing the answer tool would remove the loop DESIGN.md section 8.4
         # describes before it could gather anything.
@@ -209,24 +243,36 @@ class AnthropicProvider(StructuredByCompletion):
         client: Any | None = None,
         max_retries: int = 2,
         timeout: float = 60.0,
+        base_url: str | None = None,
+        name: str = "anthropic",
+        capabilities: ProviderCapabilities = ANTHROPIC_CAPABILITIES,
     ) -> None:
+        self._name = name
+        self._capabilities = capabilities
         if client is not None:
             self._client = client
         else:
             import anthropic  # imported lazily: constructing a client needs credentials
 
-            self._client = anthropic.AsyncAnthropic(
-                api_key=api_key or os.environ.get(API_KEY_ENV),
-                max_retries=max_retries,
-                timeout=timeout,
-            )
+            options: dict[str, Any] = {
+                "api_key": api_key or os.environ.get(API_KEY_ENV),
+                "max_retries": max_retries,
+                "timeout": timeout,
+            }
+            if base_url is not None:
+                options["base_url"] = base_url
+            self._client = anthropic.AsyncAnthropic(**options)
 
     @property
     def name(self) -> str:
-        return "anthropic"
+        return self._name
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return self._capabilities
 
     async def complete(self, req: CompletionRequest) -> CompletionResponse:
-        payload = build_payload(req)
+        payload = build_payload(req, self._capabilities)
         try:
             message = await self._client.messages.create(**payload)
         except Exception as exc:  # mapped below; the SDK's classes are imported lazily
