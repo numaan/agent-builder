@@ -24,6 +24,12 @@ random code and stores its hash**; a passcode that is a pure function of the add
 to is a fake, and is only defensible because this one never leaves the process. Which
 conversation a code was sent in is still tracked, so a code cannot be checked in a conversation
 that was never sent one.
+
+**A real pack must rate-limit this, and by more than a count.** :data:`MAX_OTP_ATTEMPTS` here is
+the minimum honest thing - three wrong guesses and the passcode stops being checkable in this
+conversation, however many times another code is sent. A real one limits per account and per
+address as well, over a window, with a lockout that outlives the conversation; otherwise "three
+guesses" is three guesses *per conversation* and a new conversation is free.
 """
 
 import hashlib
@@ -42,6 +48,19 @@ OTP_EXEMPT_REASON = (
 )
 
 
+MAX_OTP_ATTEMPTS = 3
+"""Wrong guesses a conversation gets before the passcode stops being checkable at all.
+
+A six-digit code with unlimited guesses is not a verification (review finding R3): the graph's
+wrong-code edge returns to ``send_code``, the fake's code is a pure function of the address, and
+one customer message per guess is not a cost worth anything against a million possibilities.
+Three because that is what a bank card gets, and because the failure path - hand this to a human
+- is cheap and already exists.
+
+The count is per conversation and survives a re-send, which is the half that matters: a limit
+the customer can reset by asking for another code is not a limit."""
+
+
 @dataclass(slots=True)
 class OtpStore:
     """One-time passcodes, in memory, one per conversation."""
@@ -50,11 +69,17 @@ class OtpStore:
     deliveries: list[tuple[uuid.UUID, str, str]] = field(default_factory=list)
     """``(conversation, address, code)`` for every send, so a test can watch the side effect."""
 
+    wrong: dict[uuid.UUID, int] = field(default_factory=dict)
+    """Wrong guesses per conversation. Never cleared by a re-send; see :data:`MAX_OTP_ATTEMPTS`."""
+
     def code_for(self, address: str) -> str:
         """The code this address's passcode will be. Deterministic on purpose; see the module
         docstring for why that is a property of the fake and not of the design."""
         digest = hashlib.sha256(address.strip().lower().encode("utf-8")).hexdigest()
         return f"{int(digest[:8], 16) % 1_000_000:06d}"
+
+    def locked(self, conversation_id: uuid.UUID) -> bool:
+        return self.wrong.get(conversation_id, 0) >= MAX_OTP_ATTEMPTS
 
     def send(self, conversation_id: uuid.UUID, address: str) -> str:
         code = self.code_for(address)
@@ -63,14 +88,20 @@ class OtpStore:
         return code
 
     def check(self, conversation_id: uuid.UUID, code: str | None) -> bool:
-        expected = self.sent.get(conversation_id)
-        if expected is None or not code:
+        """Check one guess and count it if it was wrong. A locked conversation checks nothing."""
+        if self.locked(conversation_id):
             return False
-        return code.strip().replace(" ", "") == expected
+        expected = self.sent.get(conversation_id)
+        guess = (code or "").strip().replace(" ", "")
+        matched = bool(expected) and guess == expected
+        if not matched:
+            self.wrong[conversation_id] = self.wrong.get(conversation_id, 0) + 1
+        return matched
 
     def reset(self) -> None:
         self.sent.clear()
         self.deliveries.clear()
+        self.wrong.clear()
 
 
 OTP = OtpStore()
@@ -95,6 +126,8 @@ class VerifyOtpInput(_Model):
 
 class VerifyOtpOutput(_Model):
     verified: bool
+    locked: bool = False
+    """No guesses left. The graph routes on this instead of asking again for ever (finding R3)."""
 
 
 async def _send_otp(payload: Any, ctx: ToolContext) -> SendOtpOutput:
@@ -112,7 +145,7 @@ async def _verify_otp(payload: Any, ctx: ToolContext) -> VerifyOtpOutput:
         # The node does not write ``ctx``; this asks the engine to, and the engine commits it
         # with the checkpoint (DESIGN.md sections 6.1, 19 step 9).
         ctx.patch_customer(identity_verified=True)
-    return VerifyOtpOutput(verified=verified)
+    return VerifyOtpOutput(verified=verified, locked=OTP.locked(ctx.conversation_id))
 
 
 SEND_OTP: Tool = FunctionTool(

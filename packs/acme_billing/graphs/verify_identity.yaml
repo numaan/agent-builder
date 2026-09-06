@@ -10,6 +10,7 @@ state:
   code_sent: bool | None
   sent_to: str | None
   verified: bool | None
+  locked: bool | None
 start: send_code
 nodes:
   send_code:
@@ -34,7 +35,7 @@ nodes:
     description: Check the code and, if it matches, mark the identity verified.
     tool: verify_otp
     args: { code: state.code }
-    into: { verified: result.verified }
+    into: { verified: result.verified, locked: result.locked }
     on_error: not_verified
     next: verified_router
 
@@ -42,7 +43,18 @@ nodes:
     type: router
     edges:
       state.verified == true: verified
+      state.locked == true: too_many_attempts
     default: wrong_code
+
+  too_many_attempts:
+    type: say
+    description: >-
+      The attempt limit of the tool, in the graph (review finding R3). Without it, wrong_code
+      returns to send_code for ever and a six-digit code has unlimited guesses.
+    message: >-
+      That code did not match either, and I have to stop guessing at this point. I am passing
+      this to a person who can verify you another way.
+    next: not_verified
 
   wrong_code:
     type: say
