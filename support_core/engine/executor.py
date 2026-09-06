@@ -48,6 +48,7 @@ from support_core.engine.runners import (
     NodeRuntime,
     build_runner,
     resolve_edge,
+    tool_gateway_factory,
 )
 from support_core.engine.types import (
     SUSPEND_STATUSES,
@@ -66,7 +67,11 @@ from support_core.graph.pack import Pack
 from support_core.graph.schema import Graph
 from support_core.llm.prompt import TranscriptMessage
 from support_core.llm.service import LlmService
-from support_core.llm.tool_loop import ModelToolRunner, UnavailableToolRunner
+from support_core.llm.tool_loop import (
+    ModelToolRunner,
+    ReadOnlyToolGateway,
+    UnavailableToolRunner,
+)
 from support_core.storage import repositories as repo
 from support_core.storage.models import Conversation, Run
 from support_core.storage.repositories import RunUpdate, StepWrite
@@ -111,6 +116,7 @@ class _Turn:
     seq: int
     next_frame_seq: int
     turn_nodes: int
+    turn_tool_calls: int
     outcome: TurnOutcome
     pending_event: ResumeEvent | None = None
     """The event that started this turn, until the node it belongs to consumes it.
@@ -135,9 +141,19 @@ class _RunRow:
     checkpoint_seq: int
     next_frame_seq: int
     turn_nodes: int
+    turn_tool_calls: int
     awaiting: dict[str, Any] | None
     pack_fingerprint: str | None
     recovery_attempts: int = 0
+
+
+def _spent(gateways: Sequence[ReadOnlyToolGateway]) -> int:
+    """Model-loop tool calls this node made, refusals included.
+
+    Refusals count, as they do inside the gateway: "ask for the refund tool a thousand times" is
+    not a way to buy an unbounded turn either (review finding V6).
+    """
+    return sum(len(gateway.calls) for gateway in gateways)
 
 
 def _snapshot(run: Run) -> _RunRow:
@@ -149,6 +165,7 @@ def _snapshot(run: Run) -> _RunRow:
         checkpoint_seq=run.checkpoint_seq,
         next_frame_seq=run.next_frame_seq,
         turn_nodes=run.turn_nodes,
+        turn_tool_calls=run.turn_tool_calls,
         awaiting=dict(run.awaiting) if run.awaiting else None,
         pack_fingerprint=run.pack_fingerprint,
         recovery_attempts=run.recovery_attempts,
@@ -468,6 +485,7 @@ class Executor:
 
         turn.status = "running"
         turn.turn_nodes = 0
+        turn.turn_tool_calls = 0
         claimed = await self._claim(turn, message_id)
         if not claimed:  # pragma: no cover - impossible while we hold the conversation lock
             return None
@@ -491,7 +509,7 @@ class Executor:
             # A run marked in flight with nothing on the stack. Whatever put it there, the
             # message that drove it goes back on the queue rather than down with it.
             await self._requeue(turn, turn.pending_event)
-            await self._set(run.id, status="idle", turn_nodes=0, awaiting=None)
+            await self._set(run.id, status="idle", turn_nodes=0, turn_tool_calls=0, awaiting=None)
             return await self._run_for(conversation.id)
         undelivered = await self._loop(turn, self._context(conversation))
         await self._requeue(turn, undelivered)
@@ -660,6 +678,13 @@ class Executor:
             node = graph.nodes[frame.node_id]
             attempt = frame.attempts.get(frame.node_id, 0)
             sid = step_id(turn.run_id, frame.frame_seq, frame.node_id, attempt)
+            # The tool budget of DESIGN.md section 5.1 is per *turn*, so what this node may spend
+            # is what the turn has left (review finding V6). ``opened`` collects the gateways the
+            # node built, so the checkpoint can record what it actually spent.
+            opened: list[ReadOnlyToolGateway] = []
+            budget = max(
+                0, self.pack.manifest.limits.max_tool_calls_per_turn - turn.turn_tool_calls
+            )
             runtime = NodeRuntime(
                 graph=graph,
                 frame=frame,
@@ -670,9 +695,13 @@ class Executor:
                 environment=self.pack.environment,
                 llm=self.llm,
                 history=await self._history(turn.conversation_id),
-                tool_runner=self.tool_runner,
-                tool_risk=self._tool_risk,
-                max_tool_calls=self.pack.manifest.limits.max_tool_calls_per_turn,
+                tool_gateway=tool_gateway_factory(
+                    self.tool_runner,
+                    tool_risk=self._tool_risk,
+                    max_calls=budget,
+                    step_id=sid,
+                    record=opened.append,
+                ),
             )
             runner = self._runner(graph, frame.node_id, node)
             started = self.hooks.clock()
@@ -695,12 +724,14 @@ class Executor:
                     result = await runner.run(state, ctx, runtime)
                 self._check_outputs(turn, frame, result)
             except NodeError as exc:
+                turn.turn_tool_calls += _spent(opened)
                 if delivering:
                     turn.pending_event = None
                 if not await self._route_error(turn, graph, frame, node, sid, started, exc):
                     return turn.pending_event
                 check_gates = False
                 continue
+            turn.turn_tool_calls += _spent(opened)
             if delivering:
                 turn.pending_event = None
             await self.hooks.probe("after_node", {"step_id": sid, "node_id": frame.node_id})
@@ -1032,6 +1063,7 @@ class Executor:
             checkpoint_seq=step.seq,
             next_frame_seq=turn.next_frame_seq,
             turn_nodes=turn.turn_nodes + 1,
+            turn_tool_calls=turn.turn_tool_calls,
             updated_at=now,
             suspended_at=suspended_at,
             timeout_at=timeout_at,
@@ -1143,6 +1175,7 @@ class Executor:
         """
         turn.status = "running"
         turn.turn_nodes = 0
+        turn.turn_tool_calls = 0
         async with self.sessions() as session, session.begin():
             # One transaction, not two: a crash between counting the turn and marking the run
             # running would count a turn that never started, and "every K turns" would drift.
@@ -1151,6 +1184,7 @@ class Executor:
                 turn.run_id,
                 status="running",
                 turn_nodes=0,
+                turn_tool_calls=0,
                 awaiting=self._with_turn_event(turn, None),
                 timeout_at=None,
                 suspended_at=None,
@@ -1254,6 +1288,7 @@ class Executor:
             seq=run.checkpoint_seq,
             next_frame_seq=run.next_frame_seq,
             turn_nodes=run.turn_nodes,
+            turn_tool_calls=run.turn_tool_calls,
             outcome=outcome,
         )
 

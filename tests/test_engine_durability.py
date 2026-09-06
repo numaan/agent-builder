@@ -244,6 +244,7 @@ async def test_two_checkpoints_of_one_step_id_are_refused_by_the_database(
                 checkpoint_seq=seq,
                 next_frame_seq=1,
                 turn_nodes=seq,
+                turn_tool_calls=0,
                 updated_at=now,
             ),
             StepWrite(
@@ -569,6 +570,7 @@ async def test_messages_written_by_one_checkpoint_keep_their_order(engine: Async
                 checkpoint_seq=1,
                 next_frame_seq=1,
                 turn_nodes=1,
+                turn_tool_calls=0,
                 updated_at=now,
             ),
             step=StepWrite(

@@ -141,3 +141,51 @@ async def test_a_call_before_specs_were_resolved_is_refused() -> None:
     outcome = await gateway.call(ToolCall(id="tu", name="get_charge"))
     assert outcome.is_error
     assert runner.invoked == []
+
+
+async def test_a_custom_node_type_cannot_reach_the_tool_runner_through_its_runtime() -> None:
+    """Review finding V4, and PLAN.md's every-phase rule.
+
+    A pack-registered custom node type is arbitrary Python whose only handle on the outside is
+    its :class:`~support_core.engine.runners.NodeRuntime`. While the runner was a public field on
+    that dataclass, such a node could call ``rt.tool_runner.invoke("issue_refund", ...)`` and
+    never meet the gateway - inert only because the default runner refuses everything, and a
+    tool call with no ``ActionApproval`` the moment phase 4 installs a real one. The runner now
+    lives in the closure the gateway factory captured.
+    """
+    import uuid
+
+    from support_core import load_pack
+    from support_core.engine.hooks import EngineHooks
+    from support_core.engine.runners import NodeRuntime, tool_gateway_factory
+    from support_core.engine.types import Frame
+    from tests.engine_support import PACKS
+
+    runner = Willing(HIGH)
+    pack = load_pack(PACKS / "llm_pack")
+    graph = pack.graphs["root"]
+    runtime = NodeRuntime(
+        graph=graph,
+        frame=Frame(frame_seq=0, graph_id="root", node_id="classify", kind="root", state={}),
+        step_id="s",
+        run_id=uuid.uuid4(),
+        conversation_id=uuid.uuid4(),
+        hooks=EngineHooks(),
+        environment=pack.environment,
+        tool_gateway=tool_gateway_factory(runner, tool_risk={}, max_calls=5, step_id="s"),
+    )
+
+    # Nothing a node can read off its runtime can execute a tool.
+    reachable = [
+        name
+        for name in dir(runtime)
+        if not name.startswith("__") and hasattr(getattr(runtime, name, None), "invoke")
+    ]
+    assert reachable == []
+
+    # The one route that does exist refuses a HIGH-tier tool, even a declared one.
+    gateway = runtime.tool_gateway(["issue_refund"])
+    assert await gateway.specs() == []
+    outcome = await gateway.call(ToolCall(id="tu", name="issue_refund"))
+    assert outcome.is_error
+    assert runner.invoked == []

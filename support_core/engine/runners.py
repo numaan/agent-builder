@@ -76,10 +76,16 @@ class NodeRuntime:
 
     The tool seam is deliberately not a callable a node can use directly. A pack-registered
     custom node type is arbitrary Python and ``rt`` is its only route to the outside
-    (reviews/phase-2.md, "the every-phase rule"), so what a node gets is
-    :meth:`tool_gateway` - a gateway constructed here, around the node's own declared tool list,
-    which refuses anything that is not a READ-tier tool that node declared. A node cannot obtain
-    the raw runner.
+    (reviews/phase-2.md, "the every-phase rule"), so what a node gets is :attr:`tool_gateway` -
+    a factory that builds a gateway around the node's own declared tool list, which refuses
+    anything that is not a READ-tier tool that node declared.
+
+    **The runtime does not hold the runner** (review finding V4). It used to, as a public
+    ``tool_runner`` field, which meant a custom node type could call
+    ``rt.tool_runner.invoke("issue_refund", ...)`` and never meet the gateway at all - inert
+    while the default runner refuses everything, and a tool call without an ``ActionApproval``
+    the moment phase 4 installs a real one. The runner is now captured in the closure
+    :func:`tool_gateway_factory` returns, and the executor is the only thing that holds it.
     """
 
     graph: Graph
@@ -99,28 +105,57 @@ class NodeRuntime:
     history: tuple[TranscriptMessage, ...] = ()
     """The recent window of DESIGN.md section 10, read once per turn by the executor."""
 
-    tool_runner: ModelToolRunner = field(default_factory=UnavailableToolRunner)
-    """Phase 4's seam. Never reachable from a node except through :meth:`tool_gateway`."""
-
-    tool_risk: Mapping[str, Risk] = field(default_factory=dict)
-    max_tool_calls: int = 10
+    tool_gateway: "ToolGatewayFactory" = field(default_factory=lambda: _no_tool_runtime)
+    """The only way to reach a tool from inside a node (DESIGN.md sections 8.2, 8.4)."""
 
     def render(self, source: str, scope: Mapping[str, Any]) -> str:
         return render(source, dict(scope), env=self.environment)
 
-    def tool_gateway(self, declared: Sequence[str]) -> ReadOnlyToolGateway:
-        """The only way to reach a tool from inside a node (DESIGN.md sections 8.2, 8.4).
 
-        Built here rather than passed in, so no caller can hand a node a gateway with a wider
-        allow-list than the node's own ``tools:`` declaration.
-        """
-        return ReadOnlyToolGateway(
-            runner=self.tool_runner,
+ToolGatewayFactory = Callable[[Sequence[str]], ReadOnlyToolGateway]
+"""Builds the gateway for one node from that node's own ``tools:`` list, and nothing wider."""
+
+
+def tool_gateway_factory(
+    runner: ModelToolRunner,
+    *,
+    tool_risk: Mapping[str, Risk],
+    max_calls: int,
+    step_id: str,
+    record: Callable[[ReadOnlyToolGateway], None] | None = None,
+) -> ToolGatewayFactory:
+    """Capture the tool runtime where a node cannot reach it (review finding V4).
+
+    ``runner`` lives in this closure and in the executor that built it. A node holds the
+    returned callable, whose only effect is to construct a
+    :class:`~support_core.llm.tool_loop.ReadOnlyToolGateway` around the tool list the node
+    itself declared - so a node cannot widen its own allow-list, and cannot get past the gateway
+    to the runner underneath.
+
+    ``record`` is how the executor learns what a node spent: every gateway built is reported to
+    it, so the per-*turn* budget of DESIGN.md section 5.1 can be counted on the run row rather
+    than re-granted to each node (review finding V6).
+    """
+
+    def build(declared: Sequence[str]) -> ReadOnlyToolGateway:
+        gateway = ReadOnlyToolGateway(
+            runner=runner,
             declared=tuple(declared),
-            manifest_risk=dict(self.tool_risk),
-            max_calls=self.max_tool_calls,
-            step_id=self.step_id,
+            manifest_risk=dict(tool_risk),
+            max_calls=max_calls,
+            step_id=step_id,
         )
+        if record is not None:
+            record(gateway)
+        return gateway
+
+    return build
+
+
+_no_tool_runtime: ToolGatewayFactory = tool_gateway_factory(
+    UnavailableToolRunner(), tool_risk={}, max_calls=10, step_id=""
+)
+"""The default: a gateway over the runner that refuses everything (phase 4 has not arrived)."""
 
 
 def scope_of(state: BaseModel, ctx: ConversationContext) -> dict[str, Any]:
@@ -420,7 +455,7 @@ class LlmRunner(_Runner):
             node_id=self.id,
             instructions=self.node.instructions,
             decisions=self._decisions(rt.graph),
-            output_schema=dict(self.node.output_schema),
+            output_schema=dict(self.node.output_schema or {}),
             state=state.model_dump(mode="json"),
             summary=ctx.summary,
             window=list(rt.history),
@@ -489,18 +524,31 @@ class LlmRunner(_Runner):
         return described
 
     def _patch(self, updates: Any, state: BaseModel) -> dict[str, Any]:
-        """State updates, restricted to what the node declared and the state can hold."""
+        """State updates, restricted to what the node declared and the state can hold.
+
+        ``declared`` is the node's ``output_schema`` and nothing else (review finding V2). It
+        used to fall back to "whatever the model wrote" when the node declared no schema, which
+        made the absence of a schema mean *any field, any type* rather than *none*: on a node
+        with no schema a model could write the graph's own ``outcome`` field, which a later
+        router or gate would then read as if the workflow had established it. The schema is now
+        also enforced one layer up, in
+        :func:`~support_core.llm.schemas.build_node_output_model`, so this check is the second
+        of two rather than the only one.
+        """
         if isinstance(updates, BaseModel):
             values = updates.model_dump(mode="json", exclude_unset=True)
         else:
             values = dict(updates or {})
-        declared = set(self.node.output_schema) or set(values)
+        declared = set(self.node.output_schema or {})
         fields = set(type(state).model_fields)
         unknown = sorted((set(values) - declared) | (set(values) - fields))
         if unknown:
+            declares = sorted(self.node.output_schema or {}) or (
+                "nothing, so this node may write no state"
+            )
             msg = (
                 f"{self.id}: the model tried to write state fields it was not offered: "
-                f"{unknown}; output_schema declares {sorted(self.node.output_schema) or 'nothing'}"
+                f"{unknown}; output_schema declares {declares}"
             )
             raise NodeError(msg, reason="llm_invalid_output")
         return values

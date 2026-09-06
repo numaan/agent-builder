@@ -34,6 +34,7 @@ class RunUpdate:
     checkpoint_seq: int
     next_frame_seq: int
     turn_nodes: int
+    turn_tool_calls: int
     updated_at: datetime
     suspended_at: datetime | None = None
     timeout_at: datetime | None = None
@@ -127,6 +128,7 @@ async def create_run(
         frames=[],
         checkpoint_seq=0,
         turn_nodes=0,
+        turn_tool_calls=0,
     )
     session.add(run)
     await session.flush()
@@ -226,6 +228,7 @@ async def claim_and_begin_turn(
                 frames=run.frames,
                 next_frame_seq=run.next_frame_seq,
                 turn_nodes=0,
+                turn_tool_calls=0,
                 suspended_at=None,
                 timeout_at=None,
                 awaiting=run.awaiting,
@@ -353,6 +356,7 @@ async def write_checkpoint(
                 checkpoint_seq=run.checkpoint_seq,
                 next_frame_seq=run.next_frame_seq,
                 turn_nodes=run.turn_nodes,
+                turn_tool_calls=run.turn_tool_calls,
                 suspended_at=run.suspended_at,
                 timeout_at=run.timeout_at,
                 awaiting=run.awaiting,

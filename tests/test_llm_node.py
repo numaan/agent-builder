@@ -9,6 +9,7 @@ model says - which is where an invented transition would have to be stopped.
 """
 
 import dataclasses
+import re
 import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -30,6 +31,7 @@ LLM_PACK = PACKS / "llm_pack"
 CLASSIFY = "Classify the customer's latest message"
 CHAT = "Reply to the small talk"
 RESEARCH = "Look up the balance with get_balance"
+RESEARCH_AGAIN = "Check the balance once more"
 EXTRACT = "The workflow asked the customer for specific values"
 
 
@@ -393,7 +395,7 @@ async def test_the_model_may_call_a_read_tool_and_gets_the_result_as_data(
     from support_core.llm.fake import render_request
 
     last = render_request(provider.calls[-1])
-    assert "-----BEGIN UNTRUSTED DATA (tool result from get_balance)-----" in last
+    assert re.search(r"BEGIN UNTRUSTED DATA [0-9a-f]{32} \(tool result from get_balance\)", last)
 
 
 async def test_a_high_risk_tool_is_refused_and_never_reaches_the_runtime(
@@ -457,6 +459,44 @@ async def test_the_tool_loop_is_bounded(pack: Pack, engine: AsyncEngine) -> None
     assert [request.reason for request in recorder.handoffs] == ["llm_invalid_output"]
     assert "never decided" in (recorder.handoffs[0].detail or "")
     assert len(runner.invoked) <= pack.manifest.limits.max_tool_calls_per_turn
+
+
+async def test_the_tool_budget_is_spent_per_turn_and_not_re_granted_to_each_node(
+    pack: Pack, engine: AsyncEngine
+) -> None:
+    """DESIGN.md section 5.1 says ``max_tool_calls_per_turn``; review finding V6 found it applied
+    per node, so a turn with three tool-using ``llm`` nodes could make three times the limit.
+
+    This pack allows four per turn. ``research`` spends three, so ``research_again`` - in the
+    same turn - has one left and its second request is refused rather than granted a fresh four.
+    """
+    from support_core.llm.types import ToolCall
+
+    call = [ToolCall(id="tu", name="get_balance", arguments={"customer_ref": "c1"})]
+    runner = FakeToolRunner([READ_TOOL])
+    executor, recorder, _ = build(
+        pack,
+        engine,
+        [
+            *REFUND_RULES,
+            Rule(when=RESEARCH_AGAIN, tool_calls=call, uses=2),
+            Rule(when=RESEARCH_AGAIN, respond=decision("done", message="Checked again.")),
+            Rule(when=RESEARCH, tool_calls=call, uses=3),
+            Rule(when=RESEARCH, respond=decision("again")),
+        ],
+        tool_runner=runner,
+    )
+    conversation_id = await executor.start_conversation()
+    await _through_the_ask(executor, conversation_id)
+
+    limit = pack.manifest.limits.max_tool_calls_per_turn
+    assert limit == 4
+    assert recorder.handoffs == []
+    # Four executions for the turn, not three plus two: the fourth request of the second node
+    # met a spent budget.
+    assert runner.invoked == ["get_balance"] * 4
+    row = await run_row(engine, conversation_id)
+    assert row["turn_tool_calls"] >= limit
 
 
 async def test_a_node_that_declares_tools_cannot_run_without_a_tool_runtime(

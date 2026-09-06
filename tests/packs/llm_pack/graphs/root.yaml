@@ -24,6 +24,7 @@ nodes:
     type: llm
     description: Ordinary conversation with no workflow behind it.
     instructions: Reply to the small talk in one short sentence.
+    output_schema: {}
     edges:
       done: finish_chat
 
@@ -39,6 +40,18 @@ nodes:
     instructions: |
       Look up the balance with get_balance before you answer, then report what you found.
     tools: [get_balance]
+    output_schema: {}
+    edges:
+      done: finish_refund
+      again: research_again
+
+  research_again:
+    type: llm
+    description: A second tool-using step in the same turn, for the per-turn tool budget.
+    instructions: |
+      Check the balance once more with get_balance and then report.
+    tools: [get_balance]
+    output_schema: {}
     edges:
       done: finish_refund
 

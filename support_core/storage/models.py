@@ -156,6 +156,13 @@ class Run(Base):
     turn_nodes: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     """Nodes executed in the current turn, for ``max_nodes_per_turn`` (section 7.3)."""
 
+    turn_tool_calls: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    """Model-loop tool calls made in the current turn, for ``max_tool_calls_per_turn``
+    (section 5.1, which says *per turn*; review finding V6 found the limit being applied per
+    node, so three tool-using ``llm`` nodes in one turn could make three times it). A column
+    beside ``turn_nodes`` for the same reason: a limit counted in memory resets when a process
+    dies mid-turn."""
+
     next_frame_seq: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     """The next value of ``Frame.frame_seq``. Monotonic and never reused, because ``frame_seq``
     is the second field of the step id (section 7.1): a graph invoked twice must not produce
