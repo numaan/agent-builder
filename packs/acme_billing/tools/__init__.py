@@ -9,6 +9,8 @@ what it exports.
 
 from support_core.tools import Tool
 
+from .address import ADDRESSES as ADDRESSES
+from .address import GET_ADDRESS, SET_ADDRESS
 from .billing import (
     BILLING,
     CHECK_REFUND_ELIGIBILITY,
@@ -20,6 +22,8 @@ from .identity import OTP, SEND_OTP, VERIFY_OTP
 
 TOOLS: list[Tool] = [
     LIST_RECENT_CHARGES,
+    GET_ADDRESS,
+    SET_ADDRESS,
     GET_CHARGE,
     CHECK_REFUND_ELIGIBILITY,
     ISSUE_REFUND,

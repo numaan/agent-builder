@@ -116,6 +116,8 @@ def test_the_sample_pack_exports_its_tools_with_the_tiers_it_declares() -> None:
     registry = registry_for_pack(SAMPLE_PACK)
     assert registry.risks == {
         "list_recent_charges": Risk.READ,
+        "get_address": Risk.READ,
+        "set_address": Risk.WRITE,
         "get_charge": Risk.READ,
         "check_refund_eligibility": Risk.READ,
         "issue_refund": Risk.HIGH,

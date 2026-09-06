@@ -146,8 +146,12 @@ ACME_ACCOUNT_QUESTION = Scenario(
             purpose="node",
         ),
     ),
-    expected_path=("classify", "escalate", "done_escalated"),
-    expected_authors=("customer", "agent"),
+    expected_path=("classify", "no_workflow", "anything_else"),
+    expected_authors=("customer", "agent", "agent"),
+    # Not "done": an account question this pack has no workflow for used to dead-end, so the
+    # customer's next message started a fresh conversation and got the same reply again. It now
+    # says what it can actually do and waits, which is why the run is waiting_customer.
+    expected_status="waiting_customer",
 )
 
 ACME_UNCLEAR = Scenario(

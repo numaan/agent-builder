@@ -41,7 +41,10 @@ def test_sample_pack_validates_with_its_graphs_via_cli() -> None:
     assert "empty" not in result.output
     # Two of the four workflows `interrupts` names still do not exist: phase 4 added `refund`
     # and `verify_identity`, and `update_address` and `payment_capture` are phase 6's.
-    assert result.output.count("manifest.interrupt_graph_unknown") == 2
+    # One, not two: pack.yaml's interrupts.blocked_in names `verify_identity`,
+    # `update_address` and `payment_capture`, and `update_address` now exists. Only
+    # `payment_capture` is still a forward reference.
+    assert result.output.count("manifest.interrupt_graph_unknown") == 1
     # Every confirm_exempt tool is reported, with the reason the pack had to give for it
     # (DESIGN.md section 8.2, phase-1 deferred finding J).
     assert result.output.count("graph.confirm_exempt") == 2
@@ -49,11 +52,11 @@ def test_sample_pack_validates_with_its_graphs_via_cli() -> None:
     # --strict fails on a warning but must not hide any finding (phase 0 review N3).
     strict = CliRunner().invoke(cli, ["pack", "validate", "--strict", str(SAMPLE_PACK)])
     assert strict.exit_code == EXIT_INVALID, strict.output
-    assert strict.output.count("manifest.interrupt_graph_unknown") == 2
+    assert strict.output.count("manifest.interrupt_graph_unknown") == 1
 
     quiet = CliRunner().invoke(cli, ["pack", "validate", "--quiet", str(SAMPLE_PACK)])
     assert quiet.exit_code == EXIT_OK
-    assert quiet.output.strip() == "acme-billing: well-formed (9 warning(s))"
+    assert quiet.output.strip() == "acme-billing: well-formed (19 warning(s))"
 
 
 def test_sample_pack_report() -> None:

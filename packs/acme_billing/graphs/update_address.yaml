@@ -1,0 +1,156 @@
+id: update_address
+description: >
+  Change the postal address on the customer's account. The second workflow in this pack, and the
+  one that shows what a workflow costs: this file, two tools, and one edge in root.yaml. Nothing
+  under support_core changed to add it. It has the same shape as the refund: an identity gate
+  that cannot be skipped, a read-only step to see what is there now, slots collected from the
+  customer, and a confirm whose approval is what authorises the one WRITE call.
+inputs:
+  address_hint: str | None
+outputs:
+  outcome: Literal["changed", "unchanged", "abandoned"]
+state:
+  address_hint: str | None
+  current: str | None
+  line1: str | None
+  line2: str | None
+  city: str | None
+  postcode: str | None
+  country: str | None
+  outcome: str | None
+
+start: identity_gate
+nodes:
+  identity_gate:
+    type: gate
+    description: >
+      Where a customer's post goes is how an account is taken over. Nothing in this graph runs
+      on an unverified identity, on any entry to it.
+    predicate: ctx.customer.identity_verified
+    redirect: verify_identity
+    next: read_current
+
+  read_current:
+    type: tool
+    description: What is on the account now, so the customer can be told what is changing.
+    tool: get_address
+    args:
+      customer_ref: ctx.customer.ref
+    into:
+      current: result.line1
+    next: collect
+
+  collect:
+    type: llm
+    description: Take the new address from what the customer has already said.
+    instructions: |
+      The customer wants to change the postal address on their account. Read what they have
+      said so far and fill in as much of the new address as they have actually given you.
+
+      Fill in only what they said. Do not invent a city from a postcode, do not complete a
+      partial street name, and do not carry anything over from the address currently on file.
+      Leave a field null if they have not given it.
+
+      If you have line1, city, postcode and country, decide "complete". Otherwise decide
+      "incomplete" and another step will ask them for the rest.
+    output_schema:
+      line1: str | None
+      line2: str | None
+      city: str | None
+      postcode: str | None
+      country: str | None
+    edges:
+      complete: confirm_change
+      incomplete: ask_address
+
+  ask_address:
+    type: ask
+    description: Ask for the parts that are missing.
+    slots: [line1, line2, city, postcode, country]
+    prompt: >-
+      What is the new address? I need the street, the town or city, the postcode and the
+      country.
+    next: check_complete
+
+  check_complete:
+    type: router
+    description: >
+      One pass round the loop only. If the customer left something out a second time, say so
+      rather than asking again: a form that keeps re-asking is worse than one that stops.
+    edges:
+      "state.line1 != null and state.city != null and state.postcode != null and state.country != null": confirm_change
+    default: give_up
+
+  confirm_change:
+    type: confirm
+    description: >
+      The approval is bound to a hash of these exact arguments. A field edited between this
+      question and the call is a mismatch, and the runtime refuses it.
+    action:
+      tool: set_address
+      args:
+        customer_ref: ctx.customer.ref
+        line1: state.line1
+        line2: state.line2
+        city: state.city
+        postcode: state.postcode
+        country: state.country
+    prompt: >-
+      I will change the address on your account to {{ state.line1 }}, {{ state.city }},
+      {{ state.postcode }}, {{ state.country }}. Shall I go ahead?
+    edges:
+      yes: apply_change
+      no: abandon
+
+  apply_change:
+    type: tool
+    description: The one WRITE call in this graph, and it runs only against a live approval.
+    tool: set_address
+    args:
+      customer_ref: ctx.customer.ref
+      line1: state.line1
+      line2: state.line2
+      city: state.city
+      postcode: state.postcode
+      country: state.country
+    requires_approval: confirm_change
+    into:
+      outcome: "changed"
+    on_error: trouble
+    next: tell_done
+
+  tell_done:
+    type: say
+    message: >-
+      That is done. Your address is now {{ state.line1 }}, {{ state.city }},
+      {{ state.postcode }}. Anything sent to you after today will go there.
+    next: done_changed
+
+  give_up:
+    type: say
+    message: >-
+      I still do not have enough of the address to change it safely, so I have left it as it
+      was. If you send me the full address I can try again.
+    next: done_unchanged
+
+  trouble:
+    type: say
+    message: >-
+      I could not save that change just now, so your address is unchanged. Please try again in
+      a few minutes.
+    next: done_unchanged
+
+  abandon:
+    type: say
+    message: No change made. Your address is as it was.
+    next: done_abandoned
+
+  done_changed:
+    type: end
+    outputs: { outcome: "changed" }
+  done_unchanged:
+    type: end
+    outputs: { outcome: "unchanged" }
+  done_abandoned:
+    type: end
+    outputs: { outcome: "abandoned" }
