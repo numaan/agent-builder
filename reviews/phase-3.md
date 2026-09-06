@@ -793,3 +793,146 @@ than recording them. Five things it did not find:
 None of the five changes this review's overall reading, which is that the phase is careful work
 whose two failures are both over-claims rather than oversights: the code does very nearly what
 the prose says, and the prose says slightly more than the code does.
+
+---
+
+## Resolution
+
+Resolver: a fresh agent that wrote none of the phase-3 code, 2026-09-06 (PLAN.md step 5). Both
+must-fix findings are fixed, each with a regression test confirmed to fail against the code as
+reviewed. Every should-fix and every nit is fixed; nothing from this review is deferred. The
+review itself was committed first as `03d3446` (it was sitting uncommitted, as in phases 0, 1
+and 2).
+
+**V1 was closed as a class, not as two instances.** The reviewer's own framing is the reason: the
+pattern missed a zero-width space and a seventh hash, and the next reader would have found a
+Cyrillic `с` in `support-core` or a fullwidth hash. A matcher that has to enumerate what a model
+might read as a delimiter cannot be finished, so the trust model is inverted instead. Every data
+fence now carries a **per-render delimiter token**, and the core prompt says in as many words
+that only a line carrying that token delimits anything. Untrusted content cannot produce such a
+line because it cannot know the token, whatever characters it uses - which is a property of the
+construction rather than of a list. The neutralising matcher stays as the second line of defence
+and is no longer byte-literal: it matches the Unicode-folded line (NFKC, format and control
+characters removed, every dash, rule and box-drawing character folded to `-`), so a look-alike is
+still visibly defused rather than reaching the model raw, and its invisible characters are
+escaped into `<U+200B>` so the attempt is legible in a trace.
+
+*Why a hash commitment and not `secrets.token_hex`.* The token is `sha256` over every slot,
+truncated to 128 bits. A random token has the unpredictability property trivially, but this
+repository's fake provider replays by `CompletionRequest.fingerprint()`, so identical inputs have
+to render identically or every cassette misses on every replay and
+`test_the_committed_cassette_is_what_the_builder_produces` cannot exist at all; the trace's
+`prompt_hash` and DESIGN.md 7.3's "LLM calls replay from the trace" want the same determinism.
+Deriving the token from the content keeps both properties: to embed the right token, an attacker
+must find a 128-bit fixed point of sha256 over content that includes their own message. That is a
+preimage problem, not a guessing game, and it does not get easier if they know every other layer
+verbatim. 128 rather than 64 bits because an attacker who controls *two* slots could otherwise
+grind the second one for a target in 2^64.
+
+*Where the token is stated.* At the top of the second, dynamic system block - never in layer 1.
+Layers 1 to 3 are the cached static prefix, and a value that changed every turn inside it would
+cost the cache every turn, which is finding V3's problem made worse. The consequence is that
+section *headers* are not nonce-carrying: they are core-written text defended by the folded
+matcher. That is sufficient because every untrusted slot is rendered inside a fence, so a forged
+header from untrusted content is enclosed by a genuine delimiter pair and is data by
+construction; the only slots outside a fence are the pack's own persona, policies, instructions
+and edge descriptions, and a pack that forges a header gains nothing it could not write in plain
+prose in the layer it already owns.
+
+**V2 is enforced twice, and made impossible to leave ambiguous.** At run time
+`build_node_output_model` now always gives `state_updates` a *typed*, closed model - an empty one
+when the node declares no `output_schema` - so the schema the provider is asked to answer into
+does not offer the field at all, and an answer that writes one fails validation before the runner
+sees it; the runner's `declared` set is then the `output_schema` alone, with no `or set(values)`
+fallback. At load time, `graph.llm_output_schema_absent` refuses a node that declares nothing.
+That last one deserves its reasoning stated: the reviewer asked for a rule catching "a pack that
+expects to write state without declaring a schema", and intent is not recoverable from a node's
+prose - so rather than guess, the rule requires the author to say which they meant.
+`output_schema: {}` is the one-line way to say "this node writes no state", and the shipped `chat`
+node now says it. This turns a semantic change that would otherwise be silent (absence meant
+*anything*, now means *nothing*) into a load-time error with both readings in the message.
+
+**V3: the breakpoint is now conditional and says when it is skipped.** Of the reviewer's three
+options, padding layer 1 past the threshold was rejected outright - padding a compliance surface
+to win a cache is the wrong trade, and it would have to be re-padded whenever the threshold moved
+- and deleting the breakpoint was rejected because `packs/acme_billing` is one phase of knowledge
+and policy text away from being cacheable, and DESIGN.md 11.1 asks for caching. So
+`build_payload` measures the prefix, compares it against a per-family minimum
+(`MIN_CACHEABLE_TOKENS`: 1024 by default, 512 for Opus, 2048 for Haiku), marks the block only if
+it fits, and logs at INFO what it measured and why it skipped otherwise. The shipped pack caches
+nothing today and now says so out loud instead of looking as though it caches; it starts caching
+with no code change when its persona and policies grow. The `live` group gains the one assertion
+that settles it against a real API: `cache_read_input_tokens` across two identical calls.
+
+| id | severity | action | commit |
+|----|----------|--------|--------|
+| V1 | must-fix | **Fixed by making the fence unforgeable.** Per-render delimiter token on every data block (`nonce_for`, a sha256 commitment over all slots), stated in the dynamic system block and in layer 1's rule 2; `neutralise` matches the Unicode-folded line (`fold`) and escapes invisibles; `neutralise_label` strips every character `str.splitlines` breaks on, which the new matrix caught forging a half-marker from four label slots. `tests/test_prompt_injection_matrix.py` is the review's 28 x 15 probe with a judge of its own rather than the module's matcher. **Confirmed failing first**: 122 forged lines across 118 of the 420 renderings against the reviewed code (more than the review's 81, because the independent judge is looser), 0 after. | `6198ab2` |
+| V2 | must-fix | **Fixed at run time and at load.** `state_updates` is always a typed closed model, empty when no `output_schema` is declared; `declared = set(self.node.output_schema)` unconditionally; `LlmNode.output_schema` is `None` when absent and `graph.llm_output_schema_absent` refuses that at load with both readings in the message; the shipped `chat` node declares `output_schema: {}`. **Confirmed failing first**: the reviewer's exact scenario routed on and ended `waiting_customer` with `outcome: "refunded"` in the checkpointed patch. | `c2f476c` |
+| V3 | should-fix | Fixed by making the breakpoint conditional on the measured prefix and a per-model minimum, logging when it is skipped, plus a `live` assertion on `cache_read_input_tokens`. Reasoning above. | `4c463d6` |
+| V4 | should-fix | Fixed. `NodeRuntime` no longer holds a runner at all: `tool_gateway` is a factory closure built by the executor (`tool_gateway_factory`), so the runner is reachable from neither a field nor a method. Adversarial test asserts that no public attribute of a `NodeRuntime` has an `invoke`, and that the one route that exists refuses a declared HIGH-tier tool. | `463a89b` |
+| V5 | should-fix | Fixed. `StructuredOutputError` gains a `summary` drawn from a fixed vocabulary (`SAFE_REASONS`), and the retry correction interpolates only that. Pydantic's own message - whose `loc` for an extra field *is* the model's key name - stays in `str(exc)`, which reaches the trace, the log and the handoff packet, none of which is a prompt. The two other `StructuredOutputError`s that carried model-written tool names into a correction got summaries too. | `6198ab2` |
+| V6 | should-fix | Fixed, both halves, and not deferred - the review's argument that Phase W makes it real rather than theoretical is right. `run.turn_tool_calls` (migration `0005`) counts the turn's model-loop tool calls beside `turn_nodes`, each node's gateway is built with what the turn has *left*, and the `+ 1` that bought six provider calls for a declared bound of five is gone. Test: two tool-using `llm` nodes in one turn against a limit of four make four calls, not four each. | `463a89b` |
+| V7 | should-fix | Fixed. Three more golden scenarios, one per remaining `classify` edge (`account_question`, `unclear`, `finished`), each keyed on the customer's own words so the scripted rules have to discriminate; `escalate`, `puzzled`, `done_escalated` and `done_finished` are now all executed by a golden conversation. `Scenario` gained `expected_authors` and `expected_status` so the shared assertions are per-scenario rather than the first scenario's shape. | `582a9d5` |
+| V8 | nit | Fixed: the static join filters empty layers, as the dynamic join already did. It matters more than a nit now, because V3 made that block's length load-bearing. | `6198ab2` |
+| V9 | nit | Fixed: `_state` sizes the fields once and drops until the estimate fits, then dumps. The dump-and-check loop is kept as a second pass, because YAML's own quoting and indentation can still push a borderline document over, but it no longer runs once per evicted field. | `6198ab2` |
+| V10 | nit | Fixed: `ReadOnlyToolGateway.label_for` returns the *resolved* spec's name, or `unknown tool` for a refusal, and the tool-result fence label uses it rather than echoing `call.name`. | `6198ab2` |
+| V11 | nit | Fixed, both halves. The sample pack sets `llm.retries` and `llm.prompt_budget`. The related self-critique point - a `prompt_budget.core_system` below core's own layer 1 is always wrong and was not a validator finding - is now `manifest.prompt_budget_too_small`, an ERROR at load rather than a `PromptTooLargeError` on the first customer's turn. | `582a9d5` |
+
+### The two adversarial matrices, before and after
+
+Both probes lived under a scratch directory and were deleted, which is how 23-of-25 could quietly
+become 21 in a later phase. Both are now tests that a plain `pytest` run collects.
+
+| matrix | reviewed code | after the resolution |
+|--------|---------------|----------------------|
+| Prompt injection: 28 payloads x 15 slots, 420 renderings (`tests/test_prompt_injection_matrix.py`) | **122 forged lines across 118 renderings** (the review measured 81 with a slightly narrower judge) | **0 of 420** |
+| Decision constraint: 25 hostile payloads through the real `LlmRunner` (`tests/test_llm_decision_matrix.py`) | **23 of 25 refused**; the two `state_updates`-with-no-schema cases routed and were checkpointed | **25 of 25 refused** |
+
+Nothing that held before fails now. Two details worth recording rather than smoothing over:
+
+* The injection matrix's judge is deliberately **not** the module's own `_RESERVED_LINE`. Asking
+  "does the thing this code neutralises get neutralised" is true by construction, and it was true
+  throughout the reviewed code while a zero-width space walked past both. The judge in the test
+  file folds Unicode itself and is looser than the real markers, which is why it counts more
+  forgeries than the review did against the same code. It also found one shape the review did
+  not: a passage id or message author containing U+2028 cut a genuine `BEGIN` marker in half,
+  because `neutralise_label` removed only `\n` and `\r`.
+* The ill-typed state write with no schema reproduced exactly as the review described it: not as
+  a refusal but as an `IncompatiblePackError` two nodes later, blaming the pack version. That is
+  the whole reason V2 is a must-fix rather than a nit.
+
+### Everything re-run at the end
+
+From the repository root with `.venv/Scripts/python.exe`; Postgres 16 in
+`customer-support-agent-db-1`, database `support_test`, `ANTHROPIC_API_KEY` unset.
+
+| Command | Result |
+|---------|--------|
+| `python -m ruff check .` | `All checks passed!` (exit 0) |
+| `python -m ruff format --check .` | `106 files already formatted` (exit 0) |
+| `python -m mypy` (strict) | `Success: no issues found in 106 source files` |
+| `python -m pytest -q` | `1057 passed, 2 deselected in 231.82s` |
+| `python -m pytest -q -m live` | `2 skipped, 1057 deselected` - skips on the missing key rather than failing |
+| `python -m pytest tests/verify_phase_2_resolution.py -q` | `39 passed in 142.78s` - phase 2's proof harness still holds |
+| `support pack validate packs/acme_billing` | `acme-billing: well-formed (4 warning(s))`, exit 0 |
+| `python -m alembic downgrade base`, `upgrade head`, `alembic check` | all five revisions down and up cleanly; `No new upgrade operations detected.` |
+| `python -m tests.cassettes.build_cassettes` | four scenarios recorded; the committed cassettes are what the builder produces |
+
+The 1057 are the reviewed 590 plus 467: 423 prompt-injection matrix (28 x 15 plus four properties
+of the token itself), 25 decision matrix, 4 state-write regressions, 5 more golden-conversation
+cases (four scenarios rather than one), and the rest spread across the tool gateway, the
+provider's cache decision and the validator's two new rules. The four `pack validate` warnings
+are unchanged: they are the forward references to graphs phases 4 and 6 add, and the review's
+recommendation that phase 6 close them rather than let them become background noise stands.
+
+### What this resolution did not touch
+
+The self-critique's open items are still open and still recorded there: no citation check
+(phase 5), no guardrails or injection flag (phase 7), no per-conversation cost cap (phase 9),
+`interrupt_check` still `continue`-only (phase 6), the four-characters-per-token estimate, and
+the conversation rendered as fenced data rather than native chat turns, which needs a real model
+to evaluate. One of them is now a backlog entry rather than only a paragraph: **an LLM call is
+still not replayed from the trace**, so a crash between the model answering and the checkpoint
+committing pays for the question twice and may answer differently. The review agreed with the
+deferral and named the right key - the step id, already on `NodeRuntime` - and it is written down
+against phase 7, which owns replay.
