@@ -195,16 +195,36 @@ class ToolRuntime:
         )
 
     async def complete_async(
-        self, *, tool_name: str, site: CallSite, payload: Mapping[str, Any], key_suffix: str = ""
+        self, *, tool_name: str, site: CallSite, payload: Mapping[str, Any], key: str
     ) -> ToolCallResult:
-        """Finish an async tool from its callback (DESIGN.md section 7.2)."""
+        """Finish an async tool from its callback (DESIGN.md section 7.2).
+
+        ``key`` is the idempotency key the **dispatch** claimed, not one derived from the site
+        as it stands now. The two are not the same string and cannot be made the same: the step
+        id carries the frame's attempt counter, and the checkpoint that records the suspension
+        increments it, so the pass that delivers a callback is always at least one attempt past
+        the pass that dispatched (review finding R1). The dispatching node therefore carries its
+        key out on the suspension - the same way a ``confirm`` node carries the hash of what it
+        showed - and the callback is matched to the call it belongs to rather than to a key
+        nobody claimed.
+
+        The key is still checked against the call site rather than trusted: the row it names
+        must belong to this run and this node, so a key that arrives from anywhere else buys
+        nothing.
+        """
         tool = self.registry.require(tool_name)
-        key = site.step_id + key_suffix
         now = self.clock()
         async with self.sessions() as session, session.begin():
             row = await repo.get_tool_call(session, key)
             if row is None:
                 msg = f"no dispatched call of {tool_name!r} under {key!r} to complete"
+                raise ToolRefused(msg)
+            if row.run_id != site.run_id or row.node_id != site.node_id or row.tool != tool.name:
+                msg = (
+                    f"{site.node_id}: the call under {key!r} belongs to {row.tool!r} at "
+                    f"{row.node_id!r} in another run; a callback completes the call its own node "
+                    f"dispatched and nothing else"
+                )
                 raise ToolRefused(msg)
             if row.status == "succeeded":
                 return self._replayed(tool, row)

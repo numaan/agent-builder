@@ -583,7 +583,9 @@ async def test_an_async_tool_is_dispatched_and_completed_by_its_callback(
         status = await connection.execute(text("SELECT status FROM tool_call"))
         assert status.scalar_one() == "awaiting_callback"
 
-    finished = await tools.complete_async(tool_name="dispatch", site=where, payload={"ok": True})
+    finished = await tools.complete_async(
+        tool_name="dispatch", site=where, payload={"ok": True}, key=started.idempotency_key
+    )
     assert not finished.pending
     assert finished.output_json == {"ok": True}
     async with engine.connect() as connection:
@@ -597,7 +599,51 @@ async def test_a_callback_for_a_call_that_was_never_dispatched_is_refused(
     conversation_id, run_id = await conversation_and_run(engine)
     with pytest.raises(ToolRefused, match="to complete"):
         await runtime(engine).complete_async(
-            tool_name="ping", site=site(conversation_id, run_id), payload={"ok": True}
+            tool_name="ping",
+            site=site(conversation_id, run_id),
+            payload={"ok": True},
+            key=site(conversation_id, run_id).step_id,
+        )
+
+
+async def test_a_callback_cannot_complete_a_call_another_node_dispatched(
+    engine: AsyncEngine,
+) -> None:
+    """The key travels on the suspension, so it is checked rather than trusted (finding R1).
+
+    A key names a row; the row records which run and which node claimed it. A callback whose key
+    names somebody else's call is refused, so carrying the key out of the suspending pass does
+    not turn it into a way to complete an arbitrary call.
+    """
+    from support_core.tools import FunctionTool, ToolRegistry
+    from tests.tool_support import Amount, Flag, _dispatch
+
+    dispatcher = FunctionTool(
+        name="dispatch",
+        description="A long-running write.",
+        input_model=Amount,
+        output_model=Flag,
+        risk=Risk.WRITE,
+        confirm_exempt=True,
+        confirm_exempt_reason="dispatching is not the act",
+        async_=True,
+        handler=_dispatch,
+    )
+    conversation_id, run_id = await conversation_and_run(engine)
+    tools = ToolRuntime(ToolRegistry([dispatcher]), make_session_factory(engine))
+    started = await tools.invoke(
+        tool_name="dispatch",
+        args={"amount": 4.0},
+        site=site(conversation_id, run_id, node_id="theirs"),
+        caller="tool_node",
+    )
+
+    with pytest.raises(ToolRefused, match="belongs to"):
+        await tools.complete_async(
+            tool_name="dispatch",
+            site=site(conversation_id, run_id, node_id="mine"),
+            payload={"ok": True},
+            key=started.idempotency_key,
         )
 
 

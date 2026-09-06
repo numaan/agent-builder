@@ -1,0 +1,17 @@
+# A pack whose only side effect is an async tool: dispatched by a `tool` node, completed by a
+# callback (DESIGN.md section 7.2, `waiting_async_tool`). The graphs exist so that the async
+# path is exercised through the *executor* rather than by calling the runtime's two halves with
+# a hand-built CallSite - which is what review finding R1 showed nobody had done.
+id: async-pack
+version: 0.1.0
+core: ">=0.0.1,<1"
+entry_graph: root
+language: en
+channels: [web_chat]
+llm:
+  default_model: claude-sonnet-5
+handoff:
+  queue: nobody
+limits:
+  max_nodes_per_turn: 25
+  max_tool_calls_per_turn: 5

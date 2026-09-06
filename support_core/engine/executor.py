@@ -842,11 +842,13 @@ class Executor:
                 requires_approval=requires_approval,
             )
 
-        async def complete(name: str, payload: Mapping[str, Any]) -> ToolCallResult:
+        async def complete(name: str, payload: Mapping[str, Any], key: str) -> ToolCallResult:
             if name not in allowed:  # pragma: no cover - the node passes its own tool
                 msg = f"{site.node_id}: {name!r} is not this node's tool"
                 raise ToolRefused(msg)
-            return await self.tools.complete_async(tool_name=name, site=site, payload=payload)
+            return await self.tools.complete_async(
+                tool_name=name, site=site, payload=payload, key=key
+            )
 
         return NodeToolAccess(
             invoke=invoke, complete=complete, hash_action=hasher, declared=allowed

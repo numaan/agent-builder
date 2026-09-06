@@ -71,7 +71,11 @@ a predicate must start with a root, so ``default`` never parses as one."""
 
 
 ToolInvoker = Callable[[str, Mapping[str, Any]], Awaitable[ToolCallResult]]
+ToolCompleter = Callable[[str, Mapping[str, Any], str], Awaitable[ToolCallResult]]
 ActionHasher = Callable[[str, Mapping[str, Any]], tuple[str, dict[str, Any]]]
+
+ASYNC_KEY = "idempotency_key"
+"""Where a suspended ``tool`` node records the key its dispatch claimed (finding R1)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,8 +99,13 @@ class NodeToolAccess:
     invoke: ToolInvoker
     """Run this node's declared tool. Raises :class:`~support_core.tools.base.ToolRefused`."""
 
-    complete: ToolInvoker
-    """Finish an async tool from its callback payload (DESIGN.md section 7.2)."""
+    complete: ToolCompleter
+    """Finish an async tool from its callback payload (DESIGN.md section 7.2).
+
+    Takes the idempotency key the dispatch claimed, which the node carried out on its
+    suspension: the step id computed on the *resuming* pass names a different attempt and so a
+    call nobody made (review finding R1).
+    """
 
     hash_action: ActionHasher
     """``sha256(tool + canonical_json(args))`` for a proposal, without running anything.
@@ -116,13 +125,21 @@ async def _no_tool_runtime_call(name: str, args: Mapping[str, Any]) -> ToolCallR
     raise ToolRefused(msg)
 
 
+async def _no_tool_runtime_complete(
+    name: str, payload: Mapping[str, Any], key: str
+) -> ToolCallResult:
+    return await _no_tool_runtime_call(name, payload)
+
+
 def _no_tool_runtime_hash(name: str, args: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
     msg = f"no tool runtime is configured, so {name!r} cannot be described or hashed"
     raise ToolRefused(msg)
 
 
 NO_TOOL_ACCESS = NodeToolAccess(
-    invoke=_no_tool_runtime_call, complete=_no_tool_runtime_call, hash_action=_no_tool_runtime_hash
+    invoke=_no_tool_runtime_call,
+    complete=_no_tool_runtime_complete,
+    hash_action=_no_tool_runtime_hash,
 )
 """The default: a node with no tool capability at all."""
 
@@ -777,10 +794,20 @@ class ToolRunner(_Runner):
             raise NodeError(f"{self.id}: tool argument failed: {exc}") from exc
         result = await self._call(rt.tools.invoke, args)
         if result.pending:
+            # The dispatch's idempotency key travels with the suspension, because the step id
+            # computed when the callback arrives names a later attempt and therefore a call
+            # nobody claimed (review finding R1). This is the same device the ``confirm`` node
+            # uses for its argument hash: what the resuming pass needs is what the suspending
+            # pass knew, and durable state is the only place the two can meet.
             return NodeResult(
                 suspend=SuspendReason(
                     status="waiting_async_tool",
-                    detail={"node": self.id, "kind": "async_tool", "tool": self.node.tool},
+                    detail={
+                        "node": self.id,
+                        "kind": "async_tool",
+                        "tool": self.node.tool,
+                        ASYNC_KEY: result.idempotency_key,
+                    },
                 )
             )
         return self._apply(result, state, ctx)
@@ -795,8 +822,26 @@ class ToolRunner(_Runner):
         if event.kind != "async_tool":
             msg = f"{self.id}: a tool node waits for its async tool's callback, not {event.kind!r}"
             raise NodeError(msg)
-        result = await self._call(rt.tools.complete, event.payload)
+        key = str(event.detail.get(ASYNC_KEY) or "")
+        if not key:
+            # Nothing to complete, and guessing a key is how the call that *is* waiting gets
+            # stranded. A run suspended by an older core has no key on its suspension, and a
+            # refusal it can route is a better answer than a callback applied to the wrong call.
+            msg = (
+                f"{self.id}: this suspension records no dispatched call to complete, so the "
+                f"callback cannot be matched to one"
+            )
+            raise NodeError(msg, reason="tool_refused")
+        result = await self._complete(rt.tools.complete, event.payload, key)
         return self._apply(result, state, ctx)
+
+    async def _complete(
+        self, call: ToolCompleter, payload: Mapping[str, Any], key: str
+    ) -> ToolCallResult:
+        async def invoke(name: str, args: Mapping[str, Any]) -> ToolCallResult:
+            return await call(name, args, key)
+
+        return await self._call(invoke, payload)
 
     async def _call(self, call: ToolInvoker, args: Mapping[str, Any]) -> ToolCallResult:
         try:

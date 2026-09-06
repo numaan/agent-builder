@@ -1,0 +1,20 @@
+# The shape review finding R1 measured: an async tool node whose `on_error` returns to the tool
+# node itself. A callback that cannot find the call it belongs to fails the node, the failure is
+# routed back here, and the node dispatches a second time - two side effects from one customer
+# intent and one callback.
+id: root
+description: Dispatch a long-running write and wait for its callback.
+state:
+  ok: bool | None
+start: dispatch_it
+nodes:
+  dispatch_it:
+    type: tool
+    description: Dispatches, suspends waiting_async_tool, and completes from the callback.
+    tool: dispatch_async
+    args: { amount: 5.0 }
+    into: { ok: result.ok }
+    on_error: dispatch_it
+    next: done
+
+  done: { type: end, outputs: {} }

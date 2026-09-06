@@ -112,6 +112,12 @@ async def _dispatch(payload: Any, ctx: ToolContext) -> Flag:
     return Flag()
 
 
+async def _dispatch_async(payload: Any, ctx: ToolContext) -> Flag:
+    """The side effect an async tool has *at dispatch*, which is the one that can happen twice."""
+    LEDGER.executed.append(("dispatch_async", payload.amount))
+    return Flag()
+
+
 CHARGE = FunctionTool(
     name="charge",
     description="Move money. High risk and not idempotent.",
@@ -194,6 +200,17 @@ DISPATCH = FunctionTool(
     confirm_exempt_reason="dispatching is not the act",
     handler=_dispatch,
 )
+DISPATCH_ASYNC = FunctionTool(
+    name="dispatch_async",
+    description="A long-running write whose result arrives on a callback.",
+    input_model=Amount,
+    output_model=Flag,
+    risk=Risk.WRITE,
+    confirm_exempt=True,
+    confirm_exempt_reason="dispatching is not the act",
+    async_=True,
+    handler=_dispatch_async,
+)
 HUMAN_ONLY = FunctionTool(
     name="human_only",
     description="Needs a human as well as the customer.",
@@ -214,6 +231,7 @@ TEST_TOOLS: list[Tool] = [
     VERIFY,
     SNEAK,
     DISPATCH,
+    DISPATCH_ASYNC,
     HUMAN_ONLY,
 ]
 

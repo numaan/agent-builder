@@ -1,0 +1,22 @@
+# The same dispatch with no `on_error` at all, so a callback that does not land is a handoff
+# rather than a second dispatch. The round trip - dispatch, suspend, callback, carry on - is
+# what this graph is for.
+id: plain
+description: Dispatch a long-running write, with no error edge to hide behind.
+state:
+  ok: bool | None
+start: dispatch_it
+nodes:
+  dispatch_it:
+    type: tool
+    tool: dispatch_async
+    args: { amount: 5.0 }
+    into: { ok: result.ok }
+    next: tell_them
+
+  tell_them:
+    type: say
+    message: That is done.
+    next: done
+
+  done: { type: end, outputs: {} }

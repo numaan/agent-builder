@@ -194,7 +194,7 @@ async def test_a_custom_node_type_cannot_reach_the_tool_runner_through_its_runti
     with pytest.raises(ToolRefused, match="may not invoke tools"):
         await runtime.tools.invoke("issue_refund", {"charge_id": "ch_1", "amount": 29.0})
     with pytest.raises(ToolRefused, match="may not invoke tools"):
-        await runtime.tools.complete("issue_refund", {})
+        await runtime.tools.complete("issue_refund", {}, "any-key")
 
     # The one route that does exist refuses a HIGH-tier tool, even a declared one.
     gateway = runtime.tool_gateway(["issue_refund"])
