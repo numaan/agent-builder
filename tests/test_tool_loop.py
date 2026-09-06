@@ -18,6 +18,7 @@ from support_core.llm.tool_loop import (
     UnavailableToolRunner,
 )
 from support_core.llm.types import ToolCall
+from support_core.tools.base import ToolRefused
 from support_core.tools.risk import Risk
 
 
@@ -175,13 +176,20 @@ async def test_a_custom_node_type_cannot_reach_the_tool_runner_through_its_runti
         tool_gateway=tool_gateway_factory(runner, tool_risk={}, max_calls=5, step_id="s"),
     )
 
-    # Nothing a node can read off its runtime can execute a tool.
+    # Nothing a node can read off its runtime is a tool runtime. Phase 4 adds exactly one
+    # attribute with an ``invoke``, and it is the per-node capability the executor built: for a
+    # node that is not a ``tool`` node it refuses every call, and it carries no reference to the
+    # ToolRuntime underneath (there is none to reach: the executor holds it).
     reachable = [
         name
         for name in dir(runtime)
         if not name.startswith("__") and hasattr(getattr(runtime, name, None), "invoke")
     ]
-    assert reachable == []
+    assert reachable == ["tools"]
+    with pytest.raises(ToolRefused, match="may not invoke tools"):
+        await runtime.tools.invoke("issue_refund", {"charge_id": "ch_1", "amount": 29.0})
+    with pytest.raises(ToolRefused, match="may not invoke tools"):
+        await runtime.tools.complete("issue_refund", {})
 
     # The one route that does exist refuses a HIGH-tier tool, even a declared one.
     gateway = runtime.tool_gateway(["issue_refund"])

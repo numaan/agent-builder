@@ -31,6 +31,8 @@ tools:
     description: Send a one-time passcode to the customer's email.
     risk: write
     confirm_exempt: true
+    confirm_exempt_reason: >-
+      a passcode the customer cannot be asked to confirm receiving (DESIGN.md section 8.2)
     input: { email: "str | None" }
     output: { sent: bool }
 

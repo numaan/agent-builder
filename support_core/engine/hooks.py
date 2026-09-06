@@ -14,6 +14,7 @@ hook                          owner phase  default
 ============================  ===========  ==================================================
 ``interrupt_check``           6            ``continue`` - resume the suspended node
 ``extract_slots``             3            the whole reply fills the first declared slot
+``confirm_decision``          4            an explicit yes or no word, else ``unclear``
 ``handoff``                   6            record nothing; the run still suspends for a human
 ``send``                      7            do not deliver; rows stay ``pending_send``
 ``summarize``                 3            no summary; ``conversation.summary`` is left alone
@@ -96,6 +97,84 @@ class SlotRequest(BaseModel):
 
 class SlotExtractor(Protocol):
     async def __call__(self, request: SlotRequest) -> dict[str, Any]: ...
+
+
+class ConfirmRequest(BaseModel):
+    """A customer's reply to a proposed action (DESIGN.md sections 6.2, 8.2)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str
+    graph_id: str
+    prompt: str
+    """The proposal exactly as it was shown to the customer."""
+
+    reply: str
+    tool: str
+    args: dict[str, Any] = Field(default_factory=dict)
+    """The canonical arguments of the action, so a classifier can see what was proposed."""
+
+    window: list[tuple[str, str]] = Field(default_factory=list)
+    ctx: ConversationContext
+
+
+class ConfirmDecision(BaseModel):
+    """Yes, no, or neither. There is no fourth answer and no default."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    answer: Literal["yes", "no", "unclear"]
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+class ConfirmChecker(Protocol):
+    async def __call__(self, request: ConfirmRequest) -> ConfirmDecision: ...
+
+
+AFFIRMATIVE: frozenset[str] = frozenset(
+    {
+        "yes",
+        "yes please",
+        "yep",
+        "yeah",
+        "y",
+        "ok",
+        "okay",
+        "sure",
+        "please",
+        "please do",
+        "go ahead",
+        "do it",
+        "confirm",
+        "confirmed",
+        "approved",
+        "proceed",
+    }
+)
+NEGATIVE: frozenset[str] = frozenset(
+    {"no", "nope", "n", "cancel", "stop", "do not", "don't", "dont", "no thanks", "not yet"}
+)
+
+
+async def keyword_confirm(request: ConfirmRequest) -> ConfirmDecision:
+    """The default reading of a confirm reply: an explicit word, or ``unclear``.
+
+    DESIGN.md section 6.2 requires "an explicit yes", so this matches the *whole* reply against a
+    closed list rather than looking for a "yes" somewhere inside it - "no, not the yes one"
+    contains one. Anything else is ``unclear``, which the ``confirm`` node turns into asking
+    again rather than into a decision either way: guessing "no" throws away a customer's
+    intention and guessing "yes" moves their money.
+
+    :class:`~support_core.llm.wiring.StructuredConfirmClassifier` replaces it wherever a provider
+    is configured. This stays because it is what lets the engine's own tests run without a model,
+    and because a pack that wants a deterministic confirmation can keep it.
+    """
+    reply = " ".join(request.reply.lower().strip().strip(".!,").split())
+    if reply in AFFIRMATIVE:
+        return ConfirmDecision(answer="yes")
+    if reply in NEGATIVE:
+        return ConfirmDecision(answer="no")
+    return ConfirmDecision(answer="unclear")
 
 
 class SummaryRequest(BaseModel):
@@ -184,6 +263,7 @@ class EngineHooks:
 
     interrupt_check: InterruptCheck = field(default=continue_interrupt_check)
     extract_slots: SlotExtractor = field(default=first_slot_extractor)
+    confirm_decision: ConfirmChecker = field(default=keyword_confirm)
     handoff: HandoffHook = field(default=no_handoff)
     send: ChannelSend = field(default=no_send)
     summarize: Summarizer = field(default=no_summary)

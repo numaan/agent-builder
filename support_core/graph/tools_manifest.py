@@ -31,10 +31,12 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from support_core.graph.types import BuiltModel, build_model
-from support_core.tools.risk import REQUIRES_CONFIRM, Risk
+from support_core.tools.base import Tool
+from support_core.tools.registry import ToolRegistry, field_types
+from support_core.tools.risk import Risk, needs_confirm
 
 MANIFEST_NAME = "tools/tools.yaml"
 
@@ -59,8 +61,23 @@ class ToolDeclaration(BaseModel):
     """DESIGN.md section 8.2: a WRITE tool the customer cannot reasonably be asked about, such
     as sending a one-time passcode. Every exemption is listed in the validator report."""
 
+    confirm_exempt_reason: str | None = None
+    """Why the exemption is defensible. Required whenever ``confirm_exempt`` is set (phase-1
+    deferred finding J): DESIGN.md section 8.2 asks for exemptions to be "reviewed deliberately",
+    and a flag nobody has to justify is not reviewed, it is noticed."""
+
     async_: bool = Field(default=False, alias="async")
     timeout_s: float = Field(default=15.0, gt=0)
+
+    @model_validator(mode="after")
+    def _exemption_is_justified(self) -> "ToolDeclaration":
+        if self.confirm_exempt and not (self.confirm_exempt_reason or "").strip():
+            msg = f"tool {self.name!r} is confirm_exempt and must give a confirm_exempt_reason"
+            raise ValueError(msg)
+        if self.confirm_exempt_reason and not self.confirm_exempt:
+            msg = f"tool {self.name!r} gives a confirm_exempt_reason but is not confirm_exempt"
+            raise ValueError(msg)
+        return self
 
 
 class ToolSpec(BaseModel):
@@ -90,10 +107,12 @@ class ToolSpec(BaseModel):
         one-time passcode". It is not offered for HIGH, which is "money, access, irreversible",
         so a HIGH tool still needs a confirm however it is declared. The validator reports the
         declaration itself as ``tools.high_risk_exempt``.
+
+        The decision itself lives in :func:`support_core.tools.risk.needs_confirm`, which the
+        run-time :class:`~support_core.tools.base.Tool` also calls, so a tool cannot be exempt to
+        the validator and not to the runtime.
         """
-        if self.risk is Risk.HIGH:
-            return True
-        return self.risk in REQUIRES_CONFIRM and not self.declaration.confirm_exempt
+        return needs_confirm(self.risk, confirm_exempt=self.declaration.confirm_exempt)
 
 
 class ToolManifest(BaseModel):
@@ -103,7 +122,11 @@ class ToolManifest(BaseModel):
 
     tools: dict[str, ToolSpec] = Field(default_factory=dict)
     present: bool = False
-    """False when the pack has no ``tools/tools.yaml`` at all."""
+    """False when the pack declares no tools at all."""
+
+    from_registry: bool = False
+    """True when these came from the pack's imported ``TOOLS`` rather than from YAML. Only then
+    are the risk tiers the ones the runtime will actually enforce."""
 
     def get(self, name: str) -> ToolSpec | None:
         return self.tools.get(name)
@@ -115,6 +138,37 @@ class ToolManifest(BaseModel):
             for spec in self.tools.values()
             if spec.declaration.confirm_exempt and spec.risk is not Risk.READ
         ]
+
+
+def manifest_from_registry(registry: ToolRegistry) -> ToolManifest:
+    """The validator's view of an *imported* registry (DESIGN.md section 8.3).
+
+    The rules type-check argument expressions against ``input_model`` and read ``risk``; taking
+    both from the imported :class:`~support_core.tools.base.Tool` is what makes the registry
+    authoritative (phase-1 deferred finding I). The declaration beside them is only for the
+    report and for the drift comparison against ``tools/tools.yaml``.
+    """
+    specs = {tool.name: spec_from_tool(tool) for tool in registry}
+    return ToolManifest(tools=specs, present=True, from_registry=True)
+
+
+def spec_from_tool(tool: Tool) -> ToolSpec:
+    declaration = ToolDeclaration(
+        name=tool.name,
+        description=tool.description,
+        risk=tool.risk,
+        input=field_types(tool.input_model),
+        output=field_types(tool.output_model),
+        idempotent=tool.idempotent,
+        requires_human_approval=tool.requires_human_approval,
+        confirm_exempt=tool.confirm_exempt,
+        confirm_exempt_reason=tool.confirm_exempt_reason,
+        timeout_s=tool.timeout_s,
+        **{"async": tool.async_},
+    )
+    return ToolSpec(
+        declaration=declaration, input_model=tool.input_model, output_model=tool.output_model
+    )
 
 
 def load_tool_manifest(pack_path: Path) -> ToolManifest:

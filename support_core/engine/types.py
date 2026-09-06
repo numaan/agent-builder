@@ -84,6 +84,15 @@ class ResumeEvent(BaseModel):
 
     message_id: uuid.UUID | None = None
 
+    detail: dict[str, Any] = Field(default_factory=dict)
+    """What the node recorded when it suspended (``run.awaiting.detail``), handed back to it.
+
+    A node that suspends knows something the node resuming needs and has nowhere else to put:
+    a ``confirm`` node's whole point is that the customer is answering *the proposal that was
+    shown to them*, so the approval hash computed at suspend time travels with the event rather
+    than being recomputed from a state the frame may have re-entered through a gate redirect in
+    between (DESIGN.md sections 6.6, 8.2)."""
+
     target_frame_seq: int | None = None
     target_node_id: str | None = None
     """The node that suspended, and therefore the only node this event may be delivered to.
@@ -113,6 +122,25 @@ class GraphInvocation(BaseModel):
     predicate is re-evaluated after its redirect returns (section 6.2)."""
 
 
+class ApprovalProposal(BaseModel):
+    """A ``confirm`` node's record that the customer said yes (DESIGN.md section 8.2).
+
+    The node computes it; the *executor* writes it, in the checkpoint transaction, with the run,
+    frame and node taken from the frame it is running - never from the node. A node cannot
+    therefore claim an approval was given somewhere it was not, and the executor honours the
+    field only from a node the graph declares as ``type: confirm``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool: str
+    args: dict[str, Any]
+    """The canonical arguments the hash was taken over."""
+
+    args_hash: str
+    approved_by: Literal["customer", "human"] = "customer"
+
+
 class NodeResult(BaseModel):
     """What a node returns (DESIGN.md section 6.3).
 
@@ -136,6 +164,16 @@ class NodeResult(BaseModel):
     llm_response: dict[str, Any] | None = None
     """Recorded on the trace step, so a replay of a completed step does not call a model
     again (DESIGN.md section 7.3). Phase 3 fills it."""
+
+    approval: ApprovalProposal | None = None
+    """An ``ActionApproval`` to record with this checkpoint (DESIGN.md section 8.2)."""
+
+    customer_patch: dict[str, Any] | None = None
+    """A change to ``ctx.customer`` a tool asked for (DESIGN.md section 19 step 9).
+
+    The whole new customer object, already validated by the tool runtime. Honoured only from a
+    ``tool`` node: ``ctx`` is read-only to nodes (section 6.1), and this is a tool's effect
+    travelling out through the node that called it, not a node writing context."""
 
     @model_validator(mode="after")
     def _one_way_out(self) -> "NodeResult":

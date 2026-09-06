@@ -65,9 +65,11 @@ def test_unregistering_something_that_was_never_registered_is_refused() -> None:
 
 
 async def test_a_node_type_core_cannot_run_names_its_phase() -> None:
-    block = NODE_TYPES["tool"].model.model_validate({"type": "tool", "tool": "x", "next": "y"})
-    runner = build_runner("issue_refund", block)
-    with pytest.raises(NodeNotExecutableError, match="not executable until phase 4"):
+    block = NODE_TYPES["handoff"].model.model_validate(
+        {"type": "handoff", "reason": "x", "edges": {"resumed": "a", "closed": "b"}}
+    )
+    runner = build_runner("escalate", block)
+    with pytest.raises(NodeNotExecutableError, match="not executable until phase 6"):
         await runner.run(None, None, _FakeRuntime())
 
 

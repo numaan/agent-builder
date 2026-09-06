@@ -8,6 +8,8 @@ outputs:
   outcome: str | None
 state:
   intent: str | None
+  charge_hint: str | None
+  refund_outcome: str | None
   anything_else: str | None
   outcome: str | None
 start: classify
@@ -18,22 +20,33 @@ nodes:
     instructions: |
       Read the customer's most recent message and decide which path it belongs on.
 
+      - refund: the customer wants money back for a charge they can point at.
       - small_talk: greetings, thanks, pleasantries, anything with no billing question in it.
-      - account_question: a question about a charge, an invoice, a refund, or the account
-        itself. These need account access, which this step does not have.
+      - account_question: a question about a charge, an invoice, or the account itself that is
+        not a request for a refund. These need account access, which this step does not have.
       - finished: the customer has said they need nothing further.
       - unclear: you cannot tell, or the message is empty, or it asks for something that is
         neither of the above.
 
-      Set intent to the label you chose. Do not answer the customer's question here; another
-      step does that.
+      Set intent to the label you chose. If they described a charge, put their own words for
+      it in charge_hint. Do not answer the customer's question here; another step does that.
     output_schema:
       intent: str | None
+      charge_hint: str | None
     edges:
+      refund: do_refund
       small_talk: chat
       account_question: escalate
       finished: done_finished
       unclear: puzzled
+
+  do_refund:
+    type: subgraph
+    description: The refund workflow (DESIGN.md section 6.4), with its own identity gate.
+    graph: refund
+    inputs: { charge_hint: state.charge_hint }
+    outputs: { refund_outcome: outcome }
+    next: anything_else
 
   chat:
     type: llm

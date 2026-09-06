@@ -13,7 +13,7 @@ frame stack and writes the checkpoint.
 """
 
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,8 +21,9 @@ from jinja2.sandbox import SandboxedEnvironment
 from pydantic import BaseModel
 
 from support_core.engine.errors import NodeError, NodeNotExecutableError
-from support_core.engine.hooks import EngineHooks, SlotRequest
+from support_core.engine.hooks import ConfirmRequest, EngineHooks, SlotRequest
 from support_core.engine.types import (
+    ApprovalProposal,
     Frame,
     GraphInvocation,
     NodeResult,
@@ -36,6 +37,7 @@ from support_core.graph.expr.syntax import Expr
 from support_core.graph.nodes import (
     NODE_TYPES,
     AskNode,
+    ConfirmNode,
     EndNode,
     GateNode,
     LlmNode,
@@ -45,6 +47,7 @@ from support_core.graph.nodes import (
     SayNode,
     Scalar,
     SubgraphNode,
+    ToolNode,
     edge_targets,
 )
 from support_core.graph.schema import Graph, parse_value
@@ -58,11 +61,70 @@ from support_core.llm.tool_loop import (
     UnavailableToolRunner,
 )
 from support_core.llm.types import LLMError, LLMUnavailableError, StructuredOutputError
+from support_core.tools.base import ToolError, ToolFailed, ToolRefused
 from support_core.tools.risk import Risk
+from support_core.tools.runtime import ToolCallResult
 
 DEFAULT_EDGE = "default"
 """The edge label a ``router`` returns when no predicate matched. Not a possible predicate:
 a predicate must start with a root, so ``default`` never parses as one."""
+
+
+ToolInvoker = Callable[[str, Mapping[str, Any]], Awaitable[ToolCallResult]]
+ActionHasher = Callable[[str, Mapping[str, Any]], tuple[str, dict[str, Any]]]
+
+
+@dataclass(frozen=True, slots=True)
+class NodeToolAccess:
+    """Everything one node may do with the tool runtime, and nothing wider.
+
+    Built by the executor, per node, from what the *validated graph* says that node is. Three
+    closures, each already carrying the node's identity, its frame, its step id, the single tool
+    it declared and the ``confirm`` node it named - so a node cannot widen its own permission,
+    cannot invoke a tool some other node declared, and cannot reach the
+    :class:`~support_core.tools.runtime.ToolRuntime` underneath, which the executor alone holds.
+    This is the shape phase 3's review finding V4 forced on the model-loop gateway, applied to
+    the deterministic path.
+
+    A node the graph does not declare as ``type: tool`` gets an :attr:`invoke` that refuses
+    everything. A pack-registered custom node type is arbitrary Python and ``rt`` is its only
+    route to the outside (reviews/phase-2.md), so what it may do with tools is exactly what an
+    ``llm`` node may do: the READ-only gateway, and nothing else.
+    """
+
+    invoke: ToolInvoker
+    """Run this node's declared tool. Raises :class:`~support_core.tools.base.ToolRefused`."""
+
+    complete: ToolInvoker
+    """Finish an async tool from its callback payload (DESIGN.md section 7.2)."""
+
+    hash_action: ActionHasher
+    """``sha256(tool + canonical_json(args))`` for a proposal, without running anything.
+
+    A ``confirm`` node needs the hash and nothing else; giving it the registry would give it the
+    tools too.
+    """
+
+    declared: tuple[str, ...] = ()
+
+
+async def _no_tool_runtime_call(name: str, args: Mapping[str, Any]) -> ToolCallResult:
+    msg = (
+        f"this node may not invoke tools; {name!r} would have to be called from a 'tool' node "
+        f"declared in the graph (DESIGN.md section 8.2)"
+    )
+    raise ToolRefused(msg)
+
+
+def _no_tool_runtime_hash(name: str, args: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+    msg = f"no tool runtime is configured, so {name!r} cannot be described or hashed"
+    raise ToolRefused(msg)
+
+
+NO_TOOL_ACCESS = NodeToolAccess(
+    invoke=_no_tool_runtime_call, complete=_no_tool_runtime_call, hash_action=_no_tool_runtime_hash
+)
+"""The default: a node with no tool capability at all."""
 
 
 @dataclass(slots=True)
@@ -106,7 +168,11 @@ class NodeRuntime:
     """The recent window of DESIGN.md section 10, read once per turn by the executor."""
 
     tool_gateway: "ToolGatewayFactory" = field(default_factory=lambda: _no_tool_runtime)
-    """The only way to reach a tool from inside a node (DESIGN.md sections 8.2, 8.4)."""
+    """The model-facing, READ-only loop of DESIGN.md section 8.4. Any node may build one."""
+
+    tools: NodeToolAccess = NO_TOOL_ACCESS
+    """The deterministic path of DESIGN.md section 8.2, narrowed to this node (see
+    :class:`NodeToolAccess`). A node that is not a ``tool`` node cannot invoke anything with it."""
 
     def render(self, source: str, scope: Mapping[str, Any]) -> str:
         return render(source, dict(scope), env=self.environment)
@@ -155,13 +221,15 @@ def tool_gateway_factory(
 _no_tool_runtime: ToolGatewayFactory = tool_gateway_factory(
     UnavailableToolRunner(), tool_risk={}, max_calls=10, step_id=""
 )
-"""The default: a gateway over the runner that refuses everything (phase 4 has not arrived)."""
+"""The default: a gateway over the runner that refuses everything, for an executor built
+without a tool runtime. The real one is built per node by the executor."""
 
 
 def scope_of(state: BaseModel, ctx: ConversationContext) -> dict[str, Any]:
     """The roots an expression or template may read (DESIGN.md section 6.4).
 
-    ``result`` is absent: it only exists inside a ``tool`` node's ``into`` mapping (phase 4).
+    ``result`` is absent: it only exists inside a ``tool`` node's ``into`` mapping, which
+    adds it for that one evaluation.
     """
     return {"state": state, "ctx": ctx}
 
@@ -554,6 +622,211 @@ class LlmRunner(_Runner):
         return values
 
 
+@dataclass(frozen=True, slots=True)
+class _Proposal:
+    """What a ``confirm`` node is about to show the customer, and its hash."""
+
+    prompt: str
+    tool: str
+    args: dict[str, Any]
+    args_hash: str
+
+
+class ConfirmRunner(_Runner):
+    """Present a proposed action and require an explicit yes (DESIGN.md sections 6.2, 8.2).
+
+    The node's whole job is to turn a customer's word into an
+    :class:`~support_core.storage.models.ActionApproval` bound to
+    ``sha256(tool_name + canonical_json(args))`` - and to refuse to do so in every case where
+    what the customer agreed to is not what would happen:
+
+    * the arguments are evaluated and hashed **when the proposal is shown**, and the hash travels
+      with the suspension. On resume the node hashes again and compares. A frame can be
+      re-entered between the two - a gate whose predicate lapsed pushes its redirect before the
+      reply is delivered (section 6.6) - so "the state now" is not automatically "the state the
+      customer was answering about". A difference re-presents the proposal instead of approving
+      the new one.
+    * an answer that is not an explicit yes or no is asked again, not resolved. Guessing "no"
+      discards what the customer wanted; guessing "yes" moves their money.
+    * the node records nothing at all on ``no``. An unused approval is a spendable one.
+
+    The approval is *proposed* here and written by the executor, in the checkpoint transaction,
+    with the run, frame and node id taken from the frame - so what a node can influence is the
+    tool and the arguments, both of which the hash covers, and not where the approval appears to
+    have come from.
+    """
+
+    __slots__ = ("node",)
+
+    def __init__(self, node_id: str, node: NodeBase) -> None:
+        super().__init__(node_id, node)
+        assert isinstance(node, ConfirmNode)
+        self.node = node
+
+    async def run(self, state: BaseModel, ctx: ConversationContext, rt: NodeRuntime) -> NodeResult:
+        return self._present(self._propose(state, ctx, rt))
+
+    async def resume(
+        self,
+        state: BaseModel,
+        ctx: ConversationContext,
+        rt: NodeRuntime,
+        event: ResumeEvent,
+    ) -> NodeResult:
+        if event.kind != "customer_message":
+            msg = f"{self.id}: a confirm node waits for a customer message, not {event.kind!r}"
+            raise NodeError(msg)
+        current = self._propose(state, ctx, rt)
+        presented = str(event.detail.get("args_hash") or "")
+        if presented and presented != current.args_hash:
+            # DESIGN.md 8.2's gap, caught at the earliest point rather than only at the call:
+            # what the customer is answering is not what would now happen.
+            changed = (
+                "The details of that action have changed since I asked, so I do not want to act "
+                "on the old answer."
+            )
+            return self._present(current, prefix=changed)
+        decision = await rt.hooks.confirm_decision(
+            ConfirmRequest(
+                node_id=self.id,
+                graph_id=rt.graph.id,
+                prompt=str(event.detail.get("prompt") or current.prompt),
+                reply=event.text or "",
+                tool=current.tool,
+                args=dict(current.args),
+                window=[(message.author, message.text) for message in rt.history],
+                ctx=ctx,
+            )
+        )
+        if decision.answer == "yes":
+            return NodeResult(
+                next_edge="yes",
+                approval=ApprovalProposal(
+                    tool=current.tool, args=dict(current.args), args_hash=current.args_hash
+                ),
+            )
+        if decision.answer == "no":
+            return NodeResult(next_edge="no")
+        return self._present(
+            current,
+            prefix="Sorry, I need a clear yes or no before I do anything.",
+        )
+
+    def _present(self, proposal: _Proposal, *, prefix: str | None = None) -> NodeResult:
+        text = f"{prefix}\n\n{proposal.prompt}" if prefix else proposal.prompt
+        return NodeResult(
+            outbound=[OutboundMessage(text=text)],
+            suspend=SuspendReason(
+                status="waiting_customer",
+                detail={
+                    "node": self.id,
+                    "kind": "confirm",
+                    "tool": proposal.tool,
+                    "args_hash": proposal.args_hash,
+                    "prompt": proposal.prompt,
+                },
+            ),
+        )
+
+    def _propose(self, state: BaseModel, ctx: ConversationContext, rt: NodeRuntime) -> _Proposal:
+        scope = scope_of(state, ctx)
+        try:
+            args = {name: value_of(raw, scope) for name, raw in self.node.action.args.items()}
+        except EvaluationError as exc:
+            raise NodeError(f"{self.id}: confirm action argument failed: {exc}") from exc
+        try:
+            args_hash, canonical = rt.tools.hash_action(self.node.action.tool, args)
+        except ToolError as exc:
+            raise NodeError(f"{self.id}: {exc}", reason="tool_refused") from exc
+        try:
+            prompt = rt.render(self.node.prompt, scope).strip()
+        except TemplateError as exc:
+            raise NodeError(f"{self.id}: confirm prompt template failed: {exc}") from exc
+        return _Proposal(
+            prompt=prompt, tool=self.node.action.tool, args=canonical, args_hash=args_hash
+        )
+
+
+class ToolRunner(_Runner):
+    """A deterministic tool call with arguments from state expressions (DESIGN.md section 6.2).
+
+    The node evaluates its ``args`` and hands them to the capability the executor built for it.
+    It does not decide whether the call is allowed: the risk policy, the approval check and the
+    idempotency key all live in :class:`~support_core.tools.runtime.ToolRuntime`, one layer
+    down, where a pack-registered node type cannot get at them either.
+
+    A refusal or a failure is a :class:`~support_core.engine.errors.NodeError`, which the
+    executor routes to the node's ``on_error`` edge if it declares one and to a handoff if it
+    does not (DESIGN.md section 7.3). The two are distinguished by ``reason`` - ``tool_refused``
+    means the runtime would not run it, ``tool_failed`` means it ran and something went wrong -
+    because a handoff packet that cannot tell those apart is not much of a packet.
+    """
+
+    __slots__ = ("node",)
+
+    def __init__(self, node_id: str, node: NodeBase) -> None:
+        super().__init__(node_id, node)
+        assert isinstance(node, ToolNode)
+        self.node = node
+
+    async def run(self, state: BaseModel, ctx: ConversationContext, rt: NodeRuntime) -> NodeResult:
+        scope = scope_of(state, ctx)
+        try:
+            args = {name: value_of(raw, scope) for name, raw in self.node.args.items()}
+        except EvaluationError as exc:
+            raise NodeError(f"{self.id}: tool argument failed: {exc}") from exc
+        result = await self._call(rt.tools.invoke, args)
+        if result.pending:
+            return NodeResult(
+                suspend=SuspendReason(
+                    status="waiting_async_tool",
+                    detail={"node": self.id, "kind": "async_tool", "tool": self.node.tool},
+                )
+            )
+        return self._apply(result, state, ctx)
+
+    async def resume(
+        self,
+        state: BaseModel,
+        ctx: ConversationContext,
+        rt: NodeRuntime,
+        event: ResumeEvent,
+    ) -> NodeResult:
+        if event.kind != "async_tool":
+            msg = f"{self.id}: a tool node waits for its async tool's callback, not {event.kind!r}"
+            raise NodeError(msg)
+        result = await self._call(rt.tools.complete, event.payload)
+        return self._apply(result, state, ctx)
+
+    async def _call(self, call: ToolInvoker, args: Mapping[str, Any]) -> ToolCallResult:
+        try:
+            return await call(self.node.tool, args)
+        except ToolRefused as exc:
+            raise NodeError(f"{self.id}: {exc}", reason="tool_refused") from exc
+        except ToolFailed as exc:
+            raise NodeError(f"{self.id}: {exc}", reason="tool_failed") from exc
+        except ToolError as exc:  # pragma: no cover - the two subclasses cover it
+            raise NodeError(f"{self.id}: {exc}", reason="tool_failed") from exc
+
+    def _apply(
+        self, result: ToolCallResult, state: BaseModel, ctx: ConversationContext
+    ) -> NodeResult:
+        """Map the tool's output into state through ``into`` (DESIGN.md section 6.4)."""
+        patch: dict[str, Any] = {}
+        into = self.node.into
+        if isinstance(into, str):
+            # ``into: state.charge`` - the whole result object into one field.
+            patch[into.removeprefix("state.")] = result.output_json
+        elif into:
+            scope = dict(scope_of(state, ctx))
+            scope["result"] = result.output
+            try:
+                patch = {name: value_of(raw, scope) for name, raw in into.items()}
+            except EvaluationError as exc:
+                raise NodeError(f"{self.id}: into mapping failed: {exc}") from exc
+        return NodeResult(state_patch=patch, customer_patch=result.customer_patch)
+
+
 class NotExecutableRunner(_Runner):
     """A node type core validates but cannot run yet, naming the phase that adds it."""
 
@@ -583,6 +856,8 @@ NODE_RUNNERS: dict[str, RunnerFactory] = {
     "gate": GateRunner,
     "ask": AskRunner,
     "llm": LlmRunner,
+    "tool": ToolRunner,
+    "confirm": ConfirmRunner,
 }
 """Runner per node type. A type in :data:`~support_core.graph.nodes.NODE_TYPES` but not here
 is validated and refused at run time by :class:`NotExecutableRunner`."""

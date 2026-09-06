@@ -48,6 +48,7 @@ tools:
     description: Send a one-time passcode.
     risk: write
     confirm_exempt: true
+    confirm_exempt_reason: the customer cannot be asked to confirm a passcode
     input: { charge_id: str }
     output: { sent: bool }
 """
@@ -827,6 +828,46 @@ nodes:
     assert "graph.approval_missing" in found
 
 
+def test_a_node_between_the_confirm_and_the_call_may_not_rewrite_the_arguments(
+    pack_dir: Path,
+) -> None:
+    """Phase-1 deferred finding H, and the reviewer's hostile case H.
+
+    The argument text on both sides is identical, so ``graph.approval_mismatch`` is happy; what
+    is not identical is what ``state.amount`` *means* by the time the call happens.
+    """
+    graph = confirmed(
+        '    edges: { "yes": do_it, "no": finish }',
+        '    edges: { "yes": bump, "no": finish }\n'
+        "  bump:\n"
+        "    type: tool\n"
+        "    tool: read_tool\n"
+        "    args: { charge_id: state.charge_id }\n"
+        "    into: { amount: result.amount }\n"
+        "    next: do_it",
+    )
+    found = rules(pack_dir, {"main": graph})
+    assert "graph.approval_args_mutated" in found
+    assert "graph.approval_mismatch" not in found, "the argument text is identical on both sides"
+
+
+def test_a_node_that_writes_something_else_between_confirm_and_call_is_fine(
+    pack_dir: Path,
+) -> None:
+    """The rule is about the fields the *approved arguments* read, not about any write."""
+    graph = confirmed(
+        '    edges: { "yes": do_it, "no": finish }',
+        '    edges: { "yes": note, "no": finish }\n'
+        "  note:\n"
+        "    type: tool\n"
+        "    tool: read_tool\n"
+        "    args: { charge_id: state.charge_id }\n"
+        "    into: { outcome: result.label }\n"
+        "    next: do_it",
+    )
+    assert rules(pack_dir, {"main": graph}, Severity.ERROR) == set()
+
+
 def test_a_confirm_on_only_one_path_is_caught(pack_dir: Path) -> None:
     """The rule is "on all paths", not "somewhere in the graph"."""
     graph = """
@@ -895,7 +936,11 @@ nodes:
 """
     found = check(pack_dir, {"main": graph})
     assert "graph.unconfirmed_write" not in {f.rule for f in found}
-    assert "graph.confirm_exempt" in {f.rule for f in found if f.severity is Severity.INFO}
+    # A WARNING from phase 4 (deferred finding J), so `--strict` fails on it and the reason the
+    # pack had to write down is in the message.
+    exemptions = [f for f in found if f.rule == "graph.confirm_exempt"]
+    assert [f.severity for f in exemptions] == [Severity.WARNING]
+    assert "cannot be asked to confirm a passcode" in exemptions[0].message
 
 
 def test_approval_mismatch_on_arguments(pack_dir: Path) -> None:
@@ -1388,9 +1433,15 @@ def test_reference_pack_validates() -> None:
 def test_reference_pack_reports_the_expected_warnings_and_notices() -> None:
     report = validate_pack(REFUND_PACK)
     warnings = {f.rule for f in report.warnings}
-    assert warnings == {"graph.state_type_unresolved", "graph.assignment_optional"}
+    assert warnings == {
+        "graph.state_type_unresolved",
+        "graph.assignment_optional",
+        # Phase 4: the exemption is a warning now, and this fixture declares its tools in YAML
+        # without exporting them, which is a pack that cannot run a tool at all.
+        "graph.confirm_exempt",
+        "tools.declared_not_exported",
+    }
     infos = {f.rule for f in report.findings if f.severity is Severity.INFO}
-    assert "graph.confirm_exempt" in infos
     assert "graph.node_not_executable" in infos
 
 
@@ -1501,7 +1552,7 @@ def test_a_high_risk_tool_cannot_be_confirm_exempt(tmp_path: Path) -> None:
         TOOLS_YAML.replace(
             "  - name: high_tool\n    description: Move money.\n    risk: high\n",
             "  - name: high_tool\n    description: Move money.\n    risk: high\n"
-            "    confirm_exempt: true\n",
+            "    confirm_exempt: true\n    confirm_exempt_reason: because I say so\n",
         ),
         encoding="utf-8",
     )

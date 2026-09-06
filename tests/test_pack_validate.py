@@ -39,17 +39,21 @@ def test_sample_pack_validates_with_its_graphs_via_cli() -> None:
     assert result.exit_code == EXIT_OK, result.output
     assert "acme-billing: well-formed" in result.output
     assert "empty" not in result.output
-    # The four warnings are the workflows phase 4 adds, named in `interrupts` already.
-    assert result.output.count("manifest.interrupt_graph_unknown") == 4
+    # Two of the four workflows `interrupts` names still do not exist: phase 4 added `refund`
+    # and `verify_identity`, and `update_address` and `payment_capture` are phase 6's.
+    assert result.output.count("manifest.interrupt_graph_unknown") == 2
+    # Every confirm_exempt tool is reported, with the reason the pack had to give for it
+    # (DESIGN.md section 8.2, phase-1 deferred finding J).
+    assert result.output.count("graph.confirm_exempt") == 2
 
     # --strict fails on a warning but must not hide any finding (phase 0 review N3).
     strict = CliRunner().invoke(cli, ["pack", "validate", "--strict", str(SAMPLE_PACK)])
     assert strict.exit_code == EXIT_INVALID, strict.output
-    assert strict.output.count("manifest.interrupt_graph_unknown") == 4
+    assert strict.output.count("manifest.interrupt_graph_unknown") == 2
 
     quiet = CliRunner().invoke(cli, ["pack", "validate", "--quiet", str(SAMPLE_PACK)])
     assert quiet.exit_code == EXIT_OK
-    assert quiet.output.strip() == "acme-billing: well-formed (4 warning(s))"
+    assert quiet.output.strip() == "acme-billing: well-formed (9 warning(s))"
 
 
 def test_sample_pack_report() -> None:
@@ -62,7 +66,15 @@ def test_sample_pack_report() -> None:
     assert report.manifest.channels == ["web_chat", "email"]
     assert report.manifest.handoff.queue == "billing-tier-1"
     assert report.manifest.limits.max_nodes_per_turn == 25
-    assert {f.rule for f in report.findings} == {"manifest.interrupt_graph_unknown"}
+    assert {f.rule for f in report.findings} == {
+        "manifest.interrupt_graph_unknown",
+        # Phase 4: the refund graph declares `charge: Charge | None`, which is the pack's own
+        # tool model and not a type core can resolve, and passes `str | None` into `str` inputs.
+        "graph.state_type_unresolved",
+        "graph.assignment_optional",
+        # The two confirm_exempt tools of DESIGN.md section 8.2, each with its reason.
+        "graph.confirm_exempt",
+    }
 
 
 def test_sample_manifest_matches_design_section_5_1() -> None:
@@ -286,6 +298,8 @@ def test_policies_length_warning(pack_copy: Path) -> None:
 
 def test_graph_files_are_validated(pack_copy: Path) -> None:
     """Phase 0 only counted graph files here; phase 1 runs the DESIGN.md 5.2 rules on them."""
+    for graph in (pack_copy / "graphs").glob("*.yaml"):
+        graph.unlink()
     (pack_copy / "graphs" / "root.yaml").write_text("id: root\n", encoding="utf-8")
     report = validate_pack(pack_copy)
     assert not report.ok
@@ -297,7 +311,8 @@ def test_graph_files_are_validated(pack_copy: Path) -> None:
 
 def test_directory_with_graph_suffix_is_reported(pack_copy: Path) -> None:
     """A directory named like a graph is not silently skipped (phase 0 review N6)."""
-    (pack_copy / "graphs" / "root.yaml").unlink()
+    for graph in (pack_copy / "graphs").glob("*.yaml"):
+        graph.unlink()
     (pack_copy / "graphs" / "root.yaml").mkdir()
     report = validate_pack(pack_copy)
     assert not report.ok
@@ -308,7 +323,8 @@ def test_directory_with_graph_suffix_is_reported(pack_copy: Path) -> None:
 
 
 def test_entry_graph_must_exist_once_graphs_are_present(pack_copy: Path) -> None:
-    (pack_copy / "graphs" / "root.yaml").unlink()
+    for graph in (pack_copy / "graphs").glob("*.yaml"):
+        graph.unlink()
     (pack_copy / "graphs" / "refund.yaml").write_text("id: refund\n", encoding="utf-8")
     assert "graph.entry_missing" in _rules(pack_copy, Severity.ERROR)
 

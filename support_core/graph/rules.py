@@ -12,7 +12,8 @@ Every graph has exactly one ``start``                                ``graph.sta
 Every ``tool`` node references a registered tool                     ``graph.tool_unknown``
 Argument expressions type-check against the tool's input model       ``graph.tool_arg_*``
 Every ``gate`` node has a ``redirect`` graph                         ``graph.gate_redirect_unknown``
-Every write/high tool node has a ``confirm`` on all paths            ``graph.unconfirmed_write``
+Every write/high tool node has a ``confirm`` on all paths            ``graph.unconfirmed_write``,
+                                                                     ``graph.approval_args_mutated``
 Sub-graph input and output mappings type-check                       ``graph.subgraph_*``
 No graph reaches itself without passing a suspending node            ``graph.unsuspended_cycle``,
                                                                      ``graph.subgraph_cycle``
@@ -28,7 +29,7 @@ from dataclasses import dataclass
 
 from support_core.graph.context import ConversationContext
 from support_core.graph.expr import ParseError, TypeError_, infer, model_type_env, parse
-from support_core.graph.expr.syntax import Expr, literal_source, unparse
+from support_core.graph.expr.syntax import Attribute, Expr, Root, literal_source, unparse, walk
 from support_core.graph.expr.typecheck import TypeEnv, TypeInfo, TypeNote, from_annotation
 from support_core.graph.findings import Finding, Severity
 from support_core.graph.manifest import PackManifest
@@ -415,7 +416,7 @@ class _Rules:
         built = build_model(f"{node_id.title()}Output", node.output_schema or {})
         for issue in built.issues:
             if issue.code == "unresolved_type":
-                continue  # pack tool models are stubs until phase 4; already warned on state
+                continue  # a name core cannot resolve is already warned about on the state
             self.error(
                 "graph.llm_output_schema_invalid",
                 f"output_schema.{issue.field}: {issue.message}",
@@ -596,6 +597,108 @@ class _Rules:
                 graph=graph,
                 node=node_id,
             )
+            return
+        self.approval_args_stable(graph, node_id, node, confirm, node.requires_approval)
+
+    def approval_args_stable(
+        self, graph: Graph, node_id: str, node: ToolNode, confirm: ConfirmNode, confirm_id: str
+    ) -> None:
+        """Nothing between the confirmation and the call may rewrite what the hash covers.
+
+        Phase-1 deferred finding H, and the reviewer's hostile case H. ``graph.approval_mismatch``
+        compares *text*: a ``tool`` node between the confirm and the call that rewrites
+        ``state.charge.amount`` leaves both sides reading ``state.charge.amount`` and passes,
+        while at run time the customer approved one amount and a different one is called with.
+        The run-time hash check does catch that - it is the whole reason DESIGN.md 8.2 says the
+        check exists - but a pack whose only failure mode is a refused refund on a live
+        conversation is a pack that should not have loaded.
+
+        The analysis is intra-graph, which the same-graph rule (see :data:`SAME_GRAPH_REASON`)
+        makes sufficient, and it is conservative in the safe direction: a ``tool`` node with a
+        side effect on the path is refused whenever the approved arguments read ``ctx`` at all,
+        because a WRITE or HIGH tool may change ``ctx.customer`` (DESIGN.md section 19 step 9)
+        and which fields it changes is not visible in the graph.
+        """
+        reads_state, reads_ctx = _fields_read(confirm.action.args)
+        if not reads_state and not reads_ctx:
+            return
+        start = confirm.edges.get("yes")
+        if start is None:  # pragma: no cover - the schema requires both confirm edges
+            return
+        between = self._between(graph, start, node_id) - {node_id, confirm_id}
+        for between_id in sorted(between):
+            here = graph.nodes[between_id]
+            written = self._writes(here)
+            clash = sorted(written & reads_state)
+            if clash:
+                self.error(
+                    "graph.approval_args_mutated",
+                    f"{between_id!r} lies between confirm {confirm_id!r} and this call and "
+                    f"writes state field(s) {clash}, which the approved arguments read. The "
+                    f"customer would be approving one action and this node would call with "
+                    f"another, and the run-time hash check would refuse it",
+                    graph=graph,
+                    node=node_id,
+                )
+                return
+            if reads_ctx and self._side_effecting_tool(here):
+                self.error(
+                    "graph.approval_args_mutated",
+                    f"the approved arguments read ctx, and {between_id!r} lies between confirm "
+                    f"{confirm_id!r} and this call and runs a write- or high-risk tool, which "
+                    f"may change ctx.customer. Move the call before the confirmation, or take "
+                    f"the value into state before confirming",
+                    graph=graph,
+                    node=node_id,
+                )
+                return
+
+    def _between(self, graph: Graph, start: str, target: str) -> set[str]:
+        """Nodes on some path from ``start`` to ``target``, inside this graph."""
+        forward = self._reach(graph, [start], forward=True)
+        backward = self._reach(graph, [target], forward=False)
+        return forward & backward
+
+    def _reach(self, graph: Graph, seeds: list[str], *, forward: bool) -> set[str]:
+        edges: dict[str, set[str]] = {node_id: set() for node_id in graph.nodes}
+        for node_id, node in graph.nodes.items():
+            for _label, target in edge_targets(node):
+                if target in graph.nodes:
+                    if forward:
+                        edges[node_id].add(target)
+                    else:
+                        edges[target].add(node_id)
+        seen: set[str] = set()
+        stack = [seed for seed in seeds if seed in graph.nodes]
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            stack.extend(edges[current] - seen)
+        return seen
+
+    def _writes(self, node: NodeBase) -> set[str]:
+        """State fields this node can write in its own frame."""
+        match node:
+            case ToolNode():
+                if isinstance(node.into, str):
+                    return {node.into.removeprefix("state.")}
+                return set(node.into or {})
+            case LlmNode():
+                return set(node.output_schema or {})
+            case AskNode():
+                return set(node.slots)
+            case SubgraphNode():
+                return set(node.outputs)
+            case _:
+                return set()
+
+    def _side_effecting_tool(self, node: NodeBase) -> bool:
+        if not isinstance(node, ToolNode):
+            return False
+        spec = self.tools.get(node.tool)
+        return spec is not None and spec.risk is not Risk.READ
 
     # -- 5.2: confirm on all paths -------------------------------------------------------
 
@@ -1103,7 +1206,15 @@ class _Rules:
                 self.warn("tools.declaration_unresolved", issue, location="tools/tools.yaml")
 
     def exemptions_notice(self) -> None:
-        """DESIGN.md section 8.2: "The validator lists every exemption in its report"."""
+        """DESIGN.md section 8.2: "The validator lists every exemption in its report".
+
+        A WARNING, not an INFO (phase-1 deferred finding J). The design asks for exemptions to be
+        "reviewed deliberately", and an INFO in a report that exits 0 is noticed rather than
+        reviewed; a warning fails ``--strict``, which is what a release gate runs. The reason the
+        pack had to write down is quoted, because the point of the line is that a human can
+        judge the argument without reading the tool.
+        """
+        source = "tools/__init__.py" if self.tools.from_registry else "tools/tools.yaml"
         for spec in self.tools.exemptions:
             if spec.risk is Risk.HIGH:
                 self.error(
@@ -1111,14 +1222,15 @@ class _Rules:
                     f"tool {spec.name!r} is high risk and marked confirm_exempt; DESIGN.md "
                     "section 8.2 offers the exemption for write-tier tools only, and a high-tier "
                     "tool moves money or access. Reclassify the tool or drop the exemption",
-                    location="tools/tools.yaml",
+                    location=source,
                 )
                 continue
-            self.info(
+            reason = (spec.declaration.confirm_exempt_reason or "").strip()
+            self.warn(
                 "graph.confirm_exempt",
                 f"tool {spec.name!r} is {spec.risk.value} risk and marked confirm_exempt, so no "
-                "confirm node is required before it; review this deliberately",
-                location="tools/tools.yaml",
+                f"confirm node is required before it. The pack's reason: {reason}",
+                location=source,
             )
 
     def prompt_budget_sanity(self) -> None:
@@ -1212,6 +1324,32 @@ def _incompatible(source: TypeInfo, target: TypeInfo) -> str | None:
             allowed = ", ".join(repr(v) for v in target.literal_values)
             return f"{extra!r} is not one of {allowed}"
     return None
+
+
+def _fields_read(args: dict[str, Scalar]) -> tuple[set[str], bool]:
+    """``(state fields, reads ctx)`` for an argument mapping.
+
+    A state field is the *first* attribute after the root, so ``state.charge.amount`` counts as
+    a read of ``charge``: rewriting the whole object is a way of rewriting the amount.
+    """
+    fields: set[str] = set()
+    reads_ctx = False
+    for raw in args.values():
+        try:
+            value = parse_value(raw)
+        except (ParseError, ValueLooksLikeExpression):
+            continue  # reported elsewhere
+        if value.expression is None:
+            continue
+        for node in walk(value.expression):
+            if isinstance(node, Attribute) and isinstance(node.value, Root):
+                if node.value.name == "state":
+                    fields.add(node.name)
+                elif node.value.name == "ctx":
+                    reads_ctx = True
+            elif isinstance(node, Root) and node.name == "ctx":
+                reads_ctx = True
+    return fields, reads_ctx
 
 
 def _canonical_args(args: dict[str, Scalar]) -> str:

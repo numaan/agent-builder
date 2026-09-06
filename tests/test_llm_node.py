@@ -499,16 +499,39 @@ async def test_the_tool_budget_is_spent_per_turn_and_not_re_granted_to_each_node
     assert row["turn_tool_calls"] >= limit
 
 
-async def test_a_node_that_declares_tools_cannot_run_without_a_tool_runtime(
+async def test_a_tool_a_pack_declares_but_does_not_export_is_not_offered_to_the_model(
     pack: Pack, engine: AsyncEngine
 ) -> None:
-    """The default runner refuses to describe anything, so the node fails rather than pretending
-    the model had the facts it was told to gather."""
-    executor, recorder, _ = build(pack, engine, REFUND_RULES)
+    """The registry is the source of truth, not ``tools/tools.yaml`` (phase-1 finding I).
+
+    ``llm_pack`` declares ``get_balance`` in YAML and exports no ``TOOLS`` at all. Phase 4 builds
+    the runner from the registry, so there is nothing to describe: the model is offered no tools,
+    its request for one cannot be honoured, and the node fails rather than pretending it gathered
+    facts it never had. The pack's *declaration* buys it nothing, which is the whole point.
+    """
+    from support_core.llm.types import ToolCall
+
+    executor, recorder, provider = build(
+        pack,
+        engine,
+        [
+            *REFUND_RULES,
+            Rule(
+                when=RESEARCH,
+                tool_calls=[
+                    ToolCall(id="tu_1", name="get_balance", arguments={"customer_ref": "c1"})
+                ],
+            ),
+        ],
+    )
     conversation_id = await executor.start_conversation()
     await _through_the_ask(executor, conversation_id)
-    assert [request.reason for request in recorder.handoffs] == ["llm_unavailable"]
-    assert "phase 4" in (recorder.handoffs[0].detail or "")
+
+    assert [request.reason for request in recorder.handoffs] == ["llm_invalid_output"]
+    assert "does not offer" in (recorder.handoffs[0].detail or "")
+    # The model was never given the tool: the node's instructions mention it, and the tool
+    # definitions the provider was sent are empty, because nothing exported it.
+    assert all(call.tools == [] for call in provider.calls)
 
 
 # -- the prompt the node actually sends ---------------------------------------------------------

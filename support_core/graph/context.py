@@ -34,7 +34,7 @@ class CustomerContext(BaseModel):
     email: str | None = None
     locale: str = "en"
     attributes: dict[str, Any] = Field(default_factory=dict)
-    """CRM record fields the pack loaded. Untyped on purpose: pack-specific (phase 4 types it)."""
+    """CRM record fields the pack loaded. Untyped on purpose: the shape is pack-specific."""
 
 
 class ConversationContext(BaseModel):

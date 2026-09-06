@@ -133,19 +133,20 @@ async def test_a_router_without_a_matching_branch_hands_off(
 
 
 async def test_the_engine_refuses_node_types_core_cannot_run_yet() -> None:
-    """PLAN.md's standing rule: nothing yet can execute a tool, and core does not pretend.
+    """Core does not pretend to run a node type it has not implemented.
 
-    ``llm`` became executable in phase 3, so the refusal is now asserted where it lives - the
-    runner registry - rather than through the one pack that happened to reach an ``llm`` node
-    first. ``tool`` and ``confirm`` are the two that matter for the standing rule: no code path
-    can run a tool, with or without an ``ActionApproval``, until phase 4 builds one.
+    ``llm`` became executable in phase 3 and ``tool`` and ``confirm`` in phase 4, so ``handoff``
+    is the last one left; the refusal is asserted where it lives, in the runner registry. The
+    standing rule about tools is no longer about *whether* a tool can run - it can - and is
+    asserted in ``tests/test_tool_policy.py`` and ``tests/test_adversarial_approvals.py``.
     """
     pack = load_pack(PACKS / "refund_pack")
     graph = pack.graphs["refund"]
-    for node_id, phase in (("fetch_charge", 4), ("confirm_refund", 4), ("handoff_dispute", 6)):
-        runner = build_runner(node_id, graph.nodes[node_id])
-        assert isinstance(runner, NotExecutableRunner)
-        assert runner.phase == phase
+    runner = build_runner("handoff_dispute", graph.nodes["handoff_dispute"])
+    assert isinstance(runner, NotExecutableRunner)
+    assert runner.phase == 6
+    for node_id in ("fetch_charge", "confirm_refund"):
+        assert not isinstance(build_runner(node_id, graph.nodes[node_id]), NotExecutableRunner)
 
 
 async def test_an_llm_node_without_a_provider_hands_off_rather_than_guessing(

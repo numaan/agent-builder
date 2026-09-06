@@ -115,7 +115,9 @@ def build_model(name: str, fields: dict[str, str], *, all_optional: bool = False
                     code="unresolved_type",
                     message=(
                         f"{', '.join(sorted(parsed.unresolved))} is not a type this core knows; "
-                        "it is typed as Any until the pack's tool models are registered (phase 4)"
+                        "it is typed as Any. A graph's state cannot name a model exported by "
+                        "the pack's tools; put the fields it needs in the state, or read the "
+                        "value with expressions, which traverse a stored mapping"
                     ),
                 )
             )

@@ -17,8 +17,9 @@ Each :class:`NodeTypeSpec` records the four facts DESIGN.md section 6.2 tabulate
 section 7.2 (suspension) are phase 2's subject and neither can be tested without running one.
 A gate only evaluates an expression and pushes a graph; an ``ask`` node's slot extraction, the
 one part that needs a model, is an injectable hook whose default is deterministic and which
-phase 3 replaces. ``llm``, ``tool``, ``confirm`` and ``handoff`` are declared but not
-executable: the validator type-checks them now and phases 3, 4 and 6 supply the behaviour.
+phase 3 replaces. ``tool`` and ``confirm`` became executable in phase 4, which is where the
+tool runtime, the approval hash and the idempotency key live. ``handoff`` is still declared but
+not executable: the validator type-checks it now and phase 6 supplies the behaviour.
 ``executable_phase`` records which phase that is, so "not implemented" is never a mystery.
 """
 
@@ -260,7 +261,7 @@ NODE_TYPES: dict[str, NodeTypeSpec] = {
         model=ToolNode,
         chooses_edge=False,
         suspends=None,
-        executable=False,
+        executable=True,
         executable_phase=4,
         suspends_when_async_tool=True,
     ),
@@ -278,7 +279,7 @@ NODE_TYPES: dict[str, NodeTypeSpec] = {
         model=ConfirmNode,
         chooses_edge=True,
         suspends="waiting_customer",
-        executable=False,
+        executable=True,
         executable_phase=4,
         template_fields=("prompt",),
     ),

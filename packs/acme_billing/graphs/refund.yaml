@@ -1,0 +1,143 @@
+id: refund
+description: >
+  Handle a refund request for a charge on the customer's account. This is DESIGN.md section
+  6.4's worked graph, running against the pack's real tools: an identity gate that cannot be
+  skipped, a read-only tool loop to find the charge, deterministic eligibility, and a confirm
+  node whose approval is what authorises the one HIGH-risk call in the pack.
+inputs:
+  charge_hint: str | None
+outputs:
+  outcome: Literal["refunded", "denied", "escalated", "abandoned"]
+state:
+  charge_hint: str | None
+  charge_id: str | None
+  charge: Charge | None            # the pack's ChargeView, as JSON in the frame's state
+  eligible: bool | None
+  denial_reason: str | None
+  outcome: str | None
+
+start: identity_gate
+nodes:
+  identity_gate:
+    type: gate
+    description: Nothing in this graph runs on an unverified identity, on any entry to it.
+    predicate: ctx.customer.identity_verified
+    redirect: verify_identity
+    next: find_charge
+
+  find_charge:
+    type: llm
+    description: Work out which charge the customer means.
+    instructions: |
+      Identify which charge the customer wants refunded. Use list_recent_charges if you need to
+      see the account. If exactly one charge matches what they described, set charge_id to its
+      id and decide "found". If more than one could match, or none does, decide "ambiguous" and
+      do not guess a charge id.
+    tools: [list_recent_charges]
+    output_schema:
+      charge_id: str | None
+    edges:
+      found: fetch_charge
+      ambiguous: ask_which_charge
+
+  ask_which_charge:
+    type: ask
+    slots: [charge_id]
+    prompt: Which charge would you like refunded? The id or the date and amount will do.
+    next: fetch_charge
+
+  fetch_charge:
+    type: tool
+    tool: get_charge
+    args:
+      charge_id: state.charge_id
+    into: state.charge
+    on_error: lookup_failed
+    next: check_eligibility
+
+  check_eligibility:
+    type: tool
+    tool: check_refund_eligibility
+    args:
+      charge_id: state.charge_id
+    into: { eligible: result.eligible, denial_reason: result.reason }
+    on_error: lookup_failed
+    next: eligibility_router
+
+  eligibility_router:
+    type: router
+    edges:
+      state.eligible == true: confirm_refund
+    default: explain_denial
+
+  confirm_refund:
+    type: confirm
+    description: The customer's explicit yes, bound to these exact arguments.
+    action:
+      tool: issue_refund
+      args: { charge_id: state.charge_id, amount: state.charge.amount }
+    prompt: |
+      I can refund {{ state.charge.amount | money }} {{ state.charge.currency }} for
+      {{ state.charge.description }} ({{ state.charge.charged_on }}) to your original payment
+      method. Shall I go ahead?
+    edges:
+      yes: issue_refund
+      no: abandon
+
+  issue_refund:
+    type: tool
+    description: The one HIGH-risk call in this pack.
+    tool: issue_refund
+    args: { charge_id: state.charge_id, amount: state.charge.amount }
+    requires_approval: confirm_refund      # the engine re-checks the ActionApproval hash here
+    into: { outcome: "refunded" }
+    on_error: refund_failed
+    next: tell_done
+
+  tell_done:
+    type: llm
+    description: Confirm the refund and say when the money arrives.
+    instructions: |
+      Tell the customer the refund is on its way. Say that it takes five to seven business days
+      to appear on their statement. Do not promise anything else and do not offer to do more
+      here; the next step asks whether they need anything else.
+    output_schema: {}
+    edges:
+      done: done
+
+  explain_denial:
+    type: llm
+    description: Explain why the refund cannot be made.
+    instructions: |
+      Explain, using the reason in the state block, why this charge cannot be refunded. Be
+      direct about it and do not suggest a way around the policy. If the customer disagrees with
+      the decision, decide "disputes"; if they accept it, decide "accepted".
+    output_schema: {}
+    edges:
+      accepted: done_denied
+      disputes: escalate_dispute
+
+  escalate_dispute:
+    type: say
+    message: >-
+      I understand. I am passing this to a billing specialist who can look at the decision
+      itself; they will pick this conversation up.
+    next: done_escalated
+
+  lookup_failed:
+    type: say
+    message: >-
+      I could not read that charge just now, so I am passing this to a billing specialist.
+    next: done_escalated
+
+  refund_failed:
+    type: say
+    message: >-
+      Something went wrong while issuing the refund, and I am not going to try again in case it
+      partly went through. A billing specialist will pick this up and confirm what happened.
+    next: done_escalated
+
+  abandon:        { type: end, outputs: { outcome: abandoned } }
+  done:           { type: end, outputs: { outcome: refunded } }
+  done_denied:    { type: end, outputs: { outcome: denied } }
+  done_escalated: { type: end, outputs: { outcome: escalated } }

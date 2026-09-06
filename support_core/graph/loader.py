@@ -11,14 +11,10 @@ So :func:`load_pack` returns a :class:`~support_core.graph.pack.Pack` or raises
 from pathlib import Path
 
 from support_core import __version__
-from support_core.graph.findings import Finding, Severity, ValidationReport
+from support_core.graph.findings import Severity, ValidationReport
 from support_core.graph.pack import Pack, build_pin
 from support_core.graph.schema import read_graphs
-from support_core.graph.tools_manifest import (
-    ToolManifest,
-    ToolManifestError,
-    load_tool_manifest,
-)
+from support_core.graph.tools_source import resolve_tools
 from support_core.graph.validator import validate_pack
 
 
@@ -64,17 +60,13 @@ def load_pack_report(path: Path | str) -> tuple[Pack | None, ValidationReport]:
         report.findings.extend(findings)
         return None, report
 
-    try:
-        tools: ToolManifest = load_tool_manifest(pack_path)
-    except ToolManifestError as exc:  # pragma: no cover - validate_pack reports it first
-        report.findings.append(
-            Finding(
-                severity=Severity.ERROR,
-                rule="tools.manifest_invalid",
-                message=str(exc),
-                location="tools/tools.yaml",
-            )
-        )
+    # Cheap the second time: the pack's ``tools`` package is already in ``sys.modules`` and
+    # ``validate_pack`` has already reported anything wrong with it, so this only rebuilds the
+    # registry object from the tools it imported.
+    resolved = resolve_tools(pack_path)
+    if any(finding.severity is Severity.ERROR for finding in resolved.findings):
+        # pragma: no cover - validate_pack reported these and returned above
+        report.findings.extend(resolved.findings)
         return None, report
 
     pack = Pack(
@@ -83,8 +75,9 @@ def load_pack_report(path: Path | str) -> tuple[Pack | None, ValidationReport]:
         persona=_read_text(pack_path / "persona.md"),
         policies=_read_text(pack_path / "policies.md"),
         graphs=graphs,
-        tools=tools,
+        tools=resolved.manifest,
         pin=build_pin(report.manifest, graphs, __version__),
+        registry=resolved.registry,
     )
     return pack, report
 

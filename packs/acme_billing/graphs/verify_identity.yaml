@@ -1,0 +1,64 @@
+id: verify_identity
+description: >
+  Verify the customer's identity with a one-time passcode (DESIGN.md section 19, steps 6 to 9).
+  Pushed by the refund graph's identity gate; it returns whether the customer is now verified,
+  and the tool that checks the code is what actually sets ctx.customer.identity_verified.
+outputs:
+  verified: bool
+state:
+  code: str | None
+  code_sent: bool | None
+  sent_to: str | None
+  verified: bool | None
+start: send_code
+nodes:
+  send_code:
+    type: tool
+    description: Send the passcode. WRITE and confirm_exempt (DESIGN.md section 8.2).
+    tool: send_otp
+    args: { email: ctx.customer.email }
+    into: { code_sent: result.sent, sent_to: result.address }
+    on_error: cannot_send
+    next: ask_code
+
+  ask_code:
+    type: ask
+    slots: [code]
+    prompt: >-
+      I have sent a six-digit code to {{ state.sent_to | default("the address on your account") }}.
+      What is it?
+    next: check_code
+
+  check_code:
+    type: tool
+    description: Check the code and, if it matches, mark the identity verified.
+    tool: verify_otp
+    args: { code: state.code }
+    into: { verified: result.verified }
+    on_error: not_verified
+    next: verified_router
+
+  verified_router:
+    type: router
+    edges:
+      state.verified == true: verified
+    default: wrong_code
+
+  wrong_code:
+    type: say
+    message: That code did not match what I sent. Let me try once more.
+    next: send_code
+
+  cannot_send:
+    type: say
+    message: >-
+      I could not send a code to the address on your account, so I cannot verify you here.
+    next: not_verified
+
+  verified:
+    type: end
+    outputs: { verified: true }
+
+  not_verified:
+    type: end
+    outputs: { verified: false }

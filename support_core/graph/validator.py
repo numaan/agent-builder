@@ -29,11 +29,7 @@ from support_core.graph.manifest import (
 )
 from support_core.graph.rules import validate_graph_set
 from support_core.graph.schema import read_graphs
-from support_core.graph.tools_manifest import (
-    ToolManifest,
-    ToolManifestError,
-    load_tool_manifest,
-)
+from support_core.graph.tools_source import resolve_tools
 
 __all__ = [
     "Finding",
@@ -169,26 +165,19 @@ def validate_graphs(
     """Every graph rule in DESIGN.md section 5.2.
 
     Parses each graph file into a :class:`~support_core.graph.schema.Graph` and hands the whole
-    set, plus the pack's declared tools, to :func:`support_core.graph.rules.validate_graph_set`.
+    set, plus the pack's tools, to :func:`support_core.graph.rules.validate_graph_set`. From
+    phase 4 those tools are the pack's *imported* ``TOOLS`` wherever it exports any
+    (:func:`~support_core.graph.tools_source.resolve_tools`), so the risk tiers the confirm rule
+    reasons about are the ones the runtime will enforce.
     Parsing and rule-checking are separate so one broken file does not hide the problems in the
     others: a file that cannot be parsed contributes its own finding and the remaining graphs are
     still validated. ``sources`` collects the text of every file read, so the loader can parse
     exactly the bytes the validator saw (phase-1 deferred finding P1).
     """
     files = list(graph_files)
-    findings: list[Finding] = []
-    try:
-        tools = load_tool_manifest(pack_path)
-    except ToolManifestError as exc:
-        tools = ToolManifest()
-        findings.append(
-            Finding(
-                severity=Severity.ERROR,
-                rule="tools.manifest_invalid",
-                message=str(exc),
-                location="tools/tools.yaml",
-            )
-        )
+    resolved = resolve_tools(pack_path)
+    findings: list[Finding] = list(resolved.findings)
+    tools = resolved.manifest
     if not files:
         return findings
     graphs, parse_findings = read_graphs(pack_path, files, sources=sources)

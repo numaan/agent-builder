@@ -25,7 +25,7 @@ inside the checkpoint transaction, or after it - resumes by re-reading the row.
 """
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -44,8 +44,10 @@ from support_core.engine.hooks import EngineHooks, HandoffRequest
 from support_core.engine.hooks import SummaryRequest as SummaryHookRequest
 from support_core.engine.locks import conversation_lock
 from support_core.engine.runners import (
+    NO_TOOL_ACCESS,
     GateRunner,
     NodeRuntime,
+    NodeToolAccess,
     build_runner,
     resolve_edge,
     tool_gateway_factory,
@@ -60,9 +62,9 @@ from support_core.engine.types import (
     TurnOutcome,
     step_id,
 )
-from support_core.graph.context import ConversationContext
+from support_core.graph.context import ConversationContext, CustomerContext
 from support_core.graph.manifest import Channel, SuspendStatus
-from support_core.graph.nodes import GateNode, NodeBase
+from support_core.graph.nodes import ConfirmNode, GateNode, NodeBase, ToolNode
 from support_core.graph.pack import Pack
 from support_core.graph.schema import Graph
 from support_core.llm.prompt import TranscriptMessage
@@ -70,12 +72,19 @@ from support_core.llm.service import LlmService
 from support_core.llm.tool_loop import (
     ModelToolRunner,
     ReadOnlyToolGateway,
-    UnavailableToolRunner,
 )
 from support_core.storage import repositories as repo
 from support_core.storage.models import Conversation, Run
-from support_core.storage.repositories import RunUpdate, StepWrite
+from support_core.storage.repositories import ApprovalWrite, RunUpdate, StepWrite
 from support_core.storage.session import make_session_factory
+from support_core.tools.approval import hash_for
+from support_core.tools.base import ToolRefused
+from support_core.tools.runtime import (
+    CallSite,
+    RegistryToolRunner,
+    ToolCallResult,
+    ToolRuntime,
+)
 
 ENTRY_INPUTS_KEY = "inputs"
 """Key inside ``conversation.context`` holding the entry graph's ``inputs``.
@@ -156,6 +165,33 @@ def _spent(gateways: Sequence[ReadOnlyToolGateway]) -> int:
     return sum(len(gateway.calls) for gateway in gateways)
 
 
+def _action_hasher(
+    tools: ToolRuntime,
+) -> Callable[[str, Mapping[str, Any]], tuple[str, dict[str, Any]]]:
+    """A closure that hashes a proposed action and can do nothing else."""
+
+    def hash_action(name: str, args: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+        tool = tools.registry.get(name)
+        if tool is None:
+            known = ", ".join(tools.registry.names) or "none"
+            msg = f"no tool named {name!r} is registered by this pack; it exports {known}"
+            raise ToolRefused(msg)
+        return hash_for(tool, args)
+
+    return hash_action
+
+
+def _suspend_detail(run: _RunRow) -> dict[str, Any]:
+    """What the node recorded when it suspended, for the event that wakes it.
+
+    A ``confirm`` node's approval hash lives here: the customer is answering the proposal that
+    was *shown* to them, and re-deriving it from the state as it stands on resume would answer a
+    different question after a gate redirect re-entered the frame in between (section 6.6).
+    """
+    detail = (run.awaiting or {}).get("detail")
+    return dict(detail) if isinstance(detail, dict) else {}
+
+
 def _snapshot(run: Run) -> _RunRow:
     return _RunRow(
         id=run.id,
@@ -189,6 +225,7 @@ class Executor:
         lock_wait_seconds: float = 30.0,
         llm: LlmService | None = None,
         tool_runner: ModelToolRunner | None = None,
+        tools: ToolRuntime | None = None,
     ) -> None:
         self.pack = pack
         self.engine = engine
@@ -201,13 +238,19 @@ class Executor:
         engine's own durability tests run without one - and an ``llm`` node then fails as a node
         error naming what is missing, rather than pretending."""
 
-        self.tool_runner: ModelToolRunner = tool_runner or UnavailableToolRunner()
-        """Phase 4's tool runtime. Whatever is injected here is wrapped by a
-        :class:`~support_core.llm.tool_loop.ReadOnlyToolGateway` before any node can reach it
-        (see :meth:`~support_core.engine.runners.NodeRuntime.tool_gateway`), so the risk policy
-        of DESIGN.md section 8.2 is not something phase 4 can choose to apply."""
+        self.tools = tools or ToolRuntime(pack.registry, self.sessions, clock=self.hooks.clock)
+        """The tool runtime (DESIGN.md section 8). The executor is the only thing that holds it:
+        a node gets a :class:`~support_core.engine.runners.NodeToolAccess` built for it, and an
+        ``llm`` node gets a :class:`~support_core.llm.tool_loop.ReadOnlyToolGateway`, neither of
+        which can reach this object or widen what it will do."""
 
-        self._tool_risk = {name: spec.risk for name, spec in pack.tools.tools.items()}
+        self.tool_runner: ModelToolRunner | None = tool_runner
+        """An override for the model-loop runner, for tests that need a specific one. ``None``
+        means one is built per node from the registry, which is the ordinary case."""
+
+        self._tool_risk = dict(pack.registry.risks)
+        """Risk tiers for the model loop's cross-check, from the registry and not from the
+        pack's YAML declarations (phase-1 deferred finding I)."""
 
     # -- entry points --------------------------------------------------------------------
 
@@ -467,6 +510,7 @@ class Executor:
                 kind="customer_message",
                 text=body,
                 message_id=message_id,
+                detail=_suspend_detail(run),
                 target_frame_seq=frame_seq,
                 target_node_id=node_id,
             )
@@ -558,7 +602,11 @@ class Executor:
             if awaiting.get("kind") == "node":
                 frame_seq, node_id = self._suspended_at(run, turn.frames)
                 turn.pending_event = event.model_copy(
-                    update={"target_frame_seq": frame_seq, "target_node_id": node_id}
+                    update={
+                        "target_frame_seq": frame_seq,
+                        "target_node_id": node_id,
+                        "detail": _suspend_detail(run),
+                    }
                 )
             else:
                 turn.pending_event = None
@@ -685,6 +733,15 @@ class Executor:
             budget = max(
                 0, self.pack.manifest.limits.max_tool_calls_per_turn - turn.turn_tool_calls
             )
+            site = CallSite(
+                conversation_id=turn.conversation_id,
+                run_id=turn.run_id,
+                frame_seq=frame.frame_seq,
+                node_id=frame.node_id,
+                step_id=sid,
+                customer=ctx.customer,
+                channel=ctx.channel,
+            )
             runtime = NodeRuntime(
                 graph=graph,
                 frame=frame,
@@ -696,12 +753,13 @@ class Executor:
                 llm=self.llm,
                 history=await self._history(turn.conversation_id),
                 tool_gateway=tool_gateway_factory(
-                    self.tool_runner,
+                    self.tool_runner or RegistryToolRunner(self.tools, site),
                     tool_risk=self._tool_risk,
                     max_calls=budget,
                     step_id=sid,
                     record=opened.append,
                 ),
+                tools=self._tool_access(node, site),
             )
             runner = self._runner(graph, frame.node_id, node)
             started = self.hooks.clock()
@@ -738,6 +796,48 @@ class Executor:
             check_gates = await self._advance(turn, ctx, graph, frame, node, result, sid, started)
         return turn.pending_event
 
+    def _tool_access(self, node: NodeBase, site: CallSite) -> NodeToolAccess:
+        """What this node may do with the tool runtime (DESIGN.md section 8.2's table).
+
+        The decision is made here, from the *validated graph's* declaration of what the node is,
+        and it is expressed as closures that already carry the answer. A node cannot argue with
+        it, because there is nothing on ``rt`` to argue with: a node the graph does not declare
+        as ``type: tool`` holds an ``invoke`` that refuses everything, and a ``tool`` node holds
+        one that can call exactly the tool it declared, with exactly the approval binding the
+        graph gave it.
+
+        ``hash_action`` is granted to every node, because it runs nothing: it turns a proposed
+        action into ``sha256(tool_name + canonical_json(args))``. A ``confirm`` node needs it,
+        and a node that computes a hash of something it cannot call has achieved nothing.
+        """
+        hasher = _action_hasher(self.tools)
+        if not isinstance(node, ToolNode):
+            return NodeToolAccess(
+                invoke=NO_TOOL_ACCESS.invoke, complete=NO_TOOL_ACCESS.complete, hash_action=hasher
+            )
+        allowed = (node.tool,)
+        requires_approval = node.requires_approval
+
+        async def invoke(name: str, args: Mapping[str, Any]) -> ToolCallResult:
+            return await self.tools.invoke(
+                tool_name=name,
+                args=args,
+                site=site,
+                caller="tool_node",
+                allowed=allowed,
+                requires_approval=requires_approval,
+            )
+
+        async def complete(name: str, payload: Mapping[str, Any]) -> ToolCallResult:
+            if name not in allowed:  # pragma: no cover - the node passes its own tool
+                msg = f"{site.node_id}: {name!r} is not this node's tool"
+                raise ToolRefused(msg)
+            return await self.tools.complete_async(tool_name=name, site=site, payload=payload)
+
+        return NodeToolAccess(
+            invoke=invoke, complete=complete, hash_action=hasher, declared=allowed
+        )
+
     async def _advance(
         self,
         turn: _Turn,
@@ -753,6 +853,8 @@ class Executor:
         node_id = frame.node_id
         patch = to_jsonable_python(result.state_patch)
         frame.state.update(patch)
+        approval = self._approval_write(turn, frame, node, node_id, result)
+        customer = self._customer_write(node, result, ctx)
         edge: str | None
         stack_changed = False
 
@@ -797,8 +899,62 @@ class Executor:
             suspend_node=node_id if result.suspend else None,
             suspend_frame_seq=frame.frame_seq if result.suspend else None,
             channel=ctx.channel,
+            approval=approval,
+            customer_context=customer,
         )
         return stack_changed
+
+    def _approval_write(
+        self, turn: _Turn, frame: Frame, node: NodeBase, node_id: str, result: NodeResult
+    ) -> ApprovalWrite | None:
+        """Turn a ``confirm`` node's proposal into the row the checkpoint writes (8.2).
+
+        Only a node the graph declares as ``type: confirm`` may produce one. A pack-registered
+        custom node type returning an ``approval`` is a pack trying to authorise its own actions,
+        and it is a node error rather than a silently ignored field: silently ignoring it would
+        let a pack believe it had a working confirmation.
+        """
+        if result.approval is None:
+            return None
+        if not isinstance(node, ConfirmNode):
+            msg = (
+                f"{node_id}: only a 'confirm' node may record an ActionApproval, and this is a "
+                f"{node.type!r} node (DESIGN.md section 8.2)"
+            )
+            raise NodeError(msg)
+        return ApprovalWrite(
+            conversation_id=turn.conversation_id,
+            run_id=turn.run_id,
+            frame_seq=frame.frame_seq,
+            node_id=node_id,
+            step_id=step_id(turn.run_id, frame.frame_seq, node_id, frame.attempts.get(node_id, 0)),
+            tool=result.approval.tool,
+            args=dict(result.approval.args),
+            args_hash=result.approval.args_hash,
+            approved_by=result.approval.approved_by,
+            approved_at=self.hooks.clock(),
+        )
+
+    def _customer_write(
+        self, node: NodeBase, result: NodeResult, ctx: ConversationContext
+    ) -> dict[str, Any] | None:
+        """Apply a tool's ``ctx.customer`` change (DESIGN.md section 19 step 9).
+
+        In memory *and* in the checkpoint. In memory because a gate re-check later in the same
+        turn has to see it - that is the whole point of ``verify_otp`` - and in the checkpoint
+        because a turn that ends here must not leave the effect durable and the context not.
+        """
+        if result.customer_patch is None:
+            return None
+        if not isinstance(node, ToolNode):
+            msg = (
+                f"{node.type!r} node tried to change ctx.customer; the context is read-only to "
+                f"nodes (DESIGN.md section 6.1) and only a tool may ask the engine to change it"
+            )
+            raise NodeError(msg)
+        customer = dict(result.customer_patch)
+        ctx.customer = CustomerContext.model_validate(customer)
+        return customer
 
     async def _run_gate_recheck(
         self, turn: _Turn, graph: Graph, frame: Frame, gate_id: str
@@ -1028,6 +1184,8 @@ class Executor:
         suspend_frame_seq: int | None = None,
         handoff_reason: str | None = None,
         channel: Channel | None = None,
+        approval: ApprovalWrite | None = None,
+        customer_context: dict[str, Any] | None = None,
     ) -> None:
         """One node, one transaction (DESIGN.md section 7.1)."""
         now = step.ended_at
@@ -1081,6 +1239,8 @@ class Executor:
                 step=step,
                 conversation_id=turn.conversation_id,
                 outbound=outbound,
+                approval=approval,
+                customer_context=customer_context,
                 before_commit=before_commit,
             )
         turn.seq = step.seq

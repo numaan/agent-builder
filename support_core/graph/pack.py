@@ -25,6 +25,7 @@ from support_core.graph.manifest import PackManifest
 from support_core.graph.schema import Graph
 from support_core.graph.templates import make_environment
 from support_core.graph.tools_manifest import ToolManifest
+from support_core.tools.registry import ToolRegistry
 
 
 class GraphPin(BaseModel):
@@ -127,7 +128,17 @@ class Pack:
     policies: str
     graphs: dict[str, Graph]
     tools: ToolManifest
+    """The pack's tools as *declarations*: what the validator type-checks arguments against.
+
+    Built from the imported registry when the pack exports any (DESIGN.md section 8.3), and only
+    from ``tools/tools.yaml`` when it exports none, in which case the pack cannot run a tool at
+    all and the validator says so."""
+
     pin: PackPin
+    registry: ToolRegistry = field(default_factory=ToolRegistry)
+    """The pack's tools as *behaviour*: the only source of a risk tier at run time (phase-1
+    deferred finding I). Empty for a pack that exports none."""
+
     environment: SandboxedEnvironment = field(default_factory=make_environment)
     """This pack's own sandboxed Jinja environment.
 
