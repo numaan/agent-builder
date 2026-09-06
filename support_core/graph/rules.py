@@ -50,6 +50,7 @@ from support_core.graph.nodes import (
     edge_targets,
     graph_references,
 )
+from support_core.graph.routing import workflow_intents
 from support_core.graph.schema import Graph, ValueLooksLikeExpression, parse_value
 from support_core.graph.templates import make_environment
 from support_core.graph.templates import validate as validate_template
@@ -144,6 +145,7 @@ class _Rules:
             self.intra_graph_cycles(graph)
         self.call_cycles()
         self.confirm_coverage()
+        self.retry_repeats_side_effect()
         self.manifest_graph_references()
         self.prompt_budget_sanity()
         self.not_executable_notice()
@@ -268,25 +270,66 @@ class _Rules:
             )
 
     def call_cycles(self) -> None:
-        """Graph A reaching itself through ``subgraph`` or ``gate.redirect``, waiting on nothing."""
-        successors = {
-            graph_id: [
-                target
-                for node in graph.nodes.values()
-                for _field, target in graph_references(node)
-                if target in self.graphs
-            ]
-            for graph_id, graph in self.graphs.items()
-        }
+        """Graph A reaching itself through ``subgraph`` or ``gate.redirect``, waiting on nothing.
+
+        Path-sensitive since phase 6 (phase-1 deferred finding N3). It used to ask whether any
+        graph in the cycle contained a suspending node *anywhere*, which the phase-1 reviewer's
+        hostile case T walked straight past: two graphs recursing through each other, with an
+        ``ask`` sitting on a branch the cycle never takes, waited for nobody and was reported by
+        nothing. What matters is whether the loop can be *travelled* without waiting, so each leg
+        is now checked on its own terms - can this graph get from its start to the call that
+        continues the cycle without passing something that suspends? - and the cycle is refused
+        only when every leg can.
+
+        The remaining approximation is that a leg is entered at the graph's ``start``. That is
+        where recursion enters a graph; the other way in is a return from a callee, which lands
+        after a call node that is itself on such a path. Erring here means reporting a cycle that
+        might not be travelled rather than missing one that is.
+        """
+        successors: dict[str, list[str]] = {}
+        calls: dict[tuple[str, str], list[str]] = {}
+        for graph_id, graph in self.graphs.items():
+            targets: list[str] = []
+            for node_id, node in graph.nodes.items():
+                for _field, target in graph_references(node):
+                    if target not in self.graphs:
+                        continue
+                    targets.append(target)
+                    calls.setdefault((graph_id, target), []).append(node_id)
+            successors[graph_id] = targets
         for cycle in _find_cycles(successors):
-            if any(self.graph_can_suspend(self.graphs[graph_id]) for graph_id in cycle):
+            legs = list(zip(cycle, [*cycle[1:], cycle[0]], strict=True))
+            if not all(self._leg_can_spin(caller, callee, calls) for caller, callee in legs):
                 continue
             self.error(
                 "graph.subgraph_cycle",
-                "these graphs invoke each other in a loop and none of them contains a node that "
-                f"waits: {' -> '.join(cycle)}",
+                "these graphs invoke each other in a loop, and on every leg of it the call can be "
+                "reached from the graph's start without passing a node that waits for the "
+                f"customer, a human or an async tool: {' -> '.join(cycle)}",
                 graph=self.graphs[cycle[0]],
             )
+
+    def _leg_can_spin(
+        self, caller: str, callee: str, calls: dict[tuple[str, str], list[str]]
+    ) -> bool:
+        """Can ``caller`` reach its call of ``callee`` from its start without suspending?"""
+        graph = self.graphs[caller]
+        alive = {node_id: node for node_id, node in graph.nodes.items() if not self.suspends(node)}
+        if graph.start not in alive:
+            return False
+        edges = {
+            node_id: [t for _l, t in edge_targets(node) if t in alive]
+            for node_id, node in alive.items()
+        }
+        seen: set[str] = set()
+        stack = [graph.start]
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            stack.extend(edges[current])
+        return any(site in seen for site in calls.get((caller, callee), []))
 
     def suspends(self, node: NodeBase) -> bool:
         spec = NODE_TYPES[node.type]
@@ -999,6 +1042,8 @@ class _Rules:
                         # A gate re-evaluates its predicate when the redirect frame pops (6.2).
                         successors[end_point].append(_Edge("return", call_site))
 
+        self._interrupt_edges(successors)
+
         entries: set[Point] = set()
         entry_graph = self.manifest.entry_graph if self.manifest else None
         starts: dict[str, Point] = {
@@ -1028,6 +1073,65 @@ class _Rules:
             if not promoted:
                 return successors, entries
             entries |= promoted
+
+    def _interrupt_edges(self, successors: dict[Point, list[_Edge]]) -> None:
+        """Add the paths an interrupt creates (DESIGN.md section 6.6), for phase-1 finding N3.
+
+        The phase-1 self-critique said it plainly: "DESIGN.md 6.6 lets a customer interrupt a
+        suspended frame and return to it later; those push and resume edges are not in my
+        control-flow graph, so an approval given before an interrupt is assumed still to hold
+        afterwards." Now they are.
+
+        Two edges per interruptible suspension point, for each workflow the root graph offers:
+
+        * **push** - from a node that suspends waiting for the customer, in a graph
+          ``interrupts.allowed_from`` names, into that workflow's ``start``. The frame is fresh,
+          so the callee is entered exactly as it is from the root graph;
+        * **return** - from each of that workflow's ``end`` nodes back to the *same* suspension
+          point, because a parked frame resumes at the node it was parked in (the engine offers
+          it back and re-runs that node).
+
+        Neither can widen the confirm analysis, and that is the point of adding them. Both ends
+        are ``ask`` or ``confirm`` points, whose transfer function clears the covered set, so the
+        push edge enters a workflow with nothing carried in and the return edge adds a
+        predecessor whose successor clears anyway; a *must*-analysis with more predecessors can
+        only report more violations, never fewer. What they buy is that the model is now honest:
+        a pack whose approval survived an interrupt only because the analysis could not see the
+        interrupt no longer does.
+        """
+        if self.manifest is None:
+            return
+        allowed = set(self.manifest.interrupts.allowed_from) - set(
+            self.manifest.interrupts.blocked_in
+        )
+        if not allowed:
+            return
+        workflows = [
+            intent.graph
+            for intent in workflow_intents(self.graphs, self.manifest.entry_graph)
+            if intent.graph in self.graphs
+        ]
+        entry_graph = self.manifest.entry_graph
+        for graph_id in sorted(allowed):
+            graph = self.graphs.get(graph_id)
+            if graph is None or graph_id == entry_graph:
+                # The engine never parks the root frame: DESIGN.md section 6.5's classifier is
+                # already the mechanism for a topic change there, so there is no interrupt edge.
+                continue
+            for node_id, node in graph.nodes.items():
+                if NODE_TYPES[node.type].suspends != "waiting_customer":
+                    continue
+                point = (graph_id, node_id)
+                for workflow in workflows:
+                    if workflow == graph_id:
+                        continue
+                    callee = self.graphs[workflow]
+                    if callee.start not in callee.nodes:  # pragma: no cover - graph.start_missing
+                        continue
+                    successors[point].append(_Edge("interrupt", (workflow, callee.start)))
+                    for end_id, end_node in callee.nodes.items():
+                        if isinstance(end_node, EndNode):
+                            successors[(workflow, end_id)].append(_Edge("interrupt_return", point))
 
     def reachable_points(
         self, successors: dict[Point, list[_Edge]], entries: set[Point]
@@ -1257,9 +1361,68 @@ class _Rules:
             self.warn(
                 "graph.confirm_exempt",
                 f"tool {spec.name!r} is {spec.risk.value} risk and marked confirm_exempt, so no "
-                f"confirm node is required before it. The pack's reason: {reason}",
+                f"confirm node is required before it. It is called as: "
+                f"{self._exempt_call_sites(spec.name)}. The pack's reason: {reason}",
                 location=source,
             )
+
+    def _exempt_call_sites(self, tool: str) -> str:
+        """Every call of a ``confirm_exempt`` tool, with the arguments its node passes.
+
+        Phase 4's review closed with this and its self-critique's attack 7 is the same point: the
+        warning named the tool and not the call, so a reviewer could not see
+        ``send_otp(email: state.email)`` - an address a *model* wrote into state - differently
+        from ``send_otp(email: ctx.customer.email)``, which is the customer's own record. Those
+        are a passcode sent wherever the model said and a passcode sent to the account, and the
+        exemption is the reason nothing else is between them.
+
+        Every call site, across every graph, because a ``gate`` redirect can reach such a node
+        from a graph that does not contain it - which is why this waited for the cross-graph
+        control-flow model rather than being a line in phase 4.
+        """
+        sites: list[str] = []
+        for graph_id, graph in sorted(self.graphs.items()):
+            for node_id, node in graph.nodes.items():
+                if not isinstance(node, ToolNode) or node.tool != tool:
+                    continue
+                args = ", ".join(f"{name}: {raw!r}" for name, raw in sorted(node.args.items()))
+                sites.append(f"{graph_id}.{node_id}({args})")
+        return "; ".join(sites) or "nowhere in this pack"
+
+    def retry_repeats_side_effect(self) -> None:
+        """An ``on_error`` edge that leads back to its own side-effecting ``tool`` node.
+
+        The load-time half of the shape phase 4's resolution left open. Such a node re-enters at
+        the next attempt, claims a *fresh* idempotency key, and calls the tool again - so a WRITE
+        tool that needs no approval repeats its side effect once per failure. A tool that does
+        need one is refused on the second attempt (the approval was spent by the first), and
+        ``graph.approval_reused`` already refuses the loop at load time; this is the case those
+        two do not cover.
+
+        A **warning**, not an error, and the reason is in the sample pack: re-sending a one-time
+        passcode after a failure is a repeat of a side effect that is exactly right. What the
+        author has to decide is whether *this* repeat is, and the run-time cap
+        (``limits.max_node_errors``) bounds it either way.
+        """
+        for graph in self.graphs.values():
+            for node_id, node in graph.nodes.items():
+                if not isinstance(node, ToolNode) or not isinstance(node.on_error, str):
+                    continue
+                spec = self.tools.get(node.tool)
+                if spec is None or spec.risk is Risk.READ or spec.needs_confirm:
+                    continue
+                if node_id not in self._reach(graph, [node.on_error], forward=True):
+                    continue
+                self.warn(
+                    "graph.on_error_repeats_side_effect",
+                    f"the on_error edge of this node leads back to it, and {node.tool!r} is "
+                    f"{spec.risk.value} risk with no confirm required, so every failure runs its "
+                    f"side effect again under a fresh idempotency key. Bounded at run time by "
+                    f"limits.max_node_errors, and right for something like re-sending a passcode "
+                    f"- but say so deliberately, or route the failure somewhere else",
+                    graph=graph,
+                    node=node_id,
+                )
 
     def prompt_budget_sanity(self) -> None:
         """A budget the core prompt itself cannot fit in is always wrong.

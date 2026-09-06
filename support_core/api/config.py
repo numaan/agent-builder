@@ -111,6 +111,27 @@ class AppConfig(BaseModel):
     """Serve the built-in demo page at ``/``. Off for a deployment whose customers have their
     own front end."""
 
+    serve_desk: bool = True
+    """Serve the human desk API of DESIGN.md section 13 under ``/desk``.
+
+    On by default, because a deployment that queues handoff packets and has no way to read them
+    is a deployment that tells customers a person will reply and has no person. Off for one that
+    reads the queue with its own tooling - the ``handoff`` table is the contract, not this API.
+
+    It has no authentication. See :mod:`support_core.api.desk`; phase 7 owns that."""
+
+    handoff_webhook_url: str | None = None
+    """A second sink for handoff packets (DESIGN.md section 13's webhook sink).
+
+    The Postgres queue is always written; this is added beside it when a deployment has somewhere
+    else to page. A webhook that is down is recorded, not retried, and never fails a turn."""
+
+    transcript_url_template: str = "/desk/conversations/{conversation_id}/transcript"
+    """What a packet's ``transcript_url`` points at. Deployment configuration because the URL a
+    person can open depends on where this service is reachable from, which core cannot know. The
+    default is this service's own desk endpoint, so the link works rather than merely looking
+    like one."""
+
     title: str = "support-core"
 
     @classmethod

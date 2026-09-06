@@ -13,6 +13,7 @@ Replacing a hook is the supported way for a later phase to arrive:
 hook                          owner phase  default
 ============================  ===========  ==================================================
 ``interrupt_check``           6            ``continue`` - resume the suspended node
+``resume_offer``              6            an explicit yes or no word, else ``unclear``
 ``extract_slots``             3            the whole reply fills the first declared slot
 ``confirm_decision``          4            an explicit yes or no word, else ``unclear``
 ``handoff``                   6            record nothing; the run still suspends for a human
@@ -48,6 +49,37 @@ class InterruptDecision(BaseModel):
     graph: str | None = None
     """The workflow to push, for ``new_intent``."""
 
+    label: str | None = None
+    """The root graph's edge label that names that workflow, for the record the engine keeps of
+    a *deferred* intent: a person reading it wants the pack's own word for the thing the
+    customer asked for, not the graph file's."""
+
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+class InterruptRequest(BaseModel):
+    """What the engine knows when a message arrives mid-workflow (DESIGN.md section 6.6)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message: str
+    ctx: ConversationContext
+    frames: list[Frame] = Field(default_factory=list)
+    current_graph: str = ""
+    current_node: str = ""
+    question: str | None = None
+    """The question the suspended node asked, which is what ``continue`` means."""
+
+    intents: list[tuple[str, str, str | None]] = Field(default_factory=list)
+    """``(label, graph, description)`` for each workflow the root graph declares an edge to.
+    DESIGN.md section 6.6: "Available intents are the root graph's declared edges.\""""
+
+    interruptible: bool = True
+    """Whether ``pack.yaml``'s ``interrupts`` lets this graph be interrupted. The check is told
+    so it can explain itself; the engine decides regardless of what comes back."""
+
+    window: list[tuple[str, str]] = Field(default_factory=list)
+
 
 class HandoffRequest(BaseModel):
     """Everything the engine knows when it gives up on a turn (DESIGN.md sections 7.3, 13)."""
@@ -57,17 +89,41 @@ class HandoffRequest(BaseModel):
     conversation_id: uuid.UUID
     run_id: uuid.UUID
     reason: str
-    """``limit_exceeded``, ``node_error``, ``timeout`` or ``pack_incompatible`` in phase 2;
-    phase 6 adds ``llm_unavailable`` and the rest of section 7.3."""
+    """DESIGN.md section 7.3's vocabulary and the reasons phases 3, 4 and 6 added to it:
+    ``limit_exceeded``, ``node_error``, ``timeout``, ``pack_incompatible``, ``engine_error``,
+    ``llm_unavailable``, ``llm_invalid_output``, ``low_confidence``, ``model_requested_handoff``,
+    ``tool_refused``, ``tool_failed``, and whatever a pack's ``handoff`` node declares."""
 
     detail: str | None = None
     frames: list[Frame] = Field(default_factory=list)
+    node_id: str | None = None
+    """Where it stopped. The frame stack usually says, but a timeout sweep has no frame and a
+    handoff node knows better than the stack does at the moment it fires."""
+
+    step_id: str | None = None
+    """The step that raised it, which is what makes delivery idempotent across a crash."""
 
 
 class InterruptCheck(Protocol):
-    async def __call__(
-        self, ctx: ConversationContext, message: str, frames: Sequence[Frame]
-    ) -> InterruptDecision: ...
+    async def __call__(self, request: InterruptRequest) -> InterruptDecision: ...
+
+
+class ResumeOfferRequest(BaseModel):
+    """A customer's answer to "shall we go back to X?" (DESIGN.md section 6.6 step 4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    workflow: str
+    offer: str
+    """The question exactly as it was put to them."""
+
+    reply: str
+    ctx: ConversationContext
+    window: list[tuple[str, str]] = Field(default_factory=list)
+
+
+class ResumeOfferChecker(Protocol):
+    async def __call__(self, request: ResumeOfferRequest) -> "ConfirmDecision": ...
 
 
 class SlotRequest(BaseModel):
@@ -91,6 +147,13 @@ class SlotRequest(BaseModel):
     window: list[tuple[str, str]] = Field(default_factory=list)
     """``(author, text)`` for the recent messages before the reply, oldest first: what the
     customer is answering may only be readable in the light of what came before it."""
+
+    hint: str | None = None
+    """What the engine knows about this reply that the node does not (DESIGN.md section 6.6).
+
+    Today: the customer also asked for a different workflow and the current graph would not stop
+    for it, so part of this reply is not an answer at all. Without that, "sure - and change my
+    address to 4 Elm Row" has to be read as a passcode by something that was told it is one."""
 
     ctx: ConversationContext
 
@@ -207,15 +270,30 @@ class Probe(Protocol):
     async def __call__(self, point: str, detail: dict[str, Any]) -> None: ...
 
 
-async def continue_interrupt_check(
-    ctx: ConversationContext, message: str, frames: Sequence[Frame]
-) -> InterruptDecision:
-    """Always ``continue``: the suspended node resumes (BACKLOG.md phase 2).
+async def continue_interrupt_check(request: InterruptRequest) -> InterruptDecision:
+    """Always ``continue``: the suspended node resumes.
 
-    The real check is a structured LLM call classifying the message against the root graph's
-    edges (DESIGN.md section 6.6) and belongs to phase 6.
+    Still the default, and still the right one. The real check is a structured model call
+    (:class:`~support_core.llm.wiring.StructuredInterruptCheck`, DESIGN.md section 6.6), and an
+    engine built without a provider must not pretend to have one; ``continue`` is also what the
+    engine does for a pack that declares no ``interrupts`` block at all, so the two agree.
     """
     return InterruptDecision(kind="continue")
+
+
+async def keyword_resume_offer(request: ResumeOfferRequest) -> ConfirmDecision:
+    """The default reading of "shall we go back to that?": an explicit word, or ``unclear``.
+
+    Same closed lists and same whole-reply match as :func:`keyword_confirm`, and the same
+    reasoning: guessing "no" abandons work the customer asked for, guessing "yes" drags them back
+    to something they had finished with, and asking again costs one message.
+    """
+    reply = " ".join(request.reply.lower().strip().strip(".!,").split())
+    if reply in AFFIRMATIVE:
+        return ConfirmDecision(answer="yes")
+    if reply in NEGATIVE:
+        return ConfirmDecision(answer="no")
+    return ConfirmDecision(answer="unclear")
 
 
 async def first_slot_extractor(request: SlotRequest) -> dict[str, Any]:
@@ -262,6 +340,7 @@ class EngineHooks:
     """One place to override everything the engine defers to another phase."""
 
     interrupt_check: InterruptCheck = field(default=continue_interrupt_check)
+    resume_offer: ResumeOfferChecker = field(default=keyword_resume_offer)
     extract_slots: SlotExtractor = field(default=first_slot_extractor)
     confirm_decision: ConfirmChecker = field(default=keyword_confirm)
     handoff: HandoffHook = field(default=no_handoff)

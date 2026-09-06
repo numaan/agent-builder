@@ -18,9 +18,10 @@ section 7.2 (suspension) are phase 2's subject and neither can be tested without
 A gate only evaluates an expression and pushes a graph; an ``ask`` node's slot extraction, the
 one part that needs a model, is an injectable hook whose default is deterministic and which
 phase 3 replaces. ``tool`` and ``confirm`` became executable in phase 4, which is where the
-tool runtime, the approval hash and the idempotency key live. ``handoff`` is still declared but
-not executable: the validator type-checks it now and phase 6 supplies the behaviour.
-``executable_phase`` records which phase that is, so "not implemented" is never a mystery.
+tool runtime, the approval hash and the idempotency key live. ``handoff`` became executable in
+phase 6, with the packet, the sinks and the desk API of DESIGN.md section 13 behind it.
+``executable_phase`` records which phase that is, so "not implemented" is never a mystery, and
+every core type is now executable.
 """
 
 from dataclasses import dataclass
@@ -182,6 +183,25 @@ class HandoffNode(NodeBase):
 
     type: Literal["handoff"]
     reason: str
+    """Why this conversation is going to a person. It rides on the packet and is what a queue is
+    triaged by, so it is the pack's own word rather than one of DESIGN.md section 7.3's engine
+    failure reasons."""
+
+    message: str | None = None
+    """What to tell the customer as the conversation is handed over. A Jinja template, rendered
+    like a ``say`` node's.
+
+    An addition to DESIGN.md section 6.2's node, which gives this type a ``reason`` and two edges
+    and no way to say anything. A node that parks a customer in silence - the run suspends
+    ``waiting_human`` and the socket goes quiet - is worse than one that does not exist, and
+    every pack would otherwise put a ``say`` in front of every handoff. Optional: core has a
+    default sentence, and it promises only what the system does.
+    """
+
+    next_steps: list[str] = Field(default_factory=list)
+    """What the pack suggests the human does, overriding core's reason-keyed checklist
+    (``suggested_next_steps`` in DESIGN.md section 13's packet). A pack knows its own desk."""
+
     edges: dict[Literal["resumed", "closed"], str]
 
 
@@ -288,8 +308,9 @@ NODE_TYPES: dict[str, NodeTypeSpec] = {
         model=HandoffNode,
         chooses_edge=True,
         suspends="waiting_human",
-        executable=False,
+        executable=True,
         executable_phase=6,
+        template_fields=("message",),
     ),
 }
 

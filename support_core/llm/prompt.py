@@ -198,6 +198,7 @@ def nonce_for(inputs: "PromptInputs") -> str:
             "node_instructions": inputs.node_instructions,
             "decisions": [(d.label, d.description) for d in inputs.decisions],
             "state": _stringify(inputs.state),
+            "pending_intents": [(i.label, i.graph, i.said) for i in inputs.pending_intents],
             "knowledge": [(p.id, p.text, p.source, p.version) for p in inputs.knowledge],
             "tool_results": [
                 (r.name, r.content, r.call_id, r.is_error) for r in inputs.tool_results
@@ -370,6 +371,22 @@ class Passage:
 
 
 @dataclass(frozen=True, slots=True)
+class DeferredIntent:
+    """A workflow the customer asked for while another one refused to stop (section 6.6 step 5).
+
+    ``said`` is the customer's own message, verbatim, which is why this is rendered as untrusted
+    data: it is the strongest evidence of what they wanted and the least trustworthy text in the
+    prompt, and both of those are true at once.
+    """
+
+    label: str
+    """The root graph's edge label for the workflow - the pack's own word for the thing."""
+
+    graph: str
+    said: str
+
+
+@dataclass(frozen=True, slots=True)
 class ToolResult:
     """A tool result carried into the prompt (DESIGN.md section 11.2 layer 8)."""
 
@@ -396,6 +413,11 @@ class PromptInputs:
     node_instructions: str = ""
     decisions: Sequence[Decision] = ()
     state: Mapping[str, Any] = field(default_factory=dict)
+    pending_intents: Sequence["DeferredIntent"] = ()
+    """Requests the customer made that a workflow refused to stop for (DESIGN.md section 6.6
+    step 5), rendered as their own fenced block inside layer 6. Filled only for a node in the
+    root frame; see :meth:`support_core.engine.executor.Executor._pending_intents`."""
+
     knowledge: Sequence[Passage] = ()
     tool_results: Sequence[ToolResult] = ()
     summary: str | None = None
@@ -506,7 +528,7 @@ def _render(layer: Layer, inputs: PromptInputs, limits: PromptBudget, nonce: str
         case Layer.ALLOWED_DECISIONS:
             return _decisions(inputs, nonce)
         case Layer.STATE:
-            return _state(inputs.state, limits.of(Layer.STATE), nonce)
+            return _state_layer(inputs, limits.of(Layer.STATE), nonce)
         case Layer.KNOWLEDGE:
             return _knowledge(inputs.knowledge, limits.of(Layer.KNOWLEDGE), nonce)
         case Layer.TOOL_RESULTS:
@@ -533,6 +555,43 @@ def _decisions(inputs: PromptInputs, nonce: str) -> str:
         lines.append("")
         lines.append(neutralise(inputs.correction.strip(), nonce=nonce))
     return "\n".join(lines)
+
+
+def _state_layer(inputs: PromptInputs, budget: int, nonce: str) -> str:
+    """Layer 6: the frame's state, and anything else about *this conversation* the node needs.
+
+    The deferred intents of DESIGN.md section 6.6 are the second thing. Section 19 step 15 says
+    "the engine surfaces the recorded secondary intent" to the root graph's classifier, and this
+    is where it can go: it is per-conversation data, it contains the customer's own words, and it
+    is neither an instruction (layer 4) nor an allowed decision (layer 5). Its own block, not
+    mixed into the state mapping, because a graph's state is the pack's namespace and core has no
+    business inventing a key in it.
+
+    Both blocks are fenced. The state one already had to be (an ``ask`` node writes the
+    customer's words into a slot); this one is *entirely* the customer's words.
+    """
+    blocks = [
+        _state(inputs.state, budget, nonce),
+        _deferred(inputs.pending_intents, nonce),
+    ]
+    return "\n\n".join(block for block in blocks if block)
+
+
+def _deferred(intents: Sequence["DeferredIntent"], nonce: str) -> str:
+    """The customer's unmet requests, as data the model may choose to act on (section 6.6)."""
+    if not intents:
+        return ""
+    lines = [
+        "Earlier in this conversation the customer asked for something the workflow in progress "
+        "could not take up. It has not been done. If their latest message does not say otherwise, "
+        "this is still outstanding and you may choose the decision that leads to it."
+    ]
+    for intent in intents:
+        lines.append(
+            f"* {neutralise_label(intent.label)}: they said "
+            f"{neutralise(intent.said.strip(), nonce=nonce)}"
+        )
+    return data_block("requests noted earlier and not yet done", "\n".join(lines), nonce=nonce)
 
 
 def _state(state: Mapping[str, Any], budget: int, nonce: str) -> str:

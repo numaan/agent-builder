@@ -124,6 +124,16 @@ class LimitsConfig(BaseModel):
     max_nodes_per_turn: int = Field(default=25, ge=1)
     max_tool_calls_per_turn: int = Field(default=10, ge=0)
     max_llm_cost_per_conversation_usd: float = Field(default=2.0, ge=0)
+    max_node_errors: int = Field(default=3, ge=1)
+    """Consecutive failures of one node in one frame before the conversation goes to a human.
+
+    The bound DESIGN.md section 7.3's retry story needs and section 5.1 has nowhere to put. A
+    node whose ``on_error`` edge leads back to itself - which is what a ``tool`` node retrying
+    its own call looks like - otherwise repeats for as long as it keeps failing, and for a WRITE
+    tool that needs no approval that is one side effect per failure (phase 4's resolution left
+    this shape open and named phase 6 as its owner). Three, because a transient failure deserves
+    more than one try and a permanent one deserves a person; counted in the frame, so it survives
+    a crash, and reset whenever the node succeeds, so an ordinary loop is untouched."""
 
 
 SuspendStatus = Literal["waiting_customer", "waiting_human", "waiting_async_tool", "waiting_timer"]

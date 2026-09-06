@@ -23,8 +23,15 @@ Three endpoints and a page:
 ``GET /``
     The demo client, when ``AppConfig.serve_client`` is on.
 
-What is not here: the desk API, the email webhook, tracing, metrics and the replay endpoint are
-phase 7, and this factory is what that phase extends.
+``/desk/...``
+    The human agent desk of DESIGN.md section 13, when ``AppConfig.serve_desk`` is on: the
+    handoff queue, a reply, a resume with a state patch, a close, a human approval, and the
+    transcript a packet links to. Section 12 calls the desk "not a customer channel but uses the
+    same API surface", which is why it is a router on this app rather than a service of its own.
+    See :mod:`support_core.api.desk` - it has no authentication yet.
+
+What is not here: the email webhook, tracing, metrics and the replay endpoint are phase 7, and
+this factory is what that phase extends.
 """
 
 import asyncio
@@ -43,6 +50,7 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from support_core.api.config import AppConfig
+from support_core.api.desk import desk_router
 from support_core.api.runtime import AppRuntime, build_runtime
 from support_core.channels import ChannelAdapter, InboundRejected
 from support_core.channels.web_chat import CHANNEL as WEB_CHAT
@@ -132,6 +140,11 @@ def create_app(
     )
     app.state.runtime = runtime
     app.include_router(_routes(runtime))
+    if settings.serve_desk:
+        # DESIGN.md section 12: the human desk "is not a customer channel but uses the same API
+        # surface". Mounted on the same app for the same reason section 4.1 gives for everything
+        # else: one service, one image, one database.
+        app.include_router(desk_router(runtime))
     if settings.serve_client:
         app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     return app

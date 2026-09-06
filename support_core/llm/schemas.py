@@ -14,7 +14,7 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
+from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator, model_validator
 
 from support_core.graph.types import build_model
 
@@ -47,6 +47,7 @@ class LlmNodeOutput(BaseModel):
         if isinstance(value, str) and value.strip().lower() == "null":
             return None
         return value
+
     decision: str = Field(description="One of the allowed decision labels, exactly as written.")
     state_updates: dict[str, Any] = Field(
         default_factory=dict, description="Values to write into the workflow state."
@@ -108,6 +109,94 @@ class ConversationSummary(BaseModel):
     summary: str = Field(
         description="A factual summary of the conversation so far, for the agent's own memory."
     )
+
+
+class HandoffSummary(BaseModel):
+    """The summary in a handoff packet (DESIGN.md section 13), written by the escalation model.
+
+    A different reader from :class:`ConversationSummary`, which is why it is a different schema
+    and a different prompt: this one is read once, by a person who is about to speak to the
+    customer, and its job is to make the first thirty seconds unnecessary. It is the only part of
+    the packet a model writes; everything else is read from durable state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(
+        description=(
+            "Three or four sentences for the human agent taking this over: what the customer "
+            "wants, what has been established, what has already been done to their account, and "
+            "what is unresolved. State facts the conversation supports and nothing else."
+        )
+    )
+
+
+class InterruptCheck(BaseModel):
+    """DESIGN.md section 6.6 step 2: what a message that arrived mid-workflow is.
+
+    The four answers are the design's own. ``kind`` and ``intent`` are parsed defensively before
+    validation because the first live run of this project (BACKLOG.md decisions log) found a
+    model spelling absent and nested values as text rather than as JSON; a third instance of that
+    family is expected, and the *interrupt* check is the worst place for one, because its wrong
+    answers are "abandon the customer's workflow" and "ignore what they just asked for".
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["continue", "new_intent", "cancel", "unclear"] = Field(
+        description=(
+            "continue if the message belongs to the question that was just asked; new_intent if "
+            "the customer has changed the subject to another workflow; cancel if they want to "
+            "stop what is in progress; unclear if you cannot tell."
+        )
+    )
+    intent: str | None = Field(
+        default=None,
+        description="For new_intent only: exactly one of the intent labels you were given.",
+    )
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _read_the_models_spelling(cls, data: Any) -> Any:
+        """Normalise the shapes a model uses for these two fields, before validation.
+
+        A model validator rather than two field validators, because the two fields are not
+        independent: ``kind = "new_intent(update_address)"`` is DESIGN.md section 6.6's *own*
+        notation for this answer, so a model shown that vocabulary may well write it, and the
+        intent then has to be recovered from the other field's raw value.
+
+        Three shapes are read, all of them the model's spelling of an answer it got right rather
+        than a different answer:
+
+        * a label wrapped in quotes or whitespace (``' "cancel" '``);
+        * ``new_intent(x)`` and ``new_intent: x``, which carry the intent inside ``kind``;
+        * an intent written as the *text* ``null`` - the exact defect the decisions log records
+          for ``message_to_customer``, where GLM wrote the four characters rather than JSON null.
+          Left alone it would name a workflow called "null", which resolves to nothing and reads
+          as *unclear*: safe, but for the wrong reason, and the customer's actual request is gone
+          a turn later.
+
+        Anything else is passed through untouched and fails validation with its normal message.
+        """
+        if not isinstance(data, dict):
+            return data
+        values = dict(data)
+        raw_kind = values.get("kind")
+        if isinstance(raw_kind, str):
+            text = raw_kind.strip().strip("\"'").strip()
+            head, sep, rest = text.partition("(")
+            if not sep:
+                head, sep, rest = text.partition(":")
+            values["kind"] = head.strip().lower() or text.lower()
+            carried = rest.strip().rstrip(")").strip().strip("\"'").strip()
+            if carried and not values.get("intent"):
+                values["intent"] = carried
+        raw_intent = values.get("intent")
+        if isinstance(raw_intent, str):
+            intent = raw_intent.strip().strip("\"'").strip()
+            values["intent"] = None if intent.lower() in {"", "null", "none", "nil"} else intent
+        return values
 
 
 def _coerce_nested_object(value: Any) -> Any:

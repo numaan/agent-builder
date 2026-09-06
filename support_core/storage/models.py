@@ -198,6 +198,17 @@ class Run(Base):
     parked for a human after a few attempts instead of being retried by every sweep for ever.
     Reset when a sweep gets through the turn."""
 
+    secondary_intents: Mapped[JsonArray] = mapped_column(
+        nullable=False, server_default=_EMPTY_ARRAY
+    )
+    """Workflows the customer asked for while the current graph refused to be interrupted
+    (section 6.6, step 5), oldest first.
+
+    A column, because section 19 step 15 surfaces one several turns after it was recorded, and
+    anything the engine has to remember between turns has to survive the process that heard it.
+    Each entry is ``{"graph", "label", "said", "at"}``: the workflow, the root-graph edge label
+    that names it, the customer's own words, and when."""
+
     updated_at: Mapped[datetime] = _updated_at()
 
 
@@ -329,20 +340,58 @@ class ToolCall(Base):
 
 
 class Handoff(Base):
-    """A handoff packet waiting for, or resolved by, a human (section 13)."""
+    """A handoff packet waiting for, or resolved by, a human (section 13).
+
+    ``packet`` is the whole :class:`~support_core.handoff.packet.HandoffPacket` as JSON, which is
+    what a webhook sink posts and what a desk renders. The columns beside it are the questions a
+    desk asks *of the queue* rather than of one packet - which run, why, where it stopped, when
+    the SLA runs out - and answering those by reading JSON out of the packet would turn the
+    packet's shape into a schema that nothing could change.
+    """
 
     __tablename__ = "handoff"
-    __table_args__ = (Index("ix_handoff_queue_status", "queue", "status"),)
+    __table_args__ = (
+        Index("ix_handoff_queue_status", "queue", "status"),
+        Index(
+            "uq_handoff_run_step",
+            "run_id",
+            "step_id",
+            unique=True,
+            postgresql_where=sql_text("step_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     conversation_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("conversation.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("run.id", ondelete="CASCADE"), index=True
+    )
     packet: Mapped[JsonObject] = mapped_column(nullable=False)
     queue: Mapped[str] = mapped_column(nullable=False)
+    reason: Mapped[str] = mapped_column(nullable=False, server_default="")
+    """Why the conversation came here (section 7.3's vocabulary, or a ``handoff`` node's own
+    ``reason``). A queue is triaged by it, so it is a column and not a JSON key."""
+
+    graph_id: Mapped[str | None] = mapped_column()
+    node_id: Mapped[str | None] = mapped_column()
+    step_id: Mapped[str | None] = mapped_column()
+    """The step that raised it (section 7.1's ``run_id:frame_seq:node_id:attempt``), where one
+    did. Unique per run: a ``handoff`` node builds and delivers its packet before the checkpoint
+    that records the step commits, so a crash in that window re-executes the node - and one
+    packet per attempt would page a person twice for one conversation."""
+
     status: Mapped[str] = mapped_column(nullable=False, server_default="open")
+    """``open``, ``resumed`` or ``closed``."""
+
     human_id: Mapped[str | None] = mapped_column()
+    sla_due_at: Mapped[datetime | None] = mapped_column()
+    """``created_at`` plus the pack's ``handoff.sla_minutes`` (section 5.1); ``None`` when the
+    pack names no SLA."""
+
     created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _updated_at()
     resolved_at: Mapped[datetime | None] = mapped_column()
 
 

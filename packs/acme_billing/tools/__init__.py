@@ -46,3 +46,7 @@ def reset_backend() -> None:
     """
     BILLING.reset()
     OTP.reset()
+    # The address book too. It was left out when the address workflow was added, which is
+    # invisible until a second conversation changes the address and a *third* reads the changed
+    # one back into its prompt - which is how a recorded conversation stops reproducing.
+    ADDRESSES.seed()

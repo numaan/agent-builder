@@ -18,8 +18,16 @@ llm:
     policies: 1200
     conversation: 3000
 interrupts:
+  # DESIGN.md 6.6. A customer who changes the subject inside refund or update_address has the
+  # workflow parked and offered back afterwards; inside verify_identity they are told it will be
+  # picked up later and the request is recorded for the root graph (6.6 step 5, 19 step 8).
+  # `root` is listed because the design's own example lists it; the engine never parks the root
+  # frame, since root.yaml's classify node already handles a topic change and offering "shall we
+  # go back to: is there anything else?" would be absurd. `payment_capture` is gone: this pack
+  # has no such graph, and naming one it does not define was a validator warning that hid
+  # nothing but taught nobody either.
   allowed_from: [root, refund, update_address]
-  blocked_in: [verify_identity, payment_capture]
+  blocked_in: [verify_identity]
 handoff:
   queue: billing-tier-1
   sla_minutes: 30

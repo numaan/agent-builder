@@ -41,14 +41,18 @@ from support_core.channels import (
 from support_core.channels.web_chat import AwaitingSummary
 from support_core.engine import Executor
 from support_core.engine.hooks import EngineHooks
+from support_core.engine.interrupts import workflow_intents
 from support_core.engine.types import OutboundMessage
 from support_core.graph.context import ConversationContext
 from support_core.graph.manifest import Channel
 from support_core.graph.pack import Pack
+from support_core.handoff import HandoffService, default_sink
 from support_core.llm.provider import LLMProvider
 from support_core.llm.service import LlmService
 from support_core.llm.wiring import (
     StructuredConfirmClassifier,
+    StructuredInterruptCheck,
+    StructuredResumeOffer,
     StructuredSlotExtractor,
     service_for_pack,
 )
@@ -167,6 +171,11 @@ class AppRuntime:
     provider_name: str
     llm: LlmService | None
     owns_engine: bool
+    handoff: "HandoffService | None" = None
+    """The desk side of DESIGN.md section 13: what built and delivered each packet. Held so a
+    test - and, later, an operator endpoint - can ask what this replica has queued and what a
+    sink refused."""
+
     send_failures: list[str] = field(default_factory=list)
     """Deliveries a transport refused, most recent last, capped at :data:`SEND_FAILURES_KEPT`.
 
@@ -242,6 +251,24 @@ class AppRuntime:
         )
         return conversation
 
+    async def say(self, conversation_id: uuid.UUID, text: str, *, author: str = "agent") -> None:
+        """Put a message into a conversation from outside a turn (DESIGN.md sections 12, 13).
+
+        The human desk's ``reply``, and nothing else so far. It takes the same route a node's
+        message does - written durably first, delivered afterwards - so a human's answer is in
+        the transcript whether or not anybody is connected, and reaches a live socket if
+        somebody is.
+
+        Not a turn: no lock, no run, no checkpoint. A person typing into a parked conversation
+        is not the engine executing anything, and making it a turn would resume a graph that is
+        deliberately waiting.
+        """
+        async with self.executor.sessions() as session, session.begin():
+            await repo.add_outbound(
+                session, conversation_id=conversation_id, text_=text, author=author
+            )
+        await self.executor.deliver_pending(conversation_id)
+
     async def state(self, conversation_id: uuid.UUID, *, history: int = 200) -> ChatState:
         """The conversation as a client needs to render it, read from durable state only."""
         async with self.executor.sessions() as session, session.begin():
@@ -300,6 +327,12 @@ def build_runtime(
         engine_hooks.summarize = LlmSummarizer(
             service, max_chars=pack.manifest.memory.max_summary_chars
         )
+        # DESIGN.md section 6.6's interrupt check and its return offer. The intents come from the
+        # pack's own root graph, so a deployment cannot widen what a customer may switch to.
+        engine_hooks.interrupt_check = StructuredInterruptCheck(
+            service, [intent.as_tuple() for intent in workflow_intents(pack)]
+        )
+        engine_hooks.resume_offer = StructuredResumeOffer(service)
 
     owns_engine = engine is None
     db = engine if engine is not None else make_engine()
@@ -310,6 +343,18 @@ def build_runtime(
         lock_wait_seconds=config.lock_wait_seconds,
         llm=service,
     )
+    # DESIGN.md section 13's "universal fallback for every failure path in section 7.3", filled.
+    # One service for the ``handoff`` node and for the engine's own routing, so a conversation
+    # that fell over on the way to a handoff produces the same packet as one that reached it.
+    handoff = HandoffService(
+        pack,
+        executor.sessions,
+        sink=default_sink(executor.sessions, config.handoff_webhook_url),
+        llm=service,
+        clock=engine_hooks.clock,
+        transcript_template=config.transcript_url_template,
+    )
+    engine_hooks.handoff = handoff
 
     connections = ConnectionRegistry()
     chosen = list(adapters) if adapters is not None else [WebChatAdapter(connections)]
@@ -347,5 +392,6 @@ def build_runtime(
         provider_name=resolved,
         llm=service,
         owns_engine=owns_engine,
+        handoff=handoff,
         send_failures=failures,
     )

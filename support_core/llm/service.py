@@ -25,6 +25,7 @@ from pydantic import BaseModel, ValidationError
 
 from support_core.llm.prompt import (
     Decision,
+    DeferredIntent,
     Passage,
     PromptBudget,
     PromptInputs,
@@ -37,6 +38,8 @@ from support_core.llm.provider import LLMProvider
 from support_core.llm.schemas import (
     ConfirmReading,
     ConversationSummary,
+    HandoffSummary,
+    InterruptCheck,
     LlmNodeOutput,
     SlotExtraction,
     build_node_output_model,
@@ -84,6 +87,7 @@ class NodeRequest:
     decisions: Sequence[Decision] = ()
     output_schema: Mapping[str, str] = field(default_factory=dict)
     state: Mapping[str, Any] = field(default_factory=dict)
+    pending_intents: Sequence[DeferredIntent] = ()
     knowledge: Sequence[Passage] = ()
     tool_results: Sequence[PromptToolResult] = ()
     summary: str | None = None
@@ -136,6 +140,12 @@ class SlotRequest:
     summary: str | None = None
     window: Sequence[TranscriptMessage] = ()
     model: str | None = None
+    hint: str | None = None
+    """A core-written note about what else is in this reply (DESIGN.md section 6.6 step 5).
+
+    It goes into layer 4 beside the extraction instructions, which is a *trusted* layer - and it
+    is safe there for the one reason that matters: core writes every word of it. The customer's
+    own message is in layer 9, fenced, where it always was."""
 
 
 @dataclass(slots=True)
@@ -164,6 +174,71 @@ class SummaryRequest:
     model: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class Intent:
+    """One workflow the customer could be asking for (DESIGN.md section 6.6 step 2).
+
+    "Available intents are the root graph's declared edges", so this is derived from the pack's
+    own root graph rather than configured twice: ``label`` is the edge, ``graph`` is the workflow
+    it leads to, and ``description`` is whatever the target node says about itself.
+    """
+
+    label: str
+    graph: str
+    description: str | None = None
+
+
+@dataclass(slots=True)
+class InterruptRequest:
+    """A customer message that arrived while a workflow was suspended (section 6.6 step 1)."""
+
+    message: str
+    current_graph: str
+    current_node: str
+    question: str | None = None
+    """The question the suspended node asked, which is what ``continue`` means."""
+
+    intents: Sequence[Intent] = ()
+    interruptible: bool = True
+    """Whether the current graph allows interrupts (``pack.yaml: interrupts``). Told to the model
+    only so it does not have to guess why a topic change was refused; the *decision* is the
+    engine's, and a model that answers ``new_intent`` for a blocked graph still gets the blocked
+    treatment."""
+
+    summary: str | None = None
+    window: Sequence[TranscriptMessage] = ()
+    model: str | None = None
+
+
+@dataclass(slots=True)
+class ResumeOfferRequest:
+    """A customer's answer to "shall we go back to what we were doing?" (section 6.6 step 4)."""
+
+    workflow: str
+    offer: str
+    reply: str
+    summary: str | None = None
+    window: Sequence[TranscriptMessage] = ()
+    model: str | None = None
+
+
+@dataclass(slots=True)
+class HandoffSummaryRequest:
+    """The one part of a handoff packet a model writes (DESIGN.md section 13)."""
+
+    reason: str
+    workflow: str
+    node: str
+    identity_verified: bool
+    actions_taken: Sequence[str] = ()
+    pending_action: str | None = None
+    detail: str | None = None
+    state: Mapping[str, Any] = field(default_factory=dict)
+    window: Sequence[TranscriptMessage] = ()
+    summary: str | None = None
+    max_chars: int = 1500
+
+
 EXTRACTION_INSTRUCTIONS = """\
 The workflow asked the customer for specific values and the customer has replied. Read the reply
 and fill in only the values it actually gives. Leave anything the reply does not answer unset and
@@ -179,6 +254,44 @@ version of it, and not conditionally. Answer "no" if it is a refusal. Answer "un
 anything else at all, including a question, a request to change the amount, silence about the
 proposal, or a change of subject. "unclear" is a good answer and costs nothing: the workflow
 asks again. Guessing "yes" spends the customer's money on a maybe.
+"""
+
+INTERRUPT_INSTRUCTIONS = """\
+A workflow is part-way through and has just asked the customer a question. Their reply has
+arrived. Say which of four things it is, and nothing else.
+
+- "continue": the reply belongs to the question that was asked. This includes a reply that
+  answers the question and mentions something else in passing, and a reply that answers it badly
+  or asks what the question means. If any part of the reply is an attempt to answer, it is this.
+- "new_intent": the customer has stopped answering and is asking for a different workflow from
+  the list of intents you were given. Name it in "intent", using one of those labels exactly.
+- "cancel": the customer wants to stop what is in progress, without asking for anything else.
+- "unclear": you genuinely cannot tell.
+
+"continue" is the safe answer and the common one. Choosing "new_intent" for a reply that was
+also an answer throws that answer away; choosing "cancel" for an impatient sentence abandons work
+the customer wanted. Only name an intent that is in the list.
+"""
+
+RESUME_OFFER_INSTRUCTIONS = """\
+The customer was part-way through one workflow, changed the subject, and has now finished the
+second thing. They have been asked whether to go back to the first. Read their reply.
+
+Answer "yes" only if they want to go back to it, "no" if they want to leave it, and "unclear" for
+anything else at all - including a reply that starts a third topic. "unclear" is a good answer:
+the workflow asks again rather than abandoning something the customer still wants.
+"""
+
+HANDOFF_INSTRUCTIONS = """\
+This conversation is being handed to a human support agent, who will read what you write before
+they read anything else. Write the summary for them.
+
+Say what the customer wants, what has been established (including whether their identity was
+verified), what has already been done to their account, and what is unresolved. Use the actions
+listed in the state block for the second of those: they are the record, and anything not in them
+did not happen. Do not apologise, do not speculate about causes, do not suggest what the agent
+should do, and do not repeat the conversation - they can read it. Facts the conversation supports
+and nothing else.
 """
 
 SUMMARY_INSTRUCTIONS = """\
@@ -285,6 +398,7 @@ class LlmService:
                 node_instructions=request.instructions,
                 decisions=request.decisions,
                 state=request.state,
+                pending_intents=request.pending_intents,
                 knowledge=request.knowledge,
                 tool_results=request.tool_results,
                 summary=request.summary,
@@ -435,6 +549,160 @@ class LlmService:
             msg = "the model returned no reading of the customer's answer"
             raise StructuredOutputError(msg)
         return _validate(ConfirmReading, response.structured, spec.name)
+
+    # -- interrupts (DESIGN.md section 6.6) -----------------------------------------------
+
+    async def read_interrupt(self, request: InterruptRequest) -> InterruptCheck:
+        """Classify a message that arrived while a workflow was suspended (section 6.6 step 2).
+
+        "A small structured LLM call that classifies the message as ``continue``,
+        ``new_intent(<workflow>)``, ``cancel``, or ``unclear``. Available intents are the root
+        graph's declared edges."
+
+        Small in the design's sense - it is the cheapest useful call in the system and DESIGN.md
+        section 20 names it as one to run on a cheaper model - and constrained in the same way an
+        ``llm`` node's decision is: the intents are a closed list the caller derived from the root
+        graph, and an answer naming anything else is not a decision this can return. The engine
+        checks that too, because a schema is a request and not a guarantee.
+        """
+        spec = StructuredSpec(
+            name="interrupt_check",
+            description="Say what this message is, relative to the question that was asked.",
+            json_schema=json_schema_for(InterruptCheck),
+        )
+        intents = {
+            "available_intents": [
+                {"label": intent.label, "workflow": intent.graph, "about": intent.description}
+                for intent in request.intents
+            ],
+            "workflow_in_progress": request.current_graph,
+            "question_asked": request.question,
+            "this_workflow_can_be_interrupted": request.interruptible,
+        }
+        prompt = assemble(
+            PromptInputs(
+                persona=self.persona,
+                policies=self.policies,
+                node_instructions=INTERRUPT_INSTRUCTIONS,
+                state=intents,
+                summary=request.summary,
+                window=[
+                    *request.window,
+                    TranscriptMessage(author="customer", text=request.message),
+                ],
+                task=(
+                    "Say what the last customer message is, in the structured form you were given."
+                ),
+            ),
+            self.budget,
+        )
+        state = _tracker()
+        req = CompletionRequest(
+            model="",
+            system=prompt.system,
+            messages=prompt.messages,
+            structured=spec,
+            max_tokens=self.max_tokens,
+            purpose="interrupt",
+        )
+        response = await self._complete(req, request.model, state)
+        if response.structured is None:
+            msg = "the model returned no reading of the interrupting message"
+            raise StructuredOutputError(msg)
+        return _validate(InterruptCheck, response.structured, spec.name)
+
+    async def read_resume_offer(self, request: ResumeOfferRequest) -> ConfirmReading:
+        """Read the answer to "shall we go back to X?" (DESIGN.md section 6.6 step 4).
+
+        The same three answers as a confirmation and for the same reason: guessing "no" throws
+        away work the customer wanted, guessing "yes" drags them back to something they had
+        dropped, and ``unclear`` costs one message.
+        """
+        spec = StructuredSpec(
+            name="read_resume_offer",
+            description="Say whether the customer wants to return to the earlier workflow.",
+            json_schema=json_schema_for(ConfirmReading),
+        )
+        prompt = assemble(
+            PromptInputs(
+                persona=self.persona,
+                policies=self.policies,
+                node_instructions=RESUME_OFFER_INSTRUCTIONS,
+                state={"paused_workflow": request.workflow, "the_offer": request.offer},
+                summary=request.summary,
+                window=[*request.window, TranscriptMessage(author="customer", text=request.reply)],
+                task="Say how the reply reads, in the structured form you were given.",
+            ),
+            self.budget,
+        )
+        state = _tracker()
+        req = CompletionRequest(
+            model="",
+            system=prompt.system,
+            messages=prompt.messages,
+            structured=spec,
+            max_tokens=self.max_tokens,
+            purpose="resume_offer",
+        )
+        response = await self._complete(req, request.model, state)
+        if response.structured is None:
+            msg = "the model returned no reading of the customer's answer"
+            raise StructuredOutputError(msg)
+        return _validate(ConfirmReading, response.structured, spec.name)
+
+    # -- handoff (DESIGN.md section 13) ---------------------------------------------------
+
+    async def write_handoff_summary(self, request: HandoffSummaryRequest) -> str:
+        """The packet's summary, on the pack's ``escalation_model`` (DESIGN.md sections 5.1, 13).
+
+        Forced onto the escalation model rather than merely allowed to escalate: section 5.1
+        introduces that model as the one "used for handoff summaries and hard reasoning nodes",
+        and this is the one text in the system a human acts on without reading the conversation.
+        Where a pack names no escalation model the default stands, which is the honest fallback.
+        """
+        spec = StructuredSpec(
+            name="handoff_summary",
+            description="Write the summary the human agent will read first.",
+            json_schema=json_schema_for(HandoffSummary),
+        )
+        prompt = assemble(
+            PromptInputs(
+                persona=self.persona,
+                policies=self.policies,
+                node_instructions=(
+                    f"{HANDOFF_INSTRUCTIONS}\nKeep it under {request.max_chars} characters."
+                ),
+                state={
+                    "reason": request.reason,
+                    "stopped_in_workflow": request.workflow,
+                    "stopped_at_node": request.node,
+                    "identity_verified": request.identity_verified,
+                    "actions_taken": list(request.actions_taken),
+                    "pending_action": request.pending_action,
+                    "engine_detail": request.detail,
+                    "workflow_state": dict(request.state),
+                },
+                summary=request.summary,
+                window=request.window,
+                task="Write the summary, in the structured form you were given.",
+            ),
+            self.budget,
+        )
+        state = _tracker()
+        req = CompletionRequest(
+            model="",
+            system=prompt.system,
+            messages=prompt.messages,
+            structured=spec,
+            max_tokens=self.max_tokens,
+            purpose="handoff",
+        )
+        response = await self._complete(req, self.models.escalation, state)
+        if response.structured is None:
+            msg = "the model returned no handoff summary"
+            raise StructuredOutputError(msg)
+        written = _validate(HandoffSummary, response.structured, spec.name)
+        return written.summary[: request.max_chars]
 
     # -- memory --------------------------------------------------------------------------
 

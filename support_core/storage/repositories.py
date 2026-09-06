@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from support_core.storage.models import (
     ActionApproval,
     Conversation,
+    Handoff,
     Message,
     Run,
     ToolCall,
@@ -48,6 +49,10 @@ class RunUpdate:
     timeout_at: datetime | None = None
     awaiting: dict[str, Any] | None = None
     pack_fingerprint: str | None = None
+    secondary_intents: list[dict[str, Any]] = field(default_factory=list)
+    """Workflows the customer asked for that a ``blocked_in`` graph would not stop for
+    (DESIGN.md section 6.6). Rewritten by every checkpoint, like the frame stack, because it is
+    changed by the same acts that change the stack."""
 
 
 @dataclass(slots=True)
@@ -66,6 +71,10 @@ class TurnStart:
     awaiting: dict[str, Any] | None = None
     pack_fingerprint: str | None = None
     status: str = "running"
+    secondary_intents: list[dict[str, Any]] = field(default_factory=list)
+    """The interrupt check runs before the claim (see :func:`claim_and_begin_turn`), so a
+    secondary intent it recorded has to commit with the claim: a process that dies in between
+    must not leave a customer's deferred request on the floor."""
 
 
 @dataclass(slots=True)
@@ -297,6 +306,7 @@ async def claim_and_begin_turn(
                 timeout_at=None,
                 awaiting=run.awaiting,
                 pack_fingerprint=run.pack_fingerprint,
+                secondary_intents=run.secondary_intents,
                 updated_at=run.updated_at,
             )
         )
@@ -442,6 +452,7 @@ async def write_checkpoint(
                 timeout_at=run.timeout_at,
                 awaiting=run.awaiting,
                 pack_fingerprint=run.pack_fingerprint,
+                secondary_intents=run.secondary_intents,
                 updated_at=run.updated_at,
             )
         )
@@ -478,6 +489,32 @@ async def write_checkpoint(
             )
         if before_commit is not None:
             await before_commit()
+
+
+async def add_outbound(
+    session: AsyncSession, *, conversation_id: uuid.UUID, text_: str, author: str = "agent"
+) -> Message:
+    """Write an outbound message from outside a turn (DESIGN.md sections 12, 13).
+
+    The human desk's ``reply`` is the only caller. It is ``pending_send`` like any other outbound
+    row, so it is delivered by the same code and appears in the same transcript - the difference
+    is the author, which is what lets a reader tell a person's sentences from a model's.
+
+    Deliberately not part of a checkpoint: nothing executed, so there is no step to record. A
+    message written by a human while a run is parked is a fact about the conversation, not about
+    the run.
+    """
+    message = Message(
+        conversation_id=conversation_id,
+        direction="outbound",
+        author=author,
+        text=text_,
+        status="pending_send",
+        ordinal=0,
+    )
+    session.add(message)
+    await session.flush()
+    return message
 
 
 async def mark_sent(session: AsyncSession, message_ids: Sequence[uuid.UUID]) -> None:
@@ -763,6 +800,150 @@ async def patch_customer_context(
             "WHERE id = :id"
         ),
         {"customer": json.dumps(customer), "id": conversation_id},
+    )
+
+
+# -- human handoff (DESIGN.md section 13) --------------------------------------------------
+
+
+@dataclass(slots=True)
+class HandoffWrite:
+    """One ``handoff`` row, as the Postgres queue sink writes it (DESIGN.md section 13)."""
+
+    conversation_id: uuid.UUID
+    run_id: uuid.UUID | None
+    packet: dict[str, Any]
+    queue: str
+    reason: str
+    graph_id: str | None = None
+    node_id: str | None = None
+    step_id: str | None = None
+    sla_due_at: datetime | None = None
+
+
+async def create_handoff(session: AsyncSession, write: HandoffWrite) -> Handoff:
+    """Put a packet on a queue. The row *is* the queue (DESIGN.md section 13's Postgres sink).
+
+    Idempotent under ``(run_id, step_id)`` where the caller has a step: the packet is built and
+    delivered *before* the checkpoint that records the step commits, so a process that dies in
+    that window re-executes the node - and a person must not be paged twice for one conversation.
+    A handoff with no step (a timeout sweep, a recovery that gave up) is inserted every time,
+    because there is nothing to say it is the same one.
+    """
+    if write.run_id is not None and write.step_id is not None:
+        existing = await session.execute(
+            select(Handoff).where(Handoff.run_id == write.run_id, Handoff.step_id == write.step_id)
+        )
+        found = existing.scalar_one_or_none()
+        if found is not None:
+            return found
+    row = Handoff(
+        conversation_id=write.conversation_id,
+        run_id=write.run_id,
+        packet=write.packet,
+        queue=write.queue,
+        reason=write.reason,
+        graph_id=write.graph_id,
+        node_id=write.node_id,
+        step_id=write.step_id,
+        sla_due_at=write.sla_due_at,
+        status="open",
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def get_handoff(session: AsyncSession, handoff_id: uuid.UUID) -> Handoff | None:
+    return await session.get(Handoff, handoff_id)
+
+
+async def list_handoffs(
+    session: AsyncSession,
+    *,
+    queue: str | None = None,
+    status: str | None = "open",
+    conversation_id: uuid.UUID | None = None,
+    limit: int = 50,
+) -> list[Handoff]:
+    """The desk's queue view (DESIGN.md section 13), oldest first so the SLA is honoured."""
+    query = select(Handoff)
+    if queue is not None:
+        query = query.where(Handoff.queue == queue)
+    if status is not None:
+        query = query.where(Handoff.status == status)
+    if conversation_id is not None:
+        query = query.where(Handoff.conversation_id == conversation_id)
+    result = await session.execute(query.order_by(Handoff.created_at, Handoff.id).limit(limit))
+    return list(result.scalars())
+
+
+async def open_handoff_for(session: AsyncSession, conversation_id: uuid.UUID) -> Handoff | None:
+    """The newest open handoff on a conversation, which is the one a desk action means."""
+    result = await session.execute(
+        select(Handoff)
+        .where(Handoff.conversation_id == conversation_id, Handoff.status == "open")
+        .order_by(Handoff.created_at.desc(), Handoff.id.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def resolve_handoff(
+    session: AsyncSession,
+    handoff_id: uuid.UUID,
+    *,
+    status: str,
+    when: datetime,
+    human_id: str | None = None,
+) -> None:
+    """Mark a queued packet dealt with: ``resumed`` (handed back) or ``closed`` (taken over)."""
+    values: dict[str, Any] = {"status": status, "resolved_at": when, "updated_at": when}
+    if human_id is not None:
+        values["human_id"] = human_id
+    await session.execute(update(Handoff).where(Handoff.id == handoff_id).values(**values))
+
+
+async def record_human_approval(
+    session: AsyncSession, *, template: ActionApproval, now: datetime
+) -> uuid.UUID:
+    """Write the *human* half of a ``requires_human_approval`` pair (DESIGN.md section 8.2).
+
+    Phase 4 built the check and left it unsatisfiable on purpose: the runtime consumes a customer
+    approval and then a second row with ``approved_by = 'human'``, and until this desk existed
+    nothing could write one, so a tool that declared the flag always refused. This is the only
+    thing in the system that writes one, and it copies every binding field from the customer's own
+    row rather than taking them from a request - the desk approves *the action that was proposed*,
+    and a desk that could name its own tool, arguments or frame would be a way to authorise
+    something the customer never saw.
+
+    The row it mirrors must be bound to a run, a frame and a confirm node, because those are what
+    :func:`consume_approval` matches on; an unbound row could never be consumed and writing its
+    twin would only look like an approval.
+    """
+    if template.run_id is None or template.frame_seq is None or not template.node_id:
+        msg = (
+            "the customer approval to mirror is not bound to a run, a frame and a confirm node, "
+            "so a human approval of it could never be consumed"
+        )
+        raise ValueError(msg)
+    return await record_approval(
+        session,
+        ApprovalWrite(
+            conversation_id=template.conversation_id,
+            run_id=template.run_id,
+            frame_seq=template.frame_seq,
+            node_id=template.node_id,
+            # A distinct step id: ``uq_action_approval_run_step`` is what stops a re-executed
+            # confirm node recording a second approval, and the human's row is a second row on
+            # purpose. It is not a step any node ran, so it is named after the one it mirrors.
+            step_id=f"{template.step_id}#human:{uuid.uuid4().hex[:8]}",
+            tool=template.tool,
+            args=dict(template.args or {}),
+            args_hash=template.args_hash,
+            approved_by="human",
+            approved_at=now,
+        ),
     )
 
 

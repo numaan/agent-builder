@@ -52,12 +52,16 @@ transaction and becomes ``sent`` once a channel adapter (phase 7) has delivered 
 
 
 class OutboundMessage(BaseModel):
-    """A message for the customer produced by a node (DESIGN.md section 6.3)."""
+    """A message for the customer (DESIGN.md section 6.3)."""
 
     model_config = ConfigDict(extra="forbid")
 
     text: str
-    author: Literal["agent"] = "agent"
+    author: Literal["agent", "human"] = "agent"
+    """Who wrote it. ``human`` is the desk of DESIGN.md section 13 replying directly, which
+    section 12 routes through "the same API surface" as everything else. A transcript that could
+    not tell a person's sentences from a model's would not be much of an audit trail, and a
+    customer is entitled to know which they are reading."""
 
 
 class SuspendReason(BaseModel):
@@ -83,6 +87,14 @@ class ResumeEvent(BaseModel):
     """Structured result, for an async tool callback or a desk state patch."""
 
     message_id: uuid.UUID | None = None
+
+    hint: str | None = None
+    """What the engine learned about this message that the node could not (section 6.6 step 5).
+
+    Today there is one: the customer changed the subject and the current graph refused to be
+    interrupted, so the reply is *also* a request for something else. An ``ask`` node's slot
+    extractor is given this, which is what stops "sure - and change my address" being read as
+    the answer to "what is the six-digit code?"."""
 
     detail: dict[str, Any] = Field(default_factory=dict)
     """What the node recorded when it suspended (``run.awaiting.detail``), handed back to it.
@@ -226,6 +238,25 @@ class Frame(BaseModel):
     """Gate nodes this frame has satisfied, in the order they were passed. Re-evaluated on
     every entry to the frame (DESIGN.md section 6.6: "Gates fire on every entry to a frame, so
     an interrupt cannot be used to reach an unverified action")."""
+
+    errors: dict[str, int] = Field(default_factory=dict)
+    """Consecutive failures per node id in this frame, cleared when the node succeeds.
+
+    The bound on DESIGN.md section 7.3's retry story. A node whose ``on_error`` edge leads back
+    to the node - a ``tool`` node retrying its own call is the shape phase 4's resolution left
+    open - would otherwise repeat for as long as it keeps failing, and for a WRITE tool that
+    needs no approval that is one side effect per failure. Counted here, in the frame, so it
+    survives a crash like everything else a turn depends on; *consecutive*, so an ordinary loop
+    that passes through a node many times is untouched."""
+
+    offer_return: bool = False
+    """This frame was interrupted and is parked (DESIGN.md section 6.6 step 4).
+
+    Set on the frame that was on top when an interrupt pushed a workflow over it, and read when
+    it is on top again: "When it ends, the engine asks the customer whether to return to the
+    interrupted workflow, then resumes or abandons it." A field on the frame rather than a
+    marker on the run, because a conversation can park more than one workflow and each one is
+    offered back in the order the stack unwinds."""
 
 
 class TurnOutcome(BaseModel):

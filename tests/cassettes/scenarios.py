@@ -19,11 +19,15 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from support_core import load_pack
 from support_core.engine import Executor
 from support_core.engine.hooks import EngineHooks
+from support_core.engine.interrupts import workflow_intents
+from support_core.handoff import HandoffService, default_sink
 from support_core.llm.fake import Rule
 from support_core.llm.provider import LLMProvider
 from support_core.llm.types import ToolCall
 from support_core.llm.wiring import (
     StructuredConfirmClassifier,
+    StructuredInterruptCheck,
+    StructuredResumeOffer,
     StructuredSlotExtractor,
     service_for_pack,
 )
@@ -38,6 +42,15 @@ CLASSIFY = "Read the customer's most recent message and decide which path"
 CHAT = "Reply to the customer's small talk"
 EXTRACT = "The workflow asked the customer for specific values"
 SUMMARY = "Write a short factual summary"
+INTERRUPT = "A workflow is part-way through and has just asked the customer a question"
+RESUME_OFFER = "changed the subject, and has now finished the"
+HANDOFF = "handed to a human support agent"
+COLLECT = "The customer wants to change the postal address on their account"
+
+
+def _interrupt(kind: str, intent: str | None = None, confidence: float = 0.9) -> dict[str, Any]:
+    """One answer from DESIGN.md section 6.6's interrupt check."""
+    return {"kind": kind, "intent": intent, "confidence": confidence}
 
 
 def answer(
@@ -145,13 +158,28 @@ ACME_ACCOUNT_QUESTION = Scenario(
             respond=answer("account_question", updates={"intent": "account_question"}),
             purpose="node",
         ),
+        # The one part of a handoff packet a model writes (DESIGN.md sections 5.1, 13), on the
+        # escalation model. Recorded, so the golden conversation proves the packet's summary is
+        # the model's and not the fallback the service uses when a summariser is down.
+        Rule(
+            when=HANDOFF,
+            respond={
+                "summary": (
+                    "The customer asked why they were charged 40 dollars on the 3rd. This pack "
+                    "has no workflow for looking up an individual charge, so nothing was checked "
+                    "and nothing was changed on the account. Their identity is not verified."
+                )
+            },
+            purpose="handoff",
+        ),
     ),
-    expected_path=("classify", "no_workflow", "anything_else"),
-    expected_authors=("customer", "agent", "agent"),
-    # Not "done": an account question this pack has no workflow for used to dead-end, so the
-    # customer's next message started a fresh conversation and got the same reply again. It now
-    # says what it can actually do and waits, which is why the run is waiting_customer.
-    expected_status="waiting_customer",
+    expected_path=("classify", "no_workflow"),
+    expected_authors=("customer", "agent"),
+    # An account question this pack has no workflow for used to dead-end, and then said honestly
+    # that nobody had been told. Phase 6 makes `no_workflow` a real `handoff` node: the run parks
+    # `waiting_human` with a packet on the billing-tier-1 queue, which is what the message now
+    # claims and what the desk API can act on.
+    expected_status="waiting_human",
 )
 
 ACME_UNCLEAR = Scenario(
@@ -284,6 +312,10 @@ ACME_REFUND = Scenario(
             when=EXTRACT,
             respond={"slots": {"anything_else": "no"}, "unfilled": [], "confidence": 0.9},
         ),
+        # DESIGN.md section 6.6 runs on every reply to a suspended workflow, so it is part of
+        # this conversation whether or not the customer changes the subject. Recorded rather than
+        # left to fail, so the replay is the conversation the service would really have.
+        Rule(when=INTERRUPT, respond=_interrupt("continue"), purpose="interrupt"),
         Rule(when=CLASSIFY, respond=answer("finished", updates={"intent": "finished"})),
         Rule(
             when=SUMMARY,
@@ -333,12 +365,292 @@ ACME_REFUND = Scenario(
     ),
 )
 
+# -- the phase 6 exit criterion ---------------------------------------------------------------
+#
+# DESIGN.md section 19 end to end, including the two things phase 6 owns: the interrupt at step 7
+# and the secondary intent at step 15.
+#
+#   7.  Customer: "sure, me@example.com. Also, can you change my address?"
+#   8.  Engine: ... Because `verify_identity` is in `blocked_in`, the engine resumes with a hint.
+#   15. `root` loops to classify; the engine surfaces the recorded secondary intent. The model
+#       chooses `update_address`. Push that workflow.
+#
+# The interrupt lands one node later than the design's, because this pack's verify_identity
+# sends the passcode to the address already on file rather than asking for the email first
+# (phase 4's deviation). Everything else is the design's own conversation.
+
+INTERRUPT_ASK = "The code is 581139. Also, can you change my address while we are at it?"
+NEW_ADDRESS = "Yes please - it is 4 Elm Row, Edinburgh, EH7 4AH, United Kingdom."
+INTERRUPT_MID_REFUND = (
+    "Actually, before that - can you change my address to 4 Elm Row, Edinburgh, EH7 4AH, "
+    "United Kingdom?"
+)
+ADDRESS_FIELDS = {
+    "line1": "4 Elm Row",
+    "line2": None,
+    "city": "Edinburgh",
+    "postcode": "EH7 4AH",
+    "country": "United Kingdom",
+}
+
+
+ACME_INTERRUPT_DEFERRED = Scenario(
+    name="acme_interrupt_deferred",
+    pack_path=ACME,
+    context={"customer": {"ref": "cus_acme_1", "email": "me@example.com", "name": "Sam"}},
+    setup=_reset_acme,
+    turns=[REFUND_ASK, INTERRUPT_ASK, "Yes please, go ahead and refund it.", NEW_ADDRESS],
+    rules=(
+        Rule(
+            when=REFUND_ASK,
+            respond=answer(
+                "refund",
+                updates={"intent": "refund", "charge_hint": "one of two Pro Plan charges"},
+            ),
+            purpose="node",
+            uses=1,
+        ),
+        # Step 8. The customer answers the passcode question *and* asks for something else. The
+        # check says which workflow; the engine, not the check, decides that verify_identity does
+        # not stop for it.
+        Rule(
+            when=INTERRUPT_ASK,
+            respond=_interrupt("new_intent", "update_address"),
+            purpose="interrupt",
+            uses=1,
+        ),
+        Rule(when=INTERRUPT, respond=_interrupt("continue"), purpose="interrupt"),
+        # The extractor is told a topic change was deferred, so it takes the code and leaves the
+        # address alone - the whole reason the hint exists.
+        Rule(
+            when=EXTRACT,
+            respond={"slots": {"code": OTP_CODE}, "unfilled": [], "confidence": 0.95},
+            uses=1,
+        ),
+        Rule(
+            when=FIND_CHARGE,
+            tool_calls=[ToolCall(id="tu_charges", name="list_recent_charges", arguments={})],
+            uses=1,
+        ),
+        Rule(when=FIND_CHARGE, respond=answer("found", updates={"charge_id": "ch_1002"})),
+        Rule(when=CONFIRM, respond={"answer": "yes", "confidence": 0.95}, purpose="confirm"),
+        Rule(
+            when=TELL_DONE,
+            respond=answer(
+                "done",
+                message=(
+                    "That is refunded. It takes five to seven business days to show on your "
+                    "statement."
+                ),
+            ),
+        ),
+        # Step 15: the root graph is shown the request it could not take up, and chooses it.
+        Rule(
+            when="requests noted earlier and not yet done",
+            respond=answer("update_address", updates={"intent": "update_address"}),
+            purpose="node",
+        ),
+        Rule(when=COLLECT, respond=answer("complete", updates=ADDRESS_FIELDS)),
+        Rule(
+            when=EXTRACT,
+            respond={"slots": {"anything_else": NEW_ADDRESS}, "unfilled": [], "confidence": 0.9},
+        ),
+        Rule(when=CLASSIFY, respond=answer("finished", updates={"intent": "finished"})),
+        Rule(
+            when=SUMMARY,
+            respond={
+                "summary": (
+                    "The customer asked for a refund of a duplicate Pro Plan charge and, while "
+                    "verifying their identity, also asked to change their address. The refund "
+                    "was approved and issued; the address change was picked up afterwards."
+                )
+            },
+        ),
+    ),
+    expected_path=(
+        "classify",
+        "do_refund",
+        "identity_gate",
+        "send_code",
+        "ask_code",
+        # Turn two: the interrupt is refused by verify_identity, the code is extracted anyway.
+        "ask_code",
+        "check_code",
+        "verified_router",
+        "verified",
+        "identity_gate",
+        "find_charge",
+        "fetch_charge",
+        "check_eligibility",
+        "eligibility_router",
+        "confirm_refund",
+        "confirm_refund",
+        "issue_refund",
+        "tell_done",
+        "done",
+        "anything_else",
+        # Turn four: classify sees the deferred intent and pushes the address workflow.
+        "anything_else",
+        "classify",
+        "do_update_address",
+        "identity_gate",
+        "read_current",
+        "collect",
+        "confirm_change",
+    ),
+    expected_authors=(
+        "customer",
+        "agent",
+        "customer",
+        "agent",
+        "agent",
+        "customer",
+        "agent",
+        "agent",
+        "customer",
+        "agent",
+    ),
+    expected_status="waiting_customer",
+)
+
+ACME_INTERRUPT_SWITCH = Scenario(
+    name="acme_interrupt_switch",
+    pack_path=ACME,
+    # Already verified, so the conversation reaches a suspension *inside the refund graph* - the
+    # one place this pack allows an interrupt - in one turn. A scenario may say so where a
+    # deployment's configuration may not (DESIGN.md section 10): this is the state the
+    # verification workflow would have left, written down instead of walked through again.
+    context={
+        "customer": {
+            "ref": "cus_acme_1",
+            "email": "me@example.com",
+            "name": "Sam",
+            "identity_verified": True,
+        }
+    },
+    setup=_reset_acme,
+    turns=[
+        REFUND_ASK,
+        INTERRUPT_MID_REFUND,
+        "Yes, go ahead with the address.",
+        "Yes please, back to the refund.",
+        "Yes, refund it.",
+    ],
+    rules=(
+        Rule(
+            when=REFUND_ASK,
+            respond=answer(
+                "refund",
+                updates={"intent": "refund", "charge_hint": "one of two Pro Plan charges"},
+            ),
+            purpose="node",
+            uses=1,
+        ),
+        Rule(
+            when=FIND_CHARGE,
+            tool_calls=[ToolCall(id="tu_charges", name="list_recent_charges", arguments={})],
+            uses=1,
+        ),
+        Rule(when=FIND_CHARGE, respond=answer("found", updates={"charge_id": "ch_1002"})),
+        # The refund graph is in `interrupts.allowed_from`, so this one is taken: the refund is
+        # parked mid-confirmation and the address workflow is pushed over it.
+        Rule(
+            when=INTERRUPT_MID_REFUND,
+            respond=_interrupt("new_intent", "update_address"),
+            purpose="interrupt",
+            uses=1,
+        ),
+        Rule(when=INTERRUPT, respond=_interrupt("continue"), purpose="interrupt"),
+        Rule(when=COLLECT, respond=answer("complete", updates=ADDRESS_FIELDS)),
+        Rule(when=CONFIRM, respond={"answer": "yes", "confidence": 0.95}, purpose="confirm"),
+        # And when it ends, the engine asks whether to go back to the refund.
+        Rule(
+            when=RESUME_OFFER,
+            respond={"answer": "yes", "confidence": 0.95},
+            purpose="resume_offer",
+        ),
+        Rule(
+            when=TELL_DONE,
+            respond=answer(
+                "done",
+                message=(
+                    "That is refunded. It takes five to seven business days to show on your "
+                    "statement."
+                ),
+            ),
+        ),
+        Rule(
+            when=EXTRACT,
+            respond={"slots": {"anything_else": "no"}, "unfilled": [], "confidence": 0.9},
+        ),
+        Rule(when=CLASSIFY, respond=answer("finished", updates={"intent": "finished"})),
+        Rule(
+            when=SUMMARY,
+            respond={
+                "summary": (
+                    "The customer asked for a refund, changed the subject to their address "
+                    "mid-confirmation, completed the address change and then came back to the "
+                    "refund and approved it."
+                )
+            },
+        ),
+    ),
+    expected_path=(
+        "classify",
+        "do_refund",
+        "identity_gate",
+        "find_charge",
+        "fetch_charge",
+        "check_eligibility",
+        "eligibility_router",
+        "confirm_refund",
+        # Turn two: the refund frame is parked and update_address is pushed over it.
+        "identity_gate",
+        "read_current",
+        "collect",
+        "confirm_change",
+        # Turn three: the address change completes and the parked refund is offered back.
+        "confirm_change",
+        "apply_change",
+        "tell_done",
+        "done_changed",
+        "__interrupt_return__",
+        # Turn four: "yes" - the refund's confirm re-presents its proposal from scratch.
+        "__interrupt_return__",
+        "confirm_refund",
+        # Turn five: the approval is given to the proposal that was just shown.
+        "confirm_refund",
+        "issue_refund",
+        "tell_done",
+        "done",
+        "anything_else",
+    ),
+    expected_authors=(
+        "customer",
+        "agent",
+        "customer",
+        "agent",
+        "agent",
+        "customer",
+        "agent",
+        "agent",
+        "customer",
+        "agent",
+        "customer",
+        "agent",
+        "agent",
+    ),
+    expected_status="waiting_customer",
+)
+
 SCENARIOS: tuple[Scenario, ...] = (
     ACME_SMALL_TALK,
     ACME_ACCOUNT_QUESTION,
     ACME_UNCLEAR,
     ACME_FINISHED_AT_ONCE,
     ACME_REFUND,
+    ACME_INTERRUPT_DEFERRED,
+    ACME_INTERRUPT_SWITCH,
 )
 
 
@@ -354,8 +666,22 @@ async def play(
         extract_slots=StructuredSlotExtractor(service),
         confirm_decision=StructuredConfirmClassifier(service),
         summarize=LlmSummarizer(service, max_chars=pack.manifest.memory.max_summary_chars),
+        # DESIGN.md section 6.6's interrupt check and its return offer, wired exactly as
+        # `build_runtime` wires them, so a golden conversation exercises what the service runs.
+        interrupt_check=StructuredInterruptCheck(
+            service, [intent.as_tuple() for intent in workflow_intents(pack)]
+        ),
+        resume_offer=StructuredResumeOffer(service),
     )
     executor = Executor(pack, engine, hooks=hooks, llm=service)
+    # DESIGN.md section 13, wired after the executor because the sink writes through the
+    # executor's own session factory: one database connection story, not two.
+    hooks.handoff = HandoffService(
+        pack,
+        executor.sessions,
+        sink=default_sink(executor.sessions),
+        llm=service,
+    )
     conversation_id = await executor.start_conversation(
         customer_ref=(scenario.context.get("customer") or {}).get("ref"),
         context=scenario.context or None,

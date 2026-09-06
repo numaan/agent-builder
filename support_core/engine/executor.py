@@ -27,9 +27,9 @@ inside the checkpoint transaction, or after it - resumes by re-reading the row.
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ValidationError
 from pydantic_core import to_jsonable_python
@@ -40,10 +40,25 @@ from support_core.engine.errors import (
     IncompatiblePackError,
     NodeError,
 )
-from support_core.engine.hooks import EngineHooks, HandoffRequest
+from support_core.engine.hooks import EngineHooks, HandoffRequest, InterruptRequest
+from support_core.engine.hooks import ResumeOfferRequest as ResumeOfferHookRequest
 from support_core.engine.hooks import SummaryRequest as SummaryHookRequest
+from support_core.engine.interrupts import (
+    INTERRUPT_RETURN_NODE,
+    abandoned_notice,
+    cancelled_notice,
+    deferral_hint,
+    deferral_notice,
+    interrupts_allowed,
+    interrupts_configured,
+    resolve_intent,
+    return_offer,
+    switch_notice,
+    workflow_intents,
+)
 from support_core.engine.locks import conversation_lock
 from support_core.engine.runners import (
+    DESK_ACTION,
     NO_TOOL_ACCESS,
     GateRunner,
     NodeRuntime,
@@ -64,10 +79,18 @@ from support_core.engine.types import (
 )
 from support_core.graph.context import ConversationContext, CustomerContext
 from support_core.graph.manifest import Channel, SuspendStatus
-from support_core.graph.nodes import ConfirmNode, GateNode, LlmNode, NodeBase, ToolNode
+from support_core.graph.nodes import (
+    ConfirmNode,
+    GateNode,
+    HandoffNode,
+    LlmNode,
+    NodeBase,
+    ToolNode,
+)
 from support_core.graph.pack import Pack
+from support_core.graph.routing import WorkflowIntent
 from support_core.graph.schema import Graph
-from support_core.llm.prompt import TranscriptMessage
+from support_core.llm.prompt import DeferredIntent, TranscriptMessage
 from support_core.llm.service import LlmService
 from support_core.llm.tool_loop import (
     ModelToolRunner,
@@ -134,6 +157,29 @@ class _Turn:
     process that dies mid-turn does not lose the customer message that drove it: the message
     row is already claimed, and only the run row can say what it was for."""
 
+    secondary_intents: list[dict[str, Any]] = field(default_factory=list)
+    """Workflows the customer asked for that a graph would not stop for (DESIGN.md section 6.6
+    step 5). Written by every checkpoint, like the frame stack, and surfaced to the root graph
+    (section 19 step 15)."""
+
+    notices: list[str] = field(default_factory=list)
+    """Core-written sentences waiting to go out with the next checkpoint's messages.
+
+    The engine says four things of its own (see :mod:`support_core.engine.interrupts`) and none
+    of them belongs to a node, so they ride on the next node's checkpoint rather than inventing a
+    step of their own: a message written outside a checkpoint is a message a crash can duplicate
+    or lose, which is the one thing phase 2 exists to prevent."""
+
+    def take_notices(self) -> list[str]:
+        """Hand over the pending core sentences and forget them.
+
+        Taken rather than read, and taken *inside* the call that composes a checkpoint, so a
+        notice is emitted exactly once: it is written by the same transaction that records the
+        step, and a crash before that transaction commits leaves the notice unsent and the run
+        where it was, which is a state the re-entered turn produces again from scratch."""
+        pending, self.notices = list(self.notices), []
+        return pending
+
     @property
     def frame(self) -> Frame:
         return self.frames[-1]
@@ -154,6 +200,12 @@ class _RunRow:
     awaiting: dict[str, Any] | None
     pack_fingerprint: str | None
     recovery_attempts: int = 0
+    secondary_intents: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _author(stored: str) -> Literal["agent", "human"]:
+    """Who a stored outbound row says wrote it. Anything unexpected is the agent."""
+    return "human" if stored == "human" else "agent"
 
 
 def _spent(gateways: Sequence[ReadOnlyToolGateway]) -> int:
@@ -215,6 +267,7 @@ def _snapshot(run: Run) -> _RunRow:
         awaiting=dict(run.awaiting) if run.awaiting else None,
         pack_fingerprint=run.pack_fingerprint,
         recovery_attempts=run.recovery_attempts,
+        secondary_intents=[dict(intent) for intent in run.secondary_intents],
     )
 
 
@@ -261,6 +314,9 @@ class Executor:
         self._tool_risk = dict(pack.registry.risks)
         """Risk tiers for the model loop's cross-check, from the registry and not from the
         pack's YAML declarations (phase-1 deferred finding I)."""
+
+        self._workflow_intents: tuple[WorkflowIntent, ...] | None = None
+        """The root graph's declared edges as workflows (DESIGN.md section 6.6), derived once."""
 
     # -- entry points --------------------------------------------------------------------
 
@@ -342,15 +398,33 @@ class Executor:
         patch: dict[str, Any] | None = None,
         close: bool = False,
     ) -> TurnOutcome:
-        """The desk returning control, or closing (DESIGN.md section 7.2, "Desk API")."""
-        if close:
+        """The desk returning control, or closing (DESIGN.md sections 7.2, 13).
+
+        Both go through the graph where a ``handoff`` node is waiting for them. DESIGN.md
+        section 13 gives that node a ``closed`` edge as well as a ``resumed`` one, so "take over
+        fully" is a decision the *pack* expresses - usually an ``end`` that finishes the
+        conversation, but a pack that wants to say goodbye first can. Closing the run from
+        underneath a waiting node would make the ``closed`` edge unreachable and leave the frame
+        stack pointing at a node that never ran.
+
+        A run parked by the engine's own failure routing has no node waiting on anything, and
+        there ``close`` still means what it did in phase 2: end the conversation.
+        """
+        payload: dict[str, Any] = dict(patch or {})
+        payload[DESK_ACTION] = "close" if close else "resume"
+        if close and not await self._node_is_waiting(conversation_id):
             return await self._close(conversation_id)
         return await self._resume(
             conversation_id,
-            ResumeEvent(kind="human", text=text, payload=patch or {}),
+            ResumeEvent(kind="human", text=text, payload=payload),
             expected="waiting_human",
             patch=patch,
         )
+
+    async def _node_is_waiting(self, conversation_id: uuid.UUID) -> bool:
+        """Whether a node suspended this run, as opposed to the engine parking it."""
+        run = await self._run_for(conversation_id)
+        return (run.awaiting or {}).get("kind") == "node"
 
     async def resume_async_tool(
         self, conversation_id: uuid.UUID, *, payload: dict[str, Any] | None = None
@@ -514,14 +588,6 @@ class Executor:
         turn = self._turn_state(run, outcome)
 
         if run.status == "waiting_customer":
-            decision = await self.hooks.interrupt_check(ctx, body, list(turn.frames))
-            if decision.kind != "continue":
-                msg = (
-                    f"interrupt check returned {decision.kind!r}: pushing a new intent, "
-                    "cancelling and the return-to-workflow prompt are DESIGN.md section 6.6 "
-                    "and arrive in phase 6"
-                )
-                raise EngineError(msg)
             frame_seq, node_id = self._suspended_at(run, turn.frames)
             turn.pending_event = ResumeEvent(
                 kind="customer_message",
@@ -531,6 +597,7 @@ class Executor:
                 target_frame_seq=frame_seq,
                 target_node_id=node_id,
             )
+            await self._interrupt(turn, run, ctx, body)
         else:
             # An idle or finished run: this message starts a new root frame rather than
             # resuming a node, so there is no event for a node to consume.
@@ -552,6 +619,157 @@ class Executor:
             return None
         await self.hooks.probe("after_claim", {"message_id": str(message_id)})
         return turn
+
+    async def _interrupt(
+        self, turn: _Turn, run: _RunRow, ctx: ConversationContext, body: str
+    ) -> None:
+        """DESIGN.md section 6.6, steps 2 to 5, applied to a message that arrived mid-workflow.
+
+        Runs *before* the claim, on a message read without claiming it, which is the shape phase
+        2's resolution built for exactly this (BACKLOG.md decisions log): the check is a model
+        call and must not sit inside the transaction that claims the message.
+
+        The four answers:
+
+        ``continue`` and ``unclear``
+            The suspended node resumes with the reply, which is what :meth:`_claim_turn` has
+            already prepared. ``unclear`` is deliberately not a third behaviour: the node that
+            asked the question is better placed to make sense of a confusing reply than a
+            classifier that has already said it cannot.
+        ``new_intent`` where the current graph allows interrupts
+            Park the suspended frame and push the workflow. The message is *consumed by the
+            check* - it is what said to switch - so no node is given it and nothing is put back
+            on the queue. The interrupting frame is fresh, so its own gates run from its start
+            node: an interrupt is not a way into an unverified action.
+        ``new_intent`` where it does not
+            Resume the suspended node with a hint, and record the intent so the root graph can
+            offer it later (step 5, and section 19 steps 8 and 15).
+        ``cancel``
+            Unwind to the root frame. Allowed from every graph including a ``blocked_in`` one:
+            refusing to let a customer stop is worse than any workflow it interrupts, and unlike
+            an interrupt it reaches nothing new.
+        """
+        frames = list(turn.frames)
+        if not frames or not interrupts_configured(self.pack.manifest):
+            # A pack that says nothing about interrupts gets no model call: the only answer the
+            # engine could act on is `continue`, which is what happens anyway.
+            return
+        event = turn.pending_event
+        if event is not None and event.target_node_id == INTERRUPT_RETURN_NODE:
+            # The customer is answering "shall we go back to X?" - that is not an interrupt, and
+            # classifying it as one would read "no thanks" as a cancellation of the wrong thing.
+            return
+        frame = frames[-1]
+        if frame.kind == "root":
+            # Nothing is in progress to interrupt. DESIGN.md section 6.5 gives the root graph an
+            # intent classifier it "loops back to after each sub-graph returns", so a customer
+            # who changes the subject while the *root* frame is waiting is already handled by the
+            # pack's own graph - and handled better, because that classifier knows every edge the
+            # root declares and this check knows only the ones that lead to a workflow. Parking a
+            # root frame would also mean offering it back ("shall we return to: is there anything
+            # else?"), which is not a question anybody should be asked.
+            return
+        intents = self._intents()
+        decision = await self.hooks.interrupt_check(
+            InterruptRequest(
+                message=body,
+                ctx=ctx,
+                frames=frames,
+                current_graph=frame.graph_id,
+                current_node=frame.node_id,
+                question=self._question_asked(run),
+                intents=[intent.as_tuple() for intent in intents],
+                interruptible=interrupts_allowed(self.pack.manifest, frame.graph_id),
+                window=[(m.author, m.text) for m in await self._history(turn.conversation_id)],
+            )
+        )
+        if decision.kind == "cancel":
+            self._cancel(turn)
+            return
+        if decision.kind != "new_intent":
+            return
+        intent = resolve_intent(intents, decision.graph or decision.label)
+        if intent is None or intent.graph == frame.graph_id:
+            # An intent the root graph does not declare is not a workflow this conversation can
+            # reach, and one naming the graph we are already in is a continue however it was
+            # spelled. Neither is guessed at.
+            return
+        if not interrupts_allowed(self.pack.manifest, frame.graph_id):
+            self._defer(turn, intent, body, frame.graph_id)
+            return
+        self._switch(turn, intent)
+
+    def _pending_intents(self, turn: _Turn, frame: Frame) -> tuple[DeferredIntent, ...]:
+        """What a node in the *root* frame is shown of the customer's deferred requests.
+
+            `root` loops to classify; the engine surfaces the recorded secondary intent. The
+            model chooses `update_address`. - DESIGN.md section 19 step 15
+
+        Surfaced, not acted on: the engine puts the customer's own words in front of the root
+        graph's classifier as untrusted data, and the *model* chooses among the edges the graph
+        declares, which is principle 2 exactly. The engine pushing the workflow itself would be
+        the engine inventing a transition.
+
+        Only in the root frame, because that is where section 19 puts it and because a
+        classifier inside a workflow has no edge to a different workflow anyway; showing it a
+        request it cannot act on would be noise at best.
+        """
+        if frame.kind != "root" or not turn.secondary_intents:
+            return ()
+        return tuple(
+            DeferredIntent(
+                label=str(intent.get("label") or intent.get("graph") or ""),
+                graph=str(intent.get("graph") or ""),
+                said=str(intent.get("said") or ""),
+            )
+            for intent in turn.secondary_intents
+        )
+
+    def _intents(self) -> tuple[WorkflowIntent, ...]:
+        if self._workflow_intents is None:
+            self._workflow_intents = workflow_intents(self.pack)
+        return self._workflow_intents
+
+    def _question_asked(self, run: _RunRow) -> str | None:
+        """The prompt the suspended node showed, where the suspension recorded one."""
+        detail = _suspend_detail(run)
+        prompt = detail.get("prompt")
+        return str(prompt) if isinstance(prompt, str) else None
+
+    def _switch(self, turn: _Turn, intent: WorkflowIntent) -> None:
+        """Park the suspended frame and push the interrupting workflow (step 4)."""
+        turn.frame.offer_return = True
+        turn.pending_event = None  # the check consumed the message; no node is waiting for it
+        turn.notices.append(switch_notice(intent))
+        self._push(turn, GraphInvocation(graph=intent.graph, kind="interrupt"))
+
+    def _defer(self, turn: _Turn, intent: WorkflowIntent, said: str, current: str) -> None:
+        """Resume the current node with a hint and record the intent (step 5)."""
+        if turn.pending_event is not None:
+            turn.pending_event = turn.pending_event.model_copy(
+                update={"hint": deferral_hint(intent, current)}
+            )
+        turn.notices.append(deferral_notice(intent, current))
+        recorded = {
+            "graph": intent.graph,
+            "label": intent.label,
+            "said": said,
+            "at": self.hooks.clock().isoformat(),
+        }
+        if not any(item.get("graph") == intent.graph for item in turn.secondary_intents):
+            turn.secondary_intents.append(recorded)
+
+    def _cancel(self, turn: _Turn) -> None:
+        """Unwind every frame above the root and acknowledge (step 2's ``cancel``).
+
+        Popping is the whole of it: nothing durable is undone, because nothing durable was done
+        by the frames being dropped - a consumed approval stays consumed and an executed tool
+        stays executed, which is why the sentence core says claims only that it stopped.
+        """
+        turn.pending_event = None
+        while len(turn.frames) > 1:
+            self._pop(turn, turn.frame, {})
+        turn.notices.append(cancelled_notice())
 
     async def _turn(self, conversation: Conversation, turn: _Turn) -> _RunRow:
         """One customer message (DESIGN.md section 7.1, the body of ``on_inbound``)."""
@@ -682,15 +900,19 @@ class Executor:
                 awaiting={"kind": "handoff", "reason": "timeout", "from": run.status},
                 updated_at=now,
             )
-            await self.hooks.handoff(
-                HandoffRequest(
-                    conversation_id=conversation_id,
-                    run_id=run.id,
-                    reason="timeout",
-                    detail=f"timed out in {run.status}",
-                    frames=[Frame.model_validate(frame) for frame in run.frames],
+            # As in the recovery sweep: a sink that is itself down must not stop the sweep
+            # telling anybody about the conversations behind this one. The run is parked.
+            with suppress(Exception):
+                await self.hooks.handoff(
+                    HandoffRequest(
+                        conversation_id=conversation_id,
+                        run_id=run.id,
+                        reason="timeout",
+                        detail=f"timed out in {run.status}",
+                        frames=[Frame.model_validate(frame) for frame in run.frames],
+                        node_id=str((run.awaiting or {}).get("node") or "") or None,
+                    )
                 )
-            )
             outcome.status = "waiting_human"
             outcome.handoff_reason = "timeout"
             return outcome
@@ -729,6 +951,19 @@ class Executor:
                     await self._run_gate_recheck(turn, graph, frame, gate_id)
                     check_gates = True
                     continue
+
+            if frame.offer_return:
+                # An interrupted workflow the customer has to be offered back (section 6.6 step
+                # 4). *After* the gate re-check above, deliberately: a gate that stopped holding
+                # while this frame was parked pushes its redirect first, so returning to a
+                # workflow is never a way back into one whose precondition has lapsed.
+                if await self._offer_return(turn, ctx, frame):
+                    check_gates = True
+                    continue
+                if turn.status != "running":
+                    return turn.pending_event
+                check_gates = False
+                continue
 
             limit = self.pack.manifest.limits.max_nodes_per_turn
             if turn.turn_nodes >= limit:
@@ -778,6 +1013,7 @@ class Executor:
                     record=opened.append,
                 ),
                 tools=self._tool_access(node, site),
+                pending_intents=self._pending_intents(turn, frame),
             )
             runner = self._runner(graph, frame.node_id, node)
             started = self.hooks.clock()
@@ -914,6 +1150,22 @@ class Executor:
             frame.passed_gates.append(node_id)
 
         frame.attempts[node_id] = frame.attempts.get(node_id, 0) + 1
+        # A node that got through is a node that is not failing, whatever it did last time. The
+        # counter that bounds DESIGN.md section 7.3's retries counts *consecutive* failures, so
+        # an ordinary loop through a node is not a retry (see :meth:`_route_error`).
+        frame.errors.pop(node_id, None)
+        detail = result.suspend.detail if result.suspend else None
+        if result.suspend is not None and isinstance(node, HandoffNode):
+            # DESIGN.md section 13's packet, built and delivered *before* the checkpoint that
+            # parks the run. After it would leave a window in which the run is waiting_human and
+            # nobody has been told - which no sweep looks for, because a suspended run is not a
+            # stalled one. Before it, a crash re-executes the node, and delivery is idempotent
+            # under (run, step).
+            detail = dict(detail or {})
+            detail["queued"] = await self._tell_a_human(
+                turn, node_id, node.reason, detail.get("detail"), sid
+            )
+            turn.outcome.handoff_reason = node.reason
         await self._checkpoint(
             turn,
             step=StepWrite(
@@ -927,8 +1179,8 @@ class Executor:
                 started_at=started,
                 ended_at=self.hooks.clock(),
             ),
-            outbound=[message.text for message in result.outbound],
-            suspend_detail=result.suspend.detail if result.suspend else None,
+            outbound=[*turn.take_notices(), *(message.text for message in result.outbound)],
+            suspend_detail=detail,
             suspend_status=result.suspend.status if result.suspend else None,
             suspend_node=node_id if result.suspend else None,
             suspend_frame_seq=frame.frame_seq if result.suspend else None,
@@ -979,6 +1231,116 @@ class Executor:
         customer = dict(result.customer_patch)
         ctx.customer = CustomerContext.model_validate(customer)
         return customer
+
+    async def _offer_return(self, turn: _Turn, ctx: ConversationContext, frame: Frame) -> bool:
+        """Ask whether to go back to a parked workflow, and act on the answer (6.6 step 4).
+
+            When it ends, the engine asks the customer whether to return to the interrupted
+            workflow, then resumes or abandons it. - DESIGN.md section 6.6
+
+        A core step rather than a node: no graph declares it, and no pack should have to. It
+        writes a trace step like anything else, under the reserved node id
+        :data:`~support_core.engine.interrupts.INTERRUPT_RETURN_NODE`, so a conversation that
+        did this is visible in the trace and its checkpoint is one transaction like every other.
+
+        Returns whether the frame stack changed - which happens only on "no", where the parked
+        frame is popped and its caller carries on with no outputs from it.
+        """
+        node_id = INTERRUPT_RETURN_NODE
+        attempt = frame.attempts.get(node_id, 0)
+        sid = step_id(turn.run_id, frame.frame_seq, node_id, attempt)
+        # Advanced now, not per outcome: every path below writes exactly one checkpoint, and a
+        # step id is unique per row (``uq_trace_step_step_id``). Making the offer and reading the
+        # answer are two steps of one conversation, and so is each re-offer after an unreadable
+        # reply; the trace shows them as the separate things they are.
+        frame.attempts[node_id] = attempt + 1
+        started = self.hooks.clock()
+        event = turn.pending_event
+        answering = (
+            event is not None
+            and event.target_frame_seq == frame.frame_seq
+            and event.target_node_id == node_id
+        )
+        offer = return_offer(frame.graph_id)
+        if not answering:
+            await self._record_offer(turn, frame, sid, started, offer, edge="offer")
+            return False
+
+        assert event is not None
+        turn.pending_event = None
+        decision = await self.hooks.resume_offer(
+            ResumeOfferHookRequest(
+                workflow=frame.graph_id,
+                offer=str(event.detail.get("prompt") or offer),
+                reply=event.text or "",
+                ctx=ctx,
+                window=[(m.author, m.text) for m in await self._history(turn.conversation_id)],
+            )
+        )
+        if decision.answer == "unclear":
+            # The same answer a confirmation gives an unreadable reply, for the same reason: the
+            # cost of asking again is one message and the cost of guessing is a workflow either
+            # abandoned or forced on somebody.
+            await self._record_offer(turn, frame, sid, started, offer, edge="offer")
+            return False
+        frame.offer_return = False
+        if decision.answer == "no":
+            turn.notices.append(abandoned_notice(frame.graph_id))
+            self._pop(turn, frame, {})
+            await self._checkpoint(
+                turn,
+                step=StepWrite(
+                    run_id=turn.run_id,
+                    step_id=sid,
+                    seq=turn.seq + 1,
+                    node_id=node_id,
+                    edge="abandoned",
+                    started_at=started,
+                    ended_at=self.hooks.clock(),
+                ),
+            )
+            return True
+        await self._checkpoint(
+            turn,
+            step=StepWrite(
+                run_id=turn.run_id,
+                step_id=sid,
+                seq=turn.seq + 1,
+                node_id=node_id,
+                edge="resumed",
+                started_at=started,
+                ended_at=self.hooks.clock(),
+            ),
+        )
+        return False
+
+    async def _record_offer(
+        self, turn: _Turn, frame: Frame, sid: str, started: datetime, offer: str, *, edge: str
+    ) -> None:
+        """Put the offer to the customer and suspend on it."""
+        turn.status = "waiting_customer"
+        await self._checkpoint(
+            turn,
+            step=StepWrite(
+                run_id=turn.run_id,
+                step_id=sid,
+                seq=turn.seq + 1,
+                node_id=INTERRUPT_RETURN_NODE,
+                edge=edge,
+                started_at=started,
+                ended_at=self.hooks.clock(),
+            ),
+            outbound=[*turn.take_notices(), offer],
+            suspend_status="waiting_customer",
+            suspend_node=INTERRUPT_RETURN_NODE,
+            suspend_frame_seq=frame.frame_seq,
+            suspend_detail={
+                "node": INTERRUPT_RETURN_NODE,
+                "kind": "interrupt_return",
+                "graph": frame.graph_id,
+                "prompt": offer,
+            },
+        )
 
     async def _run_gate_recheck(
         self, turn: _Turn, graph: Graph, frame: Frame, gate_id: str
@@ -1032,6 +1394,25 @@ class Executor:
         """
         on_error = getattr(node, "on_error", None)
         node_id = frame.node_id
+        frame.errors[node_id] = frame.errors.get(node_id, 0) + 1
+        cap = self.pack.manifest.limits.max_node_errors
+        if isinstance(on_error, str) and frame.errors[node_id] >= cap:
+            # The run-time half of the shape phase 4's resolution left open: an ``on_error`` edge
+            # that leads back to its own node retries for as long as the node keeps failing, and
+            # a WRITE tool that needs no approval repeats its side effect once per failure. The
+            # count is consecutive and lives in the frame, so an ordinary loop is untouched and a
+            # crash does not reset it. Named ``limit_exceeded`` because that is DESIGN.md section
+            # 7.3's word for a limit, and the detail says which one.
+            await self._handoff(
+                turn,
+                node_id,
+                "limit_exceeded",
+                f"{node_id} failed {frame.errors[node_id]} times in a row "
+                f"(max_node_errors={cap}); the last failure was: {exc}",
+                started=started,
+                sid=sid,
+            )
+            return False
         if not isinstance(on_error, str):
             # ``reason`` is the node's own diagnosis where it has one: DESIGN.md section 7.3
             # names ``llm_unavailable``, and phase 3 distinguishes it from a model that answered
@@ -1066,11 +1447,18 @@ class Executor:
         started: datetime | None = None,
         sid: str | None = None,
     ) -> None:
-        """Give up on the turn and park the run for a human (DESIGN.md section 7.3).
+        """Give up on the turn and park the run for a human (DESIGN.md sections 7.3, 13).
 
-        The handoff *node*, the packet and the queue sinks are phase 6; what phase 2 owns is
-        that every failure path ends in a durable ``waiting_human`` run and one call to the
-        hook, so phase 6 has one place to attach to.
+        Every failure the engine can route ends here, with the reason it was given: the limits of
+        7.3, a node error carrying its own diagnosis (``llm_unavailable``, ``tool_failed`` and
+        the rest), a timeout, a pack the run no longer fits, a recovery that gave up. Phase 2
+        made that one call to one hook; phase 6 makes the hook build a real packet, so the
+        difference between a conversation that reached a ``handoff`` node and one that fell over
+        on the way to it is the ``reason`` field and nothing else.
+
+        The packet is delivered *before* the checkpoint that parks the run, for the reason given
+        in :meth:`_advance`: the other order has a window in which the run says a human is
+        needed and no human has been told, and nothing sweeps for that.
         """
         frame = turn.frame
         attempt = frame.attempts.get(node_id, 0)
@@ -1078,6 +1466,7 @@ class Executor:
         frame.attempts[node_id] = attempt + 1
         turn.status = "waiting_human"
         now = self.hooks.clock()
+        queued = await self._tell_a_human(turn, node_id, reason, detail, step)
         await self._checkpoint(
             turn,
             step=StepWrite(
@@ -1090,22 +1479,41 @@ class Executor:
                 started_at=started or now,
                 ended_at=now,
             ),
+            outbound=turn.take_notices(),
             suspend_status="waiting_human",
-            suspend_detail={"reason": reason, "detail": detail},
+            suspend_detail={"reason": reason, "detail": detail, "queued": queued},
             suspend_node=node_id,
             suspend_frame_seq=frame.frame_seq,
             handoff_reason=reason,
         )
         turn.outcome.handoff_reason = reason
-        await self.hooks.handoff(
-            HandoffRequest(
-                conversation_id=turn.conversation_id,
-                run_id=turn.run_id,
-                reason=reason,
-                detail=detail,
-                frames=list(turn.frames),
+
+    async def _tell_a_human(
+        self, turn: _Turn, node_id: str, reason: str, detail: str | None, sid: str
+    ) -> bool:
+        """Hand the failure to the handoff hook. Returns whether it took it.
+
+        A hook that raises must not take the turn down with it: the run is about to be parked
+        durably either way, and a customer waiting for a person who was never paged is recoverable
+        from the queue, while a turn that died mid-checkpoint is another crash to re-enter. Core's
+        own :class:`~support_core.handoff.service.HandoffService` never raises; this guard is for
+        a pack's or a deployment's.
+        """
+        try:
+            await self.hooks.handoff(
+                HandoffRequest(
+                    conversation_id=turn.conversation_id,
+                    run_id=turn.run_id,
+                    reason=reason,
+                    detail=detail,
+                    frames=list(turn.frames),
+                    node_id=node_id,
+                    step_id=sid,
+                )
             )
-        )
+        except Exception:
+            return False
+        return True
 
     # -- frame stack ---------------------------------------------------------------------
 
@@ -1137,12 +1545,23 @@ class Executor:
             )
         )
         turn.next_frame_seq += 1
+        # A workflow that is now running is no longer one the customer is still waiting to be
+        # offered (DESIGN.md section 6.6 step 5). Cleared however the frame was pushed - by the
+        # root graph choosing it from the surfaced list, by an interrupt, or by a gate redirect -
+        # because what the record is for is that the request is not dropped, and it has not been.
+        turn.secondary_intents = [
+            intent for intent in turn.secondary_intents if intent.get("graph") != graph.id
+        ]
 
     def _pop(self, turn: _Turn, frame: Frame, outputs: dict[str, Any]) -> None:
         """Pop a frame and map its outputs into the caller (DESIGN.md section 6.2, ``end``)."""
         turn.frames.pop()
         if not turn.frames:
             turn.status = "done"
+            # The root frame has ended, so there is no root graph left to offer anything to. A
+            # deferred intent that survived into the next conversation would be offered to a
+            # customer who has moved on, out of a conversation they cannot see.
+            turn.secondary_intents = []
             return
         caller = turn.frame
         clean = to_jsonable_python(outputs)
@@ -1278,6 +1697,7 @@ class Executor:
             timeout_at=timeout_at,
             awaiting=awaiting,
             pack_fingerprint=self.pack.pin.fingerprint,
+            secondary_intents=list(turn.secondary_intents),
         )
 
         async def before_commit() -> None:
@@ -1302,6 +1722,15 @@ class Executor:
         if outbound:
             await self._flush_outbound(turn.conversation_id)
 
+    async def deliver_pending(self, conversation_id: uuid.UUID) -> None:
+        """Hand any undelivered outbound rows to the channel, outside a turn.
+
+        The desk's ``reply`` (DESIGN.md section 13) is the caller: a person typing into a parked
+        conversation writes a durable row and then wants it delivered, and that is exactly what
+        the end of a turn does. Public because it is not a turn and must not take the lock.
+        """
+        await self._flush_outbound(conversation_id)
+
     async def _flush_outbound(self, conversation_id: uuid.UUID) -> None:
         """Hand every undelivered outbound row to the channel and mark it sent.
 
@@ -1314,7 +1743,10 @@ class Executor:
             waiting = await repo.pending_outbound(session, conversation_id)
             if not waiting:
                 return
-            await self.hooks.send(conversation_id, [OutboundMessage(text=m.text) for m in waiting])
+            await self.hooks.send(
+                conversation_id,
+                [OutboundMessage(text=m.text, author=_author(m.author)) for m in waiting],
+            )
             await repo.mark_sent(session, [m.id for m in waiting])
 
     async def _history(self, conversation_id: uuid.UUID) -> tuple[TranscriptMessage, ...]:
@@ -1443,6 +1875,7 @@ class Executor:
                     next_frame_seq=turn.next_frame_seq,
                     awaiting=self._with_turn_event(turn, None),
                     pack_fingerprint=self.pack.pin.fingerprint,
+                    secondary_intents=list(turn.secondary_intents),
                     updated_at=self.hooks.clock(),
                 ),
                 before_commit=before_commit,
@@ -1501,6 +1934,7 @@ class Executor:
             turn_nodes=run.turn_nodes,
             turn_tool_calls=run.turn_tool_calls,
             outcome=outcome,
+            secondary_intents=[dict(intent) for intent in run.secondary_intents],
         )
 
     def _graph(self, frame: Frame) -> Graph:

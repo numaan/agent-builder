@@ -23,6 +23,7 @@ from support_core.engine.hooks import (
     EngineHooks,
     HandoffRequest,
     InterruptDecision,
+    InterruptRequest,
     SlotRequest,
 )
 from support_core.engine.runners import NodeRuntime, register_node_type, unregister_node_type
@@ -57,6 +58,9 @@ class Recorder:
     """Crash on the ``crash_after``-th visit to ``crash_at`` (0 = the first)."""
 
     interrupt: InterruptDecision | None = None
+    interrupts: list[InterruptRequest] = field(default_factory=list)
+    """Every interrupt check the engine ran, so a test can assert it did *not* run one."""
+
     slots: dict[str, Any] | None = None
     now: datetime = datetime(2026, 9, 5, 12, 0, tzinfo=UTC)
     seen: dict[str, int] = field(default_factory=dict)
@@ -91,9 +95,8 @@ class Recorder:
         if seen == self.crash_after:
             raise SimulatedCrash(f"{point} at {detail.get('step_id')}")
 
-    async def _interrupt(
-        self, ctx: ConversationContext, message: str, frames: Sequence[Any]
-    ) -> InterruptDecision:
+    async def _interrupt(self, request: InterruptRequest) -> InterruptDecision:
+        self.interrupts.append(request)
         return self.interrupt or InterruptDecision(kind="continue")
 
     async def _extract(self, request: SlotRequest) -> dict[str, Any]:

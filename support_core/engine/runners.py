@@ -40,6 +40,7 @@ from support_core.graph.nodes import (
     ConfirmNode,
     EndNode,
     GateNode,
+    HandoffNode,
     LlmNode,
     NodeBase,
     NodeTypeSpec,
@@ -52,7 +53,7 @@ from support_core.graph.nodes import (
 )
 from support_core.graph.schema import Graph, parse_value
 from support_core.graph.templates import TemplateError, render
-from support_core.llm.prompt import Decision, TranscriptMessage
+from support_core.llm.prompt import Decision, DeferredIntent, TranscriptMessage
 from support_core.llm.service import LlmService, NodeRequest
 from support_core.llm.tool_loop import (
     ModelToolRunner,
@@ -190,6 +191,11 @@ class NodeRuntime:
     tools: NodeToolAccess = NO_TOOL_ACCESS
     """The deterministic path of DESIGN.md section 8.2, narrowed to this node (see
     :class:`NodeToolAccess`). A node that is not a ``tool`` node cannot invoke anything with it."""
+
+    pending_intents: tuple[DeferredIntent, ...] = ()
+    """Requests the customer made that a workflow refused to stop for (DESIGN.md section 6.6
+    step 5), surfaced to the root graph's classifier (section 19 step 15). Non-empty only for a
+    node in the root frame; the executor decides that, not the node."""
 
     def render(self, source: str, scope: Mapping[str, Any]) -> str:
         return render(source, dict(scope), env=self.environment)
@@ -471,6 +477,7 @@ class AskRunner(_Runner):
             state_model=type(state),
             state=state.model_dump(mode="json"),
             window=[(message.author, message.text) for message in rt.history],
+            hint=event.hint,
             ctx=ctx,
         )
         try:
@@ -542,6 +549,7 @@ class LlmRunner(_Runner):
             decisions=self._decisions(rt.graph),
             output_schema=dict(self.node.output_schema or {}),
             state=state.model_dump(mode="json"),
+            pending_intents=rt.pending_intents,
             summary=ctx.summary,
             window=list(rt.history),
             gateway=rt.tool_gateway(self.node.tools) if self.node.tools else None,
@@ -872,6 +880,95 @@ class ToolRunner(_Runner):
         return NodeResult(state_patch=patch, customer_patch=result.customer_patch)
 
 
+DESK_ACTION = "__desk_action__"
+"""Key in a human resume event's payload saying which desk action this was.
+
+Underscored and reserved, like :data:`~support_core.engine.interrupts.INTERRUPT_RETURN_NODE`,
+because the rest of that payload is a *state patch* a desk supplies (DESIGN.md section 13:
+"``resume`` with optional state patch") and a graph could legitimately declare a field called
+``action``. The executor puts it there; a desk cannot, because the desk API takes the action as
+its own argument and never as part of the patch.
+"""
+
+
+DEFAULT_HANDOFF_MESSAGE = (
+    "I am passing this conversation to one of our people, with what you have told me so far. "
+    "They will reply here."
+)
+"""What a ``handoff`` node says when the pack does not write its own message.
+
+Two sentences, and both are true of what happens next: the packet really does carry the state,
+the actions and the transcript link (DESIGN.md section 13), and the desk API's ``reply`` really
+does put a human's answer into this conversation. It deliberately does not say how long it will
+take, because the pack's ``handoff.sla_minutes`` is a target for the queue, not a promise to a
+customer, and DESIGN.md section 14 makes an unbacked promise a defect.
+"""
+
+
+class HandoffRunner(_Runner):
+    """Hand the conversation to a person (DESIGN.md sections 6.2, 13).
+
+    The node's own job is small, on purpose. It says one sentence and suspends
+    ``waiting_human``; the *packet* is built and delivered by the executor, because DESIGN.md
+    section 6.3 says nodes never touch storage and a packet is six queries and a model call over
+    durable state. That division also gets the ordering right: the executor delivers before the
+    checkpoint that parks the run, so there is no window in which a run says a human is needed
+    and no human has been told.
+
+    On the way back it does no more than read what the desk did:
+
+    * ``resume`` - with an optional state patch, which the executor has already applied - takes
+      the ``resumed`` edge, which is DESIGN.md section 13's "On ``resume``, the graph continues
+      from the handoff node's ``resumed`` edge";
+    * ``close`` takes the ``closed`` edge, so a pack decides what taking over fully means for
+      its own graph rather than having the engine end the conversation underneath it.
+
+    A human's typed reply is *not* an edge. The desk's ``reply`` writes a message into the
+    conversation and leaves the run parked, because answering a customer is not the same act as
+    giving the workflow back and conflating them would resume a graph every time somebody typed.
+    """
+
+    __slots__ = ("node",)
+
+    def __init__(self, node_id: str, node: NodeBase) -> None:
+        super().__init__(node_id, node)
+        assert isinstance(node, HandoffNode)
+        self.node = node
+
+    async def run(self, state: BaseModel, ctx: ConversationContext, rt: NodeRuntime) -> NodeResult:
+        message = DEFAULT_HANDOFF_MESSAGE
+        if self.node.message:
+            try:
+                message = rt.render(self.node.message, scope_of(state, ctx)).strip()
+            except TemplateError as exc:
+                raise NodeError(f"{self.id}: handoff message template failed: {exc}") from exc
+        return NodeResult(
+            outbound=[OutboundMessage(text=message)] if message else [],
+            suspend=SuspendReason(
+                status="waiting_human",
+                detail={
+                    "node": self.id,
+                    "kind": "handoff",
+                    "reason": self.node.reason,
+                    "next_steps": list(self.node.next_steps),
+                },
+            ),
+        )
+
+    async def resume(
+        self,
+        state: BaseModel,
+        ctx: ConversationContext,
+        rt: NodeRuntime,
+        event: ResumeEvent,
+    ) -> NodeResult:
+        if event.kind != "human":
+            msg = f"{self.id}: a handoff node waits for a human, not {event.kind!r}"
+            raise NodeError(msg)
+        action = str(event.payload.get(DESK_ACTION) or "resume")
+        return NodeResult(next_edge="closed" if action == "close" else "resumed")
+
+
 class NotExecutableRunner(_Runner):
     """A node type core validates but cannot run yet, naming the phase that adds it."""
 
@@ -903,6 +1000,7 @@ NODE_RUNNERS: dict[str, RunnerFactory] = {
     "llm": LlmRunner,
     "tool": ToolRunner,
     "confirm": ConfirmRunner,
+    "handoff": HandoffRunner,
 }
 """Runner per node type. A type in :data:`~support_core.graph.nodes.NODE_TYPES` but not here
 is validated and refused at run time by :class:`NotExecutableRunner`."""
