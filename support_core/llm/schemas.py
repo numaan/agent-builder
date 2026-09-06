@@ -10,10 +10,11 @@ answer is validated against, so a provider that ignores a schema, or a model tha
 edge the graph does not declare, fails validation instead of steering the conversation.
 """
 
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
 from support_core.graph.types import build_model
 
@@ -93,6 +94,32 @@ class ConversationSummary(BaseModel):
     )
 
 
+def _coerce_nested_object(value: Any) -> Any:
+    """Accept the two shapes a model may use for a nested object it means to be empty or JSON.
+
+    Structured output is a tool call, and not every model serialises a nested object the same
+    way. Some send ``state_updates`` as a JSON *string*; some send ``null`` where they mean "I am
+    writing nothing". Both are the model's spelling, not a different answer, so they are read
+    rather than refused - and then validated against the node's own closed model exactly as
+    before, so nothing about review finding V2's guarantee is relaxed: an undeclared schema still
+    builds a model with no fields, and a payload that writes something still fails here.
+
+    Anything else is passed through untouched and fails validation with the normal message.
+    """
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return value
+        return parsed if isinstance(parsed, dict) else value
+    return value
+
+
 def build_node_output_model(
     node_id: str,
     edges: Sequence[str],
@@ -137,9 +164,15 @@ def build_node_output_model(
             ),
         ),
     )
+    validators: dict[str, Any] = {
+        "_read_state_updates": field_validator("state_updates", mode="before")(
+            classmethod(lambda cls, value: _coerce_nested_object(value))
+        )
+    }
     model = create_model(
         f"{_camel(node_id)}Output",
         __base__=LlmNodeOutput,
+        __validators__=validators,
         **fields,
     )
     return cast(type[LlmNodeOutput], model)

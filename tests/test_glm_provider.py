@@ -81,3 +81,56 @@ def test_the_provider_reports_itself_as_glm() -> None:
     assert provider.name == "glm"
     assert provider.capabilities.supports_cache_control is False
     assert provider.capabilities.supports_strict_tools is False
+
+
+def test_a_nested_object_sent_as_a_json_string_is_read_not_refused() -> None:
+    """GLM serialises ``state_updates`` as a JSON string; that is spelling, not a different answer.
+
+    Found on the first live GLM run: every ``llm`` node handed off with "the 'decide' answer does
+    not fit the required shape: state_updates: Input should be a valid dictionary". The engine was
+    right to refuse rather than guess, and the fix belongs at the provider boundary.
+    """
+    from support_core.llm.schemas import build_node_output_model
+
+    model = build_node_output_model("classify", ["refund", "small_talk"], {"hint": "str | None"})
+    for sent in ('{"hint": "twice"}', {"hint": "twice"}):
+        answer = model.model_validate(
+            {"decision": "refund", "state_updates": sent, "confidence": 0.9}
+        )
+        assert answer.state_updates.hint == "twice"  # type: ignore[attr-defined]
+
+
+def test_null_and_empty_mean_writing_nothing() -> None:
+    from support_core.llm.schemas import build_node_output_model
+
+    model = build_node_output_model("classify", ["refund"], {"hint": "str | None"})
+    for sent in (None, "", "{}"):
+        answer = model.model_validate(
+            {"decision": "refund", "state_updates": sent, "confidence": 0.9}
+        )
+        assert answer.state_updates.hint is None  # type: ignore[attr-defined]
+
+
+def test_the_string_form_cannot_smuggle_a_field_the_node_never_declared() -> None:
+    """Review finding V2 is not relaxed by reading the string: it is parsed, then validated."""
+    from support_core.llm.schemas import build_node_output_model
+
+    model = build_node_output_model("chat", ["done"], None)
+    with pytest.raises(ValueError, match="outcome"):
+        model.model_validate(
+            {
+                "decision": "done",
+                "state_updates": '{"outcome": "refunded"}',
+                "confidence": 0.9,
+            }
+        )
+
+
+def test_a_string_that_is_not_json_still_fails_loudly() -> None:
+    from support_core.llm.schemas import build_node_output_model
+
+    model = build_node_output_model("classify", ["refund"], {"hint": "str | None"})
+    with pytest.raises(ValueError, match="state_updates"):
+        model.model_validate(
+            {"decision": "refund", "state_updates": "not json at all", "confidence": 0.9}
+        )
