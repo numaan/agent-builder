@@ -17,8 +17,13 @@ Both are exempt from confirmation for the same reason and both say so, because a
 for. Neither is exempt from *anything else*: they are recorded as ``tool_call`` rows, keyed by
 the step id, and refused from a model loop like every other WRITE tool.
 
-The codes are held in memory and derived from the conversation id, so a demo and a test see the
-same code without a mail server in between. A real pack sends mail and stores nothing.
+The codes are held in memory and derived from the *address*, so a demo and a test see the same
+code without a mail server in between - and, unlike a code derived from the conversation, the
+same one on every run, which is what lets a recorded conversation replay. **A real pack sends a
+random code and stores its hash**; a passcode that is a pure function of the address it is sent
+to is a fake, and is only defensible because this one never leaves the process. Which
+conversation a code was sent in is still tracked, so a code cannot be checked in a conversation
+that was never sent one.
 """
 
 import hashlib
@@ -45,13 +50,14 @@ class OtpStore:
     deliveries: list[tuple[uuid.UUID, str, str]] = field(default_factory=list)
     """``(conversation, address, code)`` for every send, so a test can watch the side effect."""
 
-    def code_for(self, conversation_id: uuid.UUID) -> str:
-        """The code this conversation's passcode will be. Deterministic on purpose."""
-        digest = hashlib.sha256(str(conversation_id).encode("utf-8")).hexdigest()
+    def code_for(self, address: str) -> str:
+        """The code this address's passcode will be. Deterministic on purpose; see the module
+        docstring for why that is a property of the fake and not of the design."""
+        digest = hashlib.sha256(address.strip().lower().encode("utf-8")).hexdigest()
         return f"{int(digest[:8], 16) % 1_000_000:06d}"
 
     def send(self, conversation_id: uuid.UUID, address: str) -> str:
-        code = self.code_for(conversation_id)
+        code = self.code_for(address)
         self.sent[conversation_id] = code
         self.deliveries.append((conversation_id, address, code))
         return code

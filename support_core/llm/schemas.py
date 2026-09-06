@@ -62,6 +62,27 @@ class SlotExtraction(BaseModel):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
+class ConfirmReading(BaseModel):
+    """How a customer's reply to a proposed action reads (DESIGN.md sections 6.2, 8.2).
+
+    Three answers, not two. DESIGN.md 6.2 requires "an explicit yes", so a model that is asked
+    for a boolean has to put "hmm, what would it cost me?" somewhere, and both places are wrong:
+    ``true`` moves the customer's money on a question, ``false`` throws away what they wanted.
+    ``unclear`` is the honest third answer and the ``confirm`` node asks again.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    answer: Literal["yes", "no", "unclear"] = Field(
+        description=(
+            "yes only if the reply is an unambiguous agreement to the exact action proposed; "
+            "no if it is a refusal; unclear for anything else, including a question, a "
+            "condition, a change of subject, or agreement to something different."
+        )
+    )
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
 class ConversationSummary(BaseModel):
     """The rolling summary of DESIGN.md section 10."""
 

@@ -10,12 +10,13 @@ what it exports.
 from support_core.tools import Tool
 
 from .billing import (
+    BILLING,
     CHECK_REFUND_ELIGIBILITY,
     GET_CHARGE,
     ISSUE_REFUND,
     LIST_RECENT_CHARGES,
 )
-from .identity import SEND_OTP, VERIFY_OTP
+from .identity import OTP, SEND_OTP, VERIFY_OTP
 
 TOOLS: list[Tool] = [
     LIST_RECENT_CHARGES,
@@ -25,3 +26,19 @@ TOOLS: list[Tool] = [
     SEND_OTP,
     VERIFY_OTP,
 ]
+
+
+def reset_backend() -> None:
+    """Put the in-memory fakes back to their seeded state.
+
+    Only a fake pack has one of these: a real pack's backend is a service, and "reset the
+    billing system" is not an operation. It exists so a demo or a test can start from the same
+    account every time.
+
+    **Call it through the module the tool registry imported**, not through ``packs.acme_billing``:
+    :func:`support_core.tools.loading.import_pack_tools` loads a pack under a name derived from
+    its path, so importing the same file both ways gives two module objects with two independent
+    ``BILLING`` singletons, and resetting one leaves the other holding yesterday's refunds.
+    """
+    BILLING.reset()
+    OTP.reset()

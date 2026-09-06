@@ -35,6 +35,7 @@ from support_core.llm.prompt import (
 from support_core.llm.prompt import ToolResult as PromptToolResult
 from support_core.llm.provider import LLMProvider
 from support_core.llm.schemas import (
+    ConfirmReading,
     ConversationSummary,
     LlmNodeOutput,
     SlotExtraction,
@@ -138,6 +139,22 @@ class SlotRequest:
 
 
 @dataclass(slots=True)
+class ConfirmationRequest:
+    """A ``confirm`` node's resume (DESIGN.md sections 6.2, 8.2)."""
+
+    node_id: str
+    prompt: str
+    """The proposal exactly as the customer saw it."""
+
+    reply: str
+    tool: str
+    args: Mapping[str, Any] = field(default_factory=dict)
+    summary: str | None = None
+    window: Sequence[TranscriptMessage] = ()
+    model: str | None = None
+
+
+@dataclass(slots=True)
 class SummaryRequest:
     """A rolling conversation summary (DESIGN.md section 10)."""
 
@@ -152,6 +169,16 @@ The workflow asked the customer for specific values and the customer has replied
 and fill in only the values it actually gives. Leave anything the reply does not answer unset and
 name it in "unfilled". Do not infer a value from the conversation, from the customer's tone, or
 from what would be convenient: an unfilled slot is a correct answer.
+"""
+
+CONFIRM_INSTRUCTIONS = """\
+The workflow proposed one specific action to the customer and asked them to agree to it. Read
+their reply and say which of three things it is. Answer "yes" only if it is an unambiguous
+agreement to *this* action as proposed - not to something like it, not to a smaller or larger
+version of it, and not conditionally. Answer "no" if it is a refusal. Answer "unclear" for
+anything else at all, including a question, a request to change the amount, silence about the
+proposal, or a change of subject. "unclear" is a good answer and costs nothing: the workflow
+asks again. Guessing "yes" spends the customer's money on a maybe.
 """
 
 SUMMARY_INSTRUCTIONS = """\
@@ -360,6 +387,54 @@ class LlmService:
             msg = "the model returned no slot extraction"
             raise StructuredOutputError(msg)
         return _validate(schema, response.structured, spec.name)
+
+    # -- the confirm node ----------------------------------------------------------------
+
+    async def read_confirmation(self, request: "ConfirmationRequest") -> ConfirmReading:
+        """Read a customer's reply to a proposed action (DESIGN.md sections 6.2, 8.2).
+
+        The model is told what was proposed and what the customer said, and asked which of three
+        readings it is. It is not asked to decide anything: the ``confirm`` node decides, and
+        the *only* reading that produces an ``ActionApproval`` is an unambiguous yes. A failure
+        here is not defaulted in either direction - it raises, the node errors, and a human
+        looks at it - because a model that could not read "yes or no" is not a model whose
+        silence should be read as either.
+        """
+        spec = StructuredSpec(
+            name="read_confirmation",
+            description="Say how the customer's reply to the proposal reads.",
+            json_schema=json_schema_for(ConfirmReading),
+        )
+        prompt = assemble(
+            PromptInputs(
+                persona=self.persona,
+                policies=self.policies,
+                node_instructions=(
+                    f"{CONFIRM_INSTRUCTIONS}\nThe action proposed was to run the tool "
+                    f"{request.tool!r}. This is exactly what the customer was shown, and their "
+                    f"reply follows it in the conversation."
+                ),
+                state={"proposal": request.prompt, "action": dict(request.args)},
+                summary=request.summary,
+                window=[*request.window, TranscriptMessage(author="customer", text=request.reply)],
+                task="Say how the reply reads, in the structured form you were given.",
+            ),
+            self.budget,
+        )
+        state = _tracker()
+        req = CompletionRequest(
+            model="",
+            system=prompt.system,
+            messages=prompt.messages,
+            structured=spec,
+            max_tokens=self.max_tokens,
+            purpose="confirm",
+        )
+        response = await self._complete(req, request.model, state)
+        if response.structured is None:
+            msg = "the model returned no reading of the customer's answer"
+            raise StructuredOutputError(msg)
+        return _validate(ConfirmReading, response.structured, spec.name)
 
     # -- memory --------------------------------------------------------------------------
 

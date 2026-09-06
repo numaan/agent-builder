@@ -7,14 +7,16 @@ settings, so nothing else has to know that ``confidence_threshold`` lives on ``l
 
 :class:`StructuredSlotExtractor` is what reviews/phase-2.md asked phase 3 to deliver: the
 ``ask`` node is unchanged and its ``extract_slots`` *hook* is replaced, so there are not two ways
-to fill a slot.
+to fill a slot. :class:`StructuredConfirmClassifier` is phase 4's twin of it, for the one
+question in the system whose wrong answer moves money.
 """
 
 from typing import Any
 
-from support_core.engine.hooks import SlotRequest
+from support_core.engine.hooks import ConfirmDecision, ConfirmRequest, SlotRequest
 from support_core.llm.prompt import PromptBudget, TranscriptMessage
 from support_core.llm.provider import LLMProvider
+from support_core.llm.service import ConfirmationRequest as ServiceConfirmationRequest
 from support_core.llm.service import LlmService, ModelChoice, Sleeper
 from support_core.llm.service import SlotRequest as ServiceSlotRequest
 
@@ -43,6 +45,47 @@ def service_for_pack(
         max_tokens=manifest.llm.max_output_tokens,
         sleep=sleep,
     )
+
+
+class StructuredConfirmClassifier:
+    """DESIGN.md section 6.2: a ``confirm`` node "requires an explicit yes".
+
+    Fills the ``confirm_decision`` hook. Deliberately narrow: it asks the model how the reply
+    *reads* and returns that, and it is the ``confirm`` node - not this, and not the model -
+    that decides an approval follows. Two things it does not do:
+
+    * it does not fall back to the keyword matcher when the model fails. A confirmation the
+      system had to guess at is not a confirmation; the failure propagates, the node errors and
+      a human picks the conversation up.
+    * it does not lower the bar for "yes" when it is confident. ``unclear`` is returned as
+      ``unclear``, and the node asks again.
+    """
+
+    def __init__(self, service: LlmService, *, threshold: float = 0.0) -> None:
+        self.service = service
+        self.threshold = threshold or service.confidence_threshold
+
+    async def __call__(self, request: ConfirmRequest) -> ConfirmDecision:
+        reading = await self.service.read_confirmation(
+            ServiceConfirmationRequest(
+                node_id=request.node_id,
+                prompt=request.prompt,
+                reply=request.reply,
+                tool=request.tool,
+                args=dict(request.args),
+                summary=request.ctx.summary,
+                window=[
+                    TranscriptMessage(author=author, text=text) for author, text in request.window
+                ],
+            )
+        )
+        answer = reading.answer
+        if answer == "yes" and reading.confidence < self.threshold:
+            # A "yes" the model is not sure it read correctly is exactly the case where asking
+            # again is cheap and being wrong is not (DESIGN.md section 11.3's threshold, applied
+            # where it matters most).
+            answer = "unclear"
+        return ConfirmDecision(answer=answer, confidence=reading.confidence)
 
 
 class StructuredSlotExtractor:

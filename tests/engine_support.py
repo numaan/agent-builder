@@ -147,6 +147,35 @@ async def path(engine: AsyncEngine, run_id: uuid.UUID) -> list[str]:
     return [row["node_id"] for row in await trace_rows(engine, run_id)]
 
 
+async def tool_calls(engine: AsyncEngine, conversation_id: uuid.UUID) -> list[dict[str, Any]]:
+    """Every ``tool_call`` of a conversation, joined through the run (phase-0 finding F6)."""
+    async with engine.connect() as connection:
+        result = await connection.execute(
+            text(
+                "SELECT tc.id, tc.idempotency_key, tc.tool, tc.args, tc.result, tc.risk, "
+                "       tc.status, tc.error, tc.attempts, tc.node_id, tc.step_id, tc.approval_id, "
+                "       tc.context_patch "
+                "FROM tool_call tc JOIN run r ON r.id = tc.run_id "
+                "WHERE r.conversation_id = :c ORDER BY tc.created_at, tc.id"
+            ),
+            {"c": conversation_id},
+        )
+        return [dict(row) for row in result.mappings()]
+
+
+async def approvals(engine: AsyncEngine, conversation_id: uuid.UUID) -> list[dict[str, Any]]:
+    async with engine.connect() as connection:
+        result = await connection.execute(
+            text(
+                "SELECT tool, args, args_hash, approved_by, node_id, frame_seq, step_id, "
+                "       consumed_at, consumed_by_tool_call_id "
+                "FROM action_approval WHERE conversation_id = :c ORDER BY approved_at, id"
+            ),
+            {"c": conversation_id},
+        )
+        return [dict(row) for row in result.mappings()]
+
+
 async def set_context(
     engine: AsyncEngine, conversation_id: uuid.UUID, context: dict[str, Any]
 ) -> None:
