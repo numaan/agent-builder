@@ -235,11 +235,233 @@ All from the repository root with `.venv/Scripts/python.exe`, Windows 11, Docker
 | `python -m ruff check .` | `All checks passed!` (exit 0) |
 | `python -m ruff format --check .` | `124 files already formatted` (exit 0) |
 | `python -m mypy` (strict) | `Success: no issues found in 124 source files` |
-| `python -m pytest -q` | `1137 passed, 2 deselected in 308.95s` |
-| `python -m pytest -q -m live` | `2 skipped, 1137 deselected` |
+| `python -m pytest -q` | `1138 passed, 2 deselected in 288.88s` |
+| `python -m pytest -q -m live` | `2 skipped, 1138 deselected` |
 | `python -m pytest -q tests/verify_phase_2_resolution.py` | `39 passed` |
 | `support pack validate packs/acme_billing` | `acme-billing: well-formed (9 warning(s))`, exit 0 |
 | `python -m alembic downgrade base` | down to base, no errors |
 | `python -m alembic upgrade head` | `Running upgrade 0005 -> 0006` |
 | `python -m alembic check` | `No new upgrade operations detected.` |
 | `python -m tests.cassettes.build_cassettes` | five cassettes, re-recorded byte-identically |
+
+## Self-critique
+
+Written after re-reading DESIGN.md sections 3, 6.2, 6.4, 7.2, 7.3, 8.1 to 8.4, 17 and 19, PLAN.md,
+and the four earlier reviews.
+
+### What did I skip or simplify?
+
+- **A pack's Python is trusted, completely.** This is the biggest thing to say about the phase and
+  it is not a defect I can fix inside it. Importing a pack executes its code in-process; a tool is
+  a function with the service's database credentials, its network and its memory. Every control
+  this phase adds - the tiers, the approval, the idempotency key - constrains *the graph and the
+  model*, and none of it constrains the pack author. A tool that declares itself READ and moves
+  money is callable from a model loop with no confirmation, and nothing in core can tell. That is
+  the design's trust boundary (DESIGN.md 8.3 has no other source of a risk tier than the exported
+  `Tool`), and phase-1 finding I is closed in the sense that a *file the author might forget to
+  update* no longer governs anything - but "the pack author is trusted" should be written on the
+  front of the box, and today it is written only in module docstrings.
+- **`requires_human_approval` cannot be satisfied.** The runtime looks for a second approval with
+  `approved_by = 'human'`, and nothing can create one until phase 6's desk. A pack that sets the
+  flag has a tool that always refuses. That is the safe direction and it is tested, but it means
+  the fourth column of DESIGN.md 8.2's table has never run green.
+- **The `ctx.customer` patch is one capability, not several.** Any WRITE or HIGH tool may set
+  `identity_verified`. `send_otp` could, if the pack author were careless. A tool declaring which
+  context fields it may write would be better and is maybe fifteen lines; I did not do it because
+  it adds a field to the public `Tool` shape that DESIGN.md does not have, and I would rather a
+  reviewer decided that than me.
+- **A refused call leaves no `tool_call` row.** The claim is rolled back so that a refusal does
+  not burn the idempotency key, which means the audit answer to "show me every attempted refund"
+  is in `trace_step.error` rather than in the table built for tool calls. For a compliance story
+  (DESIGN.md 20) that is the wrong table.
+- **The per-turn tool budget still does not count `tool` nodes.** `limits.max_tool_calls_per_turn`
+  counts model-loop calls only (that is what phase-3 finding V6 fixed). A graph that loops through
+  five `tool` nodes makes five calls against a limit of ten and none of them is counted;
+  `max_nodes_per_turn` is the only thing bounding it. I left it because widening the counter
+  changes what an existing manifest key means, which is a decision, not a fix.
+- **No `nodes/` directory loading.** DESIGN.md 5 has an optional `nodes/` directory and 6.2 says
+  custom node types are "registered by name in the pack". `register_node_type` exists (phase 2)
+  and the tests use it, but `load_pack` still does not import a pack's `nodes/`. Phase 9's
+  registry-scoping item (R6) should probably own both.
+- **The MCP adapter has never spoken to a real server.** It is written against the two methods
+  `mcp.ClientSession` offers and tested against a fake. The tier default, the wrapping, the
+  argument model and the result flattening are all real and tested; the transport, the handshake,
+  authentication and reconnection are not, and no pack wires one in, so no MCP tool has ever gone
+  through a graph.
+- **Async tools are thin.** `Tool.async_` dispatches, suspends, and completes from a callback.
+  There is no poller, no timeout on the dispatch beyond the pack's `waiting_async_tool` rule, and
+  the callback payload is trusted: whoever can call `resume_async_tool` decides what the tool
+  returned, and the approval was already spent at dispatch. Phase 7 owns the endpoint that will
+  receive one, and it will need to authenticate it.
+
+### Where does the code diverge from the design?
+
+- **The approval is bound to more than DESIGN.md 8.2 says**, and the hash is taken over coerced
+  arguments. Both are recorded as decisions in BACKLOG.md. The binding is strictly stronger, so
+  the risk is a pack that is *refused* where the design would allow it: a legitimate second call
+  of the same action needs a second confirmation. I think that is right - "one approval, one
+  action" is what a customer means by yes - but it is a choice.
+- **`ctx` is written by tools.** DESIGN.md 6.1 says the context is read-only to all nodes and 19
+  step 9 has a tool set `identity_verified`. Reconciled by having the tool ask and the engine
+  write, in the checkpoint transaction. Nothing else in the design describes this path.
+- **A confirmation has three answers.** DESIGN.md 6.2 gives the node two edges; `unclear` is not
+  an edge, it re-presents. A pack cannot route on it.
+- **`confirm_exempt` gained a required reason and became a warning** (finding J's decision).
+  `--strict` now fails on any pack with an exemption, including the sample pack, until a human
+  has read the reason. That is intended and it is a real cost: `make check` does not use
+  `--strict`, so what actually enforces it is a release gate that does not exist yet (phase 8).
+- **The validator imports pack code.** DESIGN.md 5.2 says "load_pack parses everything, resolves
+  references, and runs a validator before the service accepts traffic" and 8.3 says the registry
+  comes from the export; putting the two together means `support pack validate` runs the pack.
+  Defensible, and now documented in the README, but it changes what a validation command is.
+- **`graph.approval_reused` covers a shape the design never mentions** (two tool nodes, one
+  confirm). It is an addition in the same spirit as phase 1's other additions.
+- **The sample pack's `refund.yaml` is DESIGN.md 6.4's graph with additions**: `on_error` on
+  `check_eligibility` and `issue_refund`, `escalate_dispute`/`lookup_failed`/`refund_failed` as
+  `say` nodes instead of `handoff` nodes (which are not executable until phase 6), and a router
+  `default`. The confirm and the call are byte-identical to the design's.
+
+### What could an attacker or a buggy pack still achieve?
+
+Ordered by how much I would worry, and all of these are things I could not talk myself out of.
+
+1. **A pack author can do anything.** See above. The model cannot, the customer cannot, the graph
+   cannot; the pack can. If the threat model ever includes a pack, everything here has to be
+   re-argued behind a sandbox.
+2. **The approval covers the arguments, not the sentence.** The customer approves a rendered
+   prompt - "I can refund $29.00 for Pro Plan (Sep 3)" - and the hash covers `charge_id` and
+   `amount`. A pack whose prompt renders a *different* charge's description than the one in
+   `charge_id` would be approved for what it asked, not for what it showed. The sample pack reads
+   both from the same object, so it is coherent; nothing enforces that it must be. Hashing the
+   rendered prompt alongside the arguments would close it and would also make the prompt
+   un-editable between question and answer, which may be too strict.
+3. **The model chooses the charge, and the sample account has two identical ones.** `find_charge`
+   is an `llm` node that writes `charge_id`; the confirmation then shows an amount and a
+   description that are the same for `ch_1001` and `ch_1002`. The customer cannot tell which they
+   are approving. The compensating control - a human sees the money before it moves - is weaker
+   than it looks whenever two charges are indistinguishable in the prompt. That is a pack defect
+   more than a core one, and the pack is the one I wrote.
+4. **A gate redirect between a confirmation and the call is not analysed.**
+   `graph.approval_args_mutated` walks intra-graph edges; a `gate` names a *graph*, so a redirect
+   whose sub-graph runs a WRITE tool that patches `ctx` is invisible to it. The run-time hash
+   check still catches an argument that actually changed, so the consequence is a refusal on a
+   customer's turn rather than a load-time error - the exact shape finding H was about, one level
+   out. Phase 6 has to rebuild the cross-graph control-flow model anyway (deferred finding N3);
+   this belongs with it.
+5. **`confirm_exempt` remains an escape hatch with a sentence in front of it.** A pack that marks
+   `charge_card` exempt and writes a plausible reason gets a warning nobody has to read. The
+   reason is now *present*, which is what makes review possible, but review is still a human
+   habit rather than a gate.
+6. **An unclear confirmation can be asked for ever.** Each unclear reply re-presents the proposal.
+   It costs a customer message per iteration, so it is not a resource attack, but there is no
+   "let us not do this then" after N tries and no handoff.
+7. **A `tool` node's arguments can be anything the graph computes**, including values the model
+   wrote into state. The confirmation is the control, and it is a real one - the hash is over
+   exactly those values. But a WRITE tool that is `confirm_exempt` takes its arguments from the
+   same place with no confirmation at all: `send_otp` sends to `ctx.customer.email`, which is
+   fine, and a pack that made it `state.email` from a model-written field would be sending
+   passcodes wherever the model said. Nothing warns about that.
+8. **Two conversations, one customer.** Everything is scoped to a conversation. The same customer
+   in two conversations can be verified in one and unverified in the other, and can have two
+   approvals for two refunds of the same charge - the *tool* refuses the second (the fake billing
+   system checks `refunded_by`), which is the pack doing the work core does not.
+
+### Which tests are weak?
+
+- **The MCP tests are all fake-client tests.** They prove the adapter's decisions, not that it can
+  talk to anything. `test_an_mcp_tool_goes_through_the_same_registry_policy_and_key` is the most
+  valuable one because it proves an MCP tool is not a second execution path, but the transport is
+  untested by construction.
+- **The `live` group is still two skipped tests.** No API key, so the confirm classifier and the
+  refund conversation have never met a real model. The scripted rules key on substrings of node
+  instructions, which is a stand-in for a classifier and not a classifier;
+  `test_an_unclear_answer_is_asked_again_rather_than_read_as_a_yes` exercises the *keyword*
+  default over four phrasings, and the model-backed reading is exercised only through a cassette
+  that always says yes.
+- **The concurrency test is in-process.** Two `Executor` objects on one engine genuinely contend
+  for the advisory lock (asyncpg gives each operation its own connection), but phase 2 set a
+  higher bar with two OS processes, and the money-moving race is exactly where that bar should be
+  met. The database-level race (`test_two_racing_callers_cannot_both_spend_one_approval`) is the
+  stronger of the two and is not process-level either.
+- **`test_the_identity_gate_cannot_be_skipped...` asserts the last node is `send_code` or
+  `ask_code`.** That is a disjunction, which is a smell: it is written that way because the
+  cassette's next interaction depends on how far the redirect gets. A tighter assertion would pin
+  one.
+- **Nothing tests two pack versions side by side**, which is where `import_pack_tools`'
+  path-derived module name earns its keep. `test_two_packs_with_a_tools_package_each_do_not_
+  shadow_one_another` uses two *different* packs, not two versions of one, and the pin machinery
+  is not involved.
+- **The async tool tests use a tool that dispatches synchronously.** There is no test of a
+  callback arriving days later, or of two callbacks for one dispatch, or of a callback for a
+  conversation that has moved on.
+- **No property or differential test for the canonical form.** Phase 1 has one for `unparse`;
+  `canonical_json` has hand-written cases only. A hypothesis property over argument mappings
+  (same values in any order hash alike; different values do not) would be cheap and I did not
+  write it.
+
+### Which adversarial tests did I verify are load-bearing?
+
+Each enforcement was switched off in the source, the suite re-run, and the source restored. Every
+one is caught; the counts are how many tests failed in
+`test_adversarial_approvals.py`, `test_tool_runtime.py`, `test_tool_crash_recovery.py`,
+`test_refund_flow.py` and `test_tool_loop.py`.
+
+| enforcement removed | tests that fail | the ones that matter |
+|---|---|---|
+| the approval check entirely (`_authorise` returns `None`) | 15 | hash mismatch refused; no-confirm refused; one approval, one call; two concurrent turns |
+| the runtime's model-loop tier check | 1 | `test_a_write_tool_is_refused_from_a_model_loop_even_with_an_approval` - the *only* test of the second lock, because phase 3's gateway is the first and still holds |
+| at-most-once (a non-idempotent call is retried) | 2 | the in-process one and the cross-process one, which counts side effects in a file |
+| the confirm's shown-versus-about-to-approve comparison | 1 | the amount changed under the customer's answer |
+| single use (`consumed_at IS NULL`) | 2 | one approval cannot authorise a second call |
+| the run/frame/node binding | 17 | an approval from another frame, another confirm node, or another tool |
+| only a `confirm` node may record an approval | 1 | a pack-registered node type forging one |
+| only a `tool` node may change `ctx.customer` | 1 | a node type declaring the customer verified |
+| only a `tool` node may invoke | 1 | and the approval check *still* refused the call, which is the defence in depth working |
+
+Two of these tests exist because the mutation testing found nothing failing: "only a `confirm`
+node may record an approval" and "only a `tool` node may change `ctx.customer`" were both
+implemented and both untested until the mutation said so. That is the strongest argument for
+doing it at all, and I would not have found either by reading.
+
+What the table does not prove: that the *set* of attacks is complete. It proves each check I
+wrote is checked. The attacks I did not think of are not in it.
+
+### What would break under concurrency or a crash mid-step?
+
+- **A crash between the claim and the tool** leaves a `running` row and no side effect, and the
+  retry re-executes for an idempotent tool or refuses for a non-idempotent one. The refusal is
+  the conservative answer to a state that is genuinely ambiguous, and it costs a handoff on a
+  call that never happened. A tool that could be *asked* whether it happened (a payment provider
+  with a lookup) would do better, and DESIGN.md has no place for one to say so.
+- **A crash between the tool and its result row** is the case the phase is built around and is
+  tested across a real process boundary. What is not tested: a crash between the result row and
+  the *checkpoint*, where the tool call is durable and the step is not. The step re-executes,
+  replays the recorded result, and proceeds - correct by construction, and asserted only
+  indirectly by `test_the_same_step_replays_a_completed_call_without_running_it_again`.
+- **A crash inside the claim transaction** rolls back both the row and the approval consumption,
+  which is the point of putting them together. A crash *between* the claim commit and the
+  execution leaves the approval consumed and the call unmade; the retry finds the row and re-uses
+  its `approval_id` rather than consuming a second, so the customer's one yes still buys one
+  attempt.
+- **Two turns of one conversation** are serialised by the advisory lock, and the approval consume
+  is atomic underneath it, so the lock is not what makes it safe. Two *conversations* share
+  nothing except the pack's in-memory fake, which is a property of the sample pack and not of the
+  engine.
+- **The in-memory fakes are per-process.** `BILLING` and `OTP` live in one interpreter. Two service
+  replicas would have two of each, which no test would notice because the tests are one process.
+  A real pack has a service behind it; a demo with two workers would behave strangely, and the
+  README should probably say so.
+- **`ctx` is rebuilt per turn from the conversation row and mutated in memory during it.** A tool
+  that patches the customer mid-turn is visible to the rest of that turn and durable at the
+  checkpoint. If a node *after* the patch fails and the turn hands off, the patch is already
+  committed - which is right (the tool really did verify the identity) but means a handoff can
+  leave the context ahead of the workflow.
+- **`_maybe_summarize` still reads and writes in two transactions** under the conversation lock,
+  which phase 3's review noted; nothing in this phase makes it worse.
+
+### What I fixed while writing this
+
+Two things, both committed rather than recorded: an idempotency key re-entered with *different*
+arguments now refuses instead of executing the new ones under the old approval (`14c5e32`), and
+the two node-type defences the mutation testing showed were untested got the tests that
+mutation-kill them (`78da4a5`, `c73effa`). The rest of this section stands as written.
