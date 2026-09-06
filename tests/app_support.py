@@ -102,10 +102,22 @@ class Chat:
 
 
 @asynccontextmanager
-async def chatting(host: str, session: str | None = None) -> AsyncIterator[Chat]:
-    query = f"?session={session}" if session else ""
-    url = f"ws://{host}/channels/web_chat/ws{query}"
+async def chatting(
+    host: str, session: str | None = None, *, hello: bool = True
+) -> AsyncIterator[Chat]:
+    """One web chat connection, having said hello.
+
+    The session key travels in the opening frame rather than in the query string (review finding
+    W9): it is the whole of this channel's access control and a URL is written into every access
+    log on the way. ``hello=False`` is for the tests that drive the opening handshake themselves.
+    """
+    url = f"ws://{host}/channels/web_chat/ws"
     async with websockets.connect(url, open_timeout=START_TIMEOUT) as socket:
+        if hello:
+            opening: dict[str, Any] = {"type": "hello"}
+            if session is not None:
+                opening["session"] = session
+            await socket.send(json.dumps(opening))
         yield Chat(socket)
 
 

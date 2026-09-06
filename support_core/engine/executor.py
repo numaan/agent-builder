@@ -66,6 +66,7 @@ from support_core.engine.interrupts import (
 )
 from support_core.engine.locks import conversation_lock
 from support_core.engine.runners import (
+    DEFAULT_HANDOFF_MESSAGE,
     DESK_ACTION,
     HANDOFF_UNDELIVERED_MESSAGE,
     NO_TOOL_ACCESS,
@@ -1672,6 +1673,15 @@ class Executor:
         The packet is delivered *before* the checkpoint that parks the run, for the reason given
         in :meth:`_advance`: the other order has a window in which the run says a human is
         needed and no human has been told, and nothing sweeps for that.
+
+        **The customer is told too** (phase W review finding W6). The turn that raises the
+        handoff used to end in complete silence: the reviewer sent a message that failed a node,
+        and the run went to ``waiting_human`` with zero outbound messages - the socket carried a
+        status change and nothing else. The *next* message on that conversation is answered
+        (phase 6's finding P6), which made the silence look deliberate; it was not. A web chat
+        client can at least render a status pill, and an email customer gets nothing at all after
+        asking a question. The sentence is the same one a ``handoff`` node says, chosen by the
+        same rule: what a human was actually told decides which of the two is true.
         """
         frame = turn.frame
         attempt = frame.attempts.get(node_id, 0)
@@ -1680,6 +1690,7 @@ class Executor:
         turn.status = "waiting_human"
         now = self.hooks.clock()
         queued = await self._tell_a_human(turn, node_id, reason, detail, step)
+        turn.notices.append(DEFAULT_HANDOFF_MESSAGE if queued else HANDOFF_UNDELIVERED_MESSAGE)
         await self._checkpoint(
             turn,
             step=StepWrite(

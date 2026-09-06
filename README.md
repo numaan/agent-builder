@@ -187,20 +187,35 @@ see the other half of phase 6. This pack has no workflow for looking up a charge
 conversation to a person: the agent says so, the run parks, and a packet lands on the
 `billing-tier-1` queue. Read it, answer the customer, and give the workflow back:
 
+The desk is **off unless you turn it on, and it needs a credential when you do**. It lists every
+conversation in the deployment and writes into any of them, so start the app with a token - add
+`"serve_desk": true` to the configuration file and export `SUPPORT_DESK_TOKEN` - and send that
+token on every desk request:
+
 ```sh
-curl localhost:8000/desk/handoffs                                   # the queue
-curl localhost:8000/desk/handoffs/<id>                              # the whole packet
-curl -X POST localhost:8000/desk/handoffs/<id>/reply \
+export SUPPORT_DESK_TOKEN=$(python -c 'import secrets; print(secrets.token_hex(16))')
+desk() { curl -H "Authorization: Bearer $SUPPORT_DESK_TOKEN" "$@"; }
+
+desk localhost:8000/desk/handoffs                                   # the queue
+desk localhost:8000/desk/handoffs/<id>                              # the whole packet
+desk -X POST localhost:8000/desk/handoffs/<id>/reply \
      -H 'content-type: application/json' \
      -d '{"text": "That was the annual renewal."}'
-curl -X POST localhost:8000/desk/handoffs/<id>/resume -H 'content-type: application/json' -d '{}'
+desk -X POST localhost:8000/desk/handoffs/<id>/resume -H 'content-type: application/json' -d '{}'
 ```
+
+Turning `serve_desk` on without a token stops the application at startup rather than serving an
+open desk, and a request without the token is a 401 rather than an answer. Both are deliberate:
+phase W's review found this API mounted beside the customer chat, on by default and open, and
+reproduced an anonymous browser listing every conversation, reading another customer's transcript
+and packet, and writing into it (reviews/phase-w.md, finding W1). What the token is *not* is
+per-operator identity or rotation; the desk takes a `human_id` on every action for the audit, and
+real operator accounts belong with phase 7.
 
 The reply appears in the customer's open browser tab, attributed to a person rather than to the
 agent. The packet carries the reason, an LLM-written summary, whether identity was verified,
 where the conversation stopped, its state, every WRITE and HIGH tool call the conversation made,
-any pending action, suggested next steps and a transcript link. The desk has **no
-authentication** - see `support_core/api/desk.py`; that is phase 7's first job on this surface.
+any pending action, suggested next steps and a transcript link.
 
 Two things worth knowing:
 
@@ -215,10 +230,16 @@ Two things worth knowing:
   would have a second, different account.
 
 `GET /healthz` reports the pack, its fingerprint, the provider in use and whether the database is
-reachable. The channel endpoints are `WS /channels/web_chat/ws?session=<key>` and
+reachable. The channel endpoints are `WS /channels/web_chat/ws` and
 `POST /channels/web_chat/messages` with `{"session": "...", "text": "..."}`; the POST answers
 `202` with `"queued": true` when another turn holds that conversation's lock, rather than holding
 the connection until it frees.
+
+The socket's first frame names the conversation - `{"type": "hello", "session": "<key>"}`, or
+`{"type": "hello"}` to be given a new key - and the server answers `ready`. The key travels in a
+frame rather than in the query string because it is the whole of this channel's access control,
+and a URL is written verbatim into uvicorn's access log and into every proxy in front of it
+(finding W9). Connecting creates nothing: the first message creates the conversation (W8).
 
 ## Using GLM instead of Claude
 

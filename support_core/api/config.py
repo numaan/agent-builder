@@ -35,8 +35,6 @@ cassettes where there is not, and neither if the deployment configured no casset
 with no ``llm`` nodes needs no provider at all and should not be made to invent one.
 """
 
-RESOLVED: tuple[str, ...] = ("replay", "anthropic", "none")
-
 ENV_CONFIG = "SUPPORT_APP_CONFIG"
 ENV_PACK = "SUPPORT_PACK"
 ENV_PROVIDER = "SUPPORT_LLM_PROVIDER"
@@ -44,6 +42,14 @@ ENV_CASSETTES = "SUPPORT_CASSETTE_DIR"
 ENV_API_KEY = "ANTHROPIC_API_KEY"
 ENV_MODEL = "SUPPORT_MODEL"
 ENV_ESCALATION_MODEL = "SUPPORT_ESCALATION_MODEL"
+ENV_DESK_TOKEN = "SUPPORT_DESK_TOKEN"
+
+MIN_DESK_TOKEN = 16
+"""Shortest desk credential accepted.
+
+A number rather than a judgement, because "is this a real token" has to be decidable at startup.
+Sixteen characters is what ``secrets.token_hex(8)`` gives and is comfortably past the length at
+which a credential is a placeholder somebody meant to replace."""
 
 
 class ConfigError(ValueError):
@@ -111,14 +117,34 @@ class AppConfig(BaseModel):
     """Serve the built-in demo page at ``/``. Off for a deployment whose customers have their
     own front end."""
 
-    serve_desk: bool = True
+    serve_desk: bool = False
     """Serve the human desk API of DESIGN.md section 13 under ``/desk``.
 
-    On by default, because a deployment that queues handoff packets and has no way to read them
-    is a deployment that tells customers a person will reply and has no person. Off for one that
-    reads the queue with its own tooling - the ``handoff`` table is the contract, not this API.
+    **Off unless a deployment says otherwise, and unserveable without a credential** (phase W
+    review finding W1). It was on by default, on the same listener as the customer chat and with
+    no authentication, so any browser that could open the demo page could list every conversation
+    in the deployment, read another customer's transcript and handoff packet, and write into it -
+    including the human half of a ``requires_human_approval`` pair, which is a customer
+    countersigning their own action.
 
-    It has no authentication. See :mod:`support_core.api.desk`; phase 7 owns that."""
+    The argument for the old default was that a deployment which queues handoff packets and
+    cannot read them tells customers a person will reply and has no person. That argument is
+    sound and it is not an argument for serving them to everybody: the ``handoff`` table is the
+    contract, and turning the desk on is one line plus a token.
+
+    Turning it on without :attr:`desk_token` is a startup failure, not an open desk."""
+
+    desk_token: str | None = None
+    """The bearer token the desk API requires, at least :data:`MIN_DESK_TOKEN` characters.
+
+    A secret, so a real deployment supplies it in ``SUPPORT_DESK_TOKEN`` (DESIGN.md section 20);
+    the field exists so a test, or a developer's local file, can set one without exporting a
+    variable. It is never echoed: nothing in a response, a log line or ``/healthz`` contains it.
+
+    One shared token rather than per-operator accounts, deliberately. This is the smallest thing
+    that makes the failure mode a refusal, which is what finding W1 asks for; real operator
+    identity, rotation and an audit of who did what belong with phase 7's work on this surface,
+    and the desk already takes a ``human_id`` on every action for the audit half."""
 
     handoff_webhook_url: str | None = None
     """A second sink for handoff packets (DESIGN.md section 13's webhook sink).
@@ -155,6 +181,8 @@ class AppConfig(BaseModel):
             values["models"]["default"] = source[ENV_MODEL]
         if source.get(ENV_ESCALATION_MODEL):
             values["models"]["escalation"] = source[ENV_ESCALATION_MODEL]
+        if source.get(ENV_DESK_TOKEN):
+            values["desk_token"] = source[ENV_DESK_TOKEN]
         try:
             return cls.model_validate(values)
         except ValidationError as exc:
@@ -176,6 +204,29 @@ class AppConfig(BaseModel):
         except ValidationError as exc:
             msg = f"{path} is not a valid application configuration: {exc}"
             raise ConfigError(msg) from exc
+
+    def build_desk_credential(self) -> str:
+        """The desk's bearer token, or a refusal to start (phase W review finding W1).
+
+        Called by :func:`~support_core.api.app.create_app` *before* the router is mounted, so a
+        deployment that turns the desk on and forgets the token gets an application that will not
+        start rather than a desk anybody can read. That is the whole point of the finding: the
+        failure mode of a missing credential has to be refusal, not access.
+        """
+        token = (self.desk_token or "").strip()
+        if not token:
+            msg = (
+                "serve_desk is on but no desk_token is set: the desk lists every conversation "
+                f"in this deployment and writes into any of them. Set {ENV_DESK_TOKEN} in the "
+                "environment (DESIGN.md section 20), or turn serve_desk off"
+            )
+            raise ConfigError(msg)
+        if len(token) < MIN_DESK_TOKEN:
+            msg = (
+                f"desk_token must be at least {MIN_DESK_TOKEN} characters; this one is {len(token)}"
+            )
+            raise ConfigError(msg)
+        return token
 
     def resolve_provider(self, env: Mapping[str, str] | None = None) -> str:
         """Which provider this configuration actually means, resolving ``auto``.

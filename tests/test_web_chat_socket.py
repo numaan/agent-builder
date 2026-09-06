@@ -15,6 +15,9 @@ import json
 import uuid
 
 import httpx
+import pytest
+import websockets.exceptions
+from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from support_core.api import AppConfig
@@ -64,12 +67,33 @@ async def test_a_conversation_runs_over_a_websocket(engine: AsyncEngine) -> None
 
 
 async def test_a_client_that_brings_no_session_is_given_one(engine: AsyncEngine) -> None:
+    """And connecting alone creates nothing (review finding W8).
+
+    A socket used to write a durable ``conversation`` and ``run`` before the customer had said
+    anything, from an unauthenticated endpoint with no rate limit, so a loop of connects filled
+    two tables. A connect now resolves a key and reports an empty conversation; the first
+    message is what creates one.
+    """
     app = build_app(QUEUE_PACK, engine)
-    async with serving(app) as host, chatting(host) as chat:
-        ready = await chat.ready()
+    async with serving(app) as host:
+        async with chatting(host) as chat:
+            ready = await chat.ready()
+        async with engine.connect() as connection:
+            after_connecting = await connection.scalar(
+                sql_text("SELECT count(*) FROM conversation")
+            )
+
+        async with chatting(host, ready["session"]) as again:
+            await again.ready()
+            await again.say("hello")
+        async with engine.connect() as connection:
+            after_speaking = await connection.scalar(sql_text("SELECT count(*) FROM conversation"))
 
     assert ready["session"]
-    assert uuid.UUID(ready["conversation_id"])
+    assert ready["conversation_id"] is None
+    assert ready["history"] == []
+    assert after_connecting == 0, "connecting is not a conversation"
+    assert after_speaking == 1
 
 
 async def test_a_frame_that_is_not_a_message_is_an_error_not_a_disconnect(
@@ -88,15 +112,53 @@ async def test_a_frame_that_is_not_a_message_is_an_error_not_a_disconnect(
         assert chat.messages == ["Say something."]
 
 
+async def test_a_binary_frame_is_refused_rather_than_crashing_the_handler(
+    engine: AsyncEngine,
+) -> None:
+    """Phase W review finding W2, the reviewer's attempt A7, with their exact input.
+
+    A WebSocket carries text frames and binary frames, and this endpoint speaks JSON text. A
+    binary frame used to reach ``socket.receive_text()``, which raised ``KeyError: 'text'`` out
+    of the handler: an unhandled exception on the phase's public entry point, an ASGI traceback
+    in the log for every frame an anonymous client cared to send, and an abnormal close.
+
+    A hostile client is refused, and told why, and the refusal is orderly: an ``error`` frame
+    saying what was wrong, then close code 1003 - "unsupported data", which is what a WebSocket
+    says when it will not take the kind of frame it was sent. The server is still serving
+    afterwards, which the second connection proves.
+    """
+    app = build_app(QUEUE_PACK, engine)
+    async with serving(app) as host:
+        async with chatting(host, "socket-binary-frame") as chat:
+            await chat.ready()
+            await chat.socket.send(b"\x00\x01\x02\x03")
+            refusal = await chat.recv()
+            with pytest.raises(websockets.exceptions.ConnectionClosed) as closed:
+                await asyncio.wait_for(chat.socket.recv(), timeout=30.0)
+
+        # Whatever the last client did, the next one is served.
+        async with chatting(host, "socket-after-binary") as after:
+            await after.ready()
+            await after.say("hello")
+            assert after.messages == ["Say something."]
+
+    assert refusal["type"] == "error"
+    assert refusal["fatal"] is True
+    assert "binary" in refusal["detail"]
+    assert closed.value.rcvd is not None
+    assert closed.value.rcvd.code == 1003, closed.value.rcvd
+
+
 async def test_a_socket_speaks_only_for_its_own_conversation(engine: AsyncEngine) -> None:
     """A frame that names another session is not a way into that conversation: the session is
     the connection's, fixed when the socket opened."""
     app = build_app(QUEUE_PACK, engine)
     async with serving(app) as host:
         async with chatting(host, "socket-victim-01") as victim:
-            victim_ready = await victim.ready()
+            await victim.ready()
+            victim_turn = await victim.say("hello")
         async with chatting(host, "socket-attacker") as attacker:
-            attacker_ready = await attacker.ready()
+            await attacker.ready()
             await attacker.socket.send(
                 json.dumps({"type": "message", "text": "hi", "session": "socket-victim-01"})
             )
@@ -105,8 +167,7 @@ async def test_a_socket_speaks_only_for_its_own_conversation(engine: AsyncEngine
                 turn = await attacker.recv()
 
     assert turn["type"] == "turn"
-    assert turn["conversation_id"] == attacker_ready["conversation_id"]
-    assert turn["conversation_id"] != victim_ready["conversation_id"]
+    assert turn["conversation_id"] != victim_turn["conversation_id"]
 
 
 # -- the exit criterion --------------------------------------------------------------------
@@ -149,7 +210,7 @@ async def test_the_refund_conversation_runs_through_the_socket_with_the_confirma
         assert finished["status"] == "done"
         assert finished["awaiting"] is None
 
-        conversation_id = uuid.UUID(ready["conversation_id"])
+        conversation_id = uuid.UUID(finished["conversation_id"])
         runtime = app.state.runtime
         async with runtime.executor.sessions() as session, session.begin():
             run = await repo.load_run(session, conversation_id)
@@ -180,8 +241,8 @@ async def test_a_suspended_conversation_resumes_on_a_second_connection(
     app = build_app(ACME, engine, config=acme_config())
     async with serving(app) as host:
         async with chatting(host, "reconnect-demo-01") as first:
-            opened = await first.ready()
-            await first.say(REFUND_ASK)
+            await first.ready()
+            opened = await first.say(REFUND_ASK)
             assert "six-digit code" in first.messages[-1]
 
         async with chatting(host, "reconnect-demo-01") as second:
@@ -209,14 +270,20 @@ async def test_two_connections_on_one_conversation_both_see_what_it_says(
     ):
         first_ready = await one.ready()
         second_ready = await two.ready()
-        assert first_ready["conversation_id"] == second_ready["conversation_id"]
+        assert first_ready["session"] == second_ready["session"]
 
-        await one.say("hello")
+        sender = await one.say("hello")
         watched = await asyncio.wait_for(two.recv(), timeout=30.0)
+        # The `turn` frame - the only thing carrying `status` and `awaiting`, and therefore the
+        # only thing that raises the approval panel - reaches the second tab too (finding W3).
+        watcher = await asyncio.wait_for(two.recv(), timeout=30.0)
 
     assert one.messages == ["Say something."]
     assert watched["type"] == "message"
     assert watched["text"] == "Say something."
+    assert watcher["type"] == "turn"
+    assert watcher["status"] == sender["status"] == "waiting_customer"
+    assert watcher["awaiting"] == sender["awaiting"]
 
 
 async def test_a_message_posted_by_webhook_reaches_the_open_socket(engine: AsyncEngine) -> None:

@@ -144,6 +144,27 @@ main {
   border-bottom-right-radius: 4px;
 }
 
+/* A human at the desk, not the model. Phase 6 attributes a desk reply to `human` on purpose,
+   "so an audit can tell the model's words from a human's"; the page used to render every
+   non-agent author as the customer, which put a support agent's reply on the customer's side of
+   the transcript (review finding W11). Same side as the agent, visibly not the same speaker. */
+.turn.human {
+  background: var(--agent);
+  border: 1px solid var(--warn-line);
+  align-self: flex-start;
+  border-bottom-left-radius: 4px;
+}
+
+.turn.human::before {
+  content: "a person at the desk";
+  display: block;
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  opacity: 0.65;
+  margin-bottom: 3px;
+}
+
 .turn.pending {
   opacity: 0.65;
 }

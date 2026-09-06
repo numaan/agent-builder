@@ -226,13 +226,32 @@ async def enqueue_inbound(
     with ``status = pending`` and processed in order when the lock frees." Writing the row
     *first*, always, is what makes the message durable no matter which process ends up
     processing it, and what gives the queue its order.
+
+    The order is *claimed*, not measured (phase W review finding W4). The ``UPDATE ...
+    RETURNING`` below takes the conversation's row lock, so two callers arriving at the same
+    instant are serialised here and leave with distinct, increasing numbers; the queue is then
+    drained in the order the rows were made durable. It used to be ordered by ``created_at`` -
+    the transaction start timestamp, identical to the microsecond for a simultaneous pair - with
+    a random UUID breaking the tie, and the reviewer reversed two messages that way and parked
+    the conversation for good.
+
+    The cost is that concurrent messages *on one conversation* serialise for the length of this
+    transaction, which writes one row and commits. Messages on different conversations touch
+    different rows and do not meet.
     """
+    seq = await session.scalar(
+        update(Conversation)
+        .where(Conversation.id == conversation_id)
+        .values(inbound_seq=Conversation.inbound_seq + 1)
+        .returning(Conversation.inbound_seq)
+    )
     message = Message(
         conversation_id=conversation_id,
         direction="inbound",
         author=author,
         text=text_,
         status="pending",
+        queue_seq=seq,
     )
     session.add(message)
     await session.flush()
@@ -254,7 +273,7 @@ async def peek_next_pending(session: AsyncSession, conversation_id: uuid.UUID) -
             Message.direction == "inbound",
             Message.status == "pending",
         )
-        .order_by(Message.created_at, Message.id)
+        .order_by(Message.queue_seq, Message.created_at, Message.id)
         .limit(1)
     )
     return result.scalar_one_or_none()
@@ -279,7 +298,7 @@ async def pending_inbound(
             Message.direction == "inbound",
             Message.status == "pending",
         )
-        .order_by(Message.created_at, Message.id)
+        .order_by(Message.queue_seq, Message.created_at, Message.id)
         .limit(limit)
     )
     return list(result.scalars())
@@ -550,6 +569,18 @@ async def mark_sent(session: AsyncSession, message_ids: Sequence[uuid.UUID]) -> 
 
 
 async def pending_outbound(session: AsyncSession, conversation_id: uuid.UUID) -> list[Message]:
+    """Committed outbound messages nobody has delivered yet, claimed for this transaction.
+
+    ``FOR UPDATE SKIP LOCKED`` is what makes "claimed" true (phase W review finding W5).
+    :meth:`~support_core.engine.executor.Executor.deliver_pending` deliberately runs *outside*
+    the conversation lock - a desk reply is not a turn and must not wait for one - so two
+    transactions could read the same ``pending_send`` rows and hand both copies to the adapter
+    before either marked them ``sent``. On web chat that is a duplicated bubble; on phase 7's
+    email adapter it is a duplicated email, which is a customer complaint. Skipping locked rows
+    rather than waiting for them is right here: a row another transaction is already delivering
+    is a row this one has nothing to do about, and it will be ``sent`` by the time anyone looks
+    again.
+    """
     result = await session.execute(
         select(Message)
         .where(
@@ -558,6 +589,7 @@ async def pending_outbound(session: AsyncSession, conversation_id: uuid.UUID) ->
             Message.status == "pending_send",
         )
         .order_by(Message.created_at, Message.ordinal, Message.id)
+        .with_for_update(skip_locked=True)
     )
     return list(result.scalars())
 
@@ -571,10 +603,22 @@ async def transcript(
     and therefore excludes anything not committed into the conversation's history. This is what
     a channel shows a client that reconnected: it includes a customer message still ``pending``
     in the queue, because the customer typed it and would otherwise watch it disappear.
+
+    An outbound row that has not been ``sent`` is **not** included (phase W review finding W10).
+    Today that changes nothing, because delivery is the only thing that can leave a row
+    ``pending_send``. It stops being nothing the moment phase 7 puts DESIGN.md section 14's
+    outbound guardrail at send time: this path reads rows straight out of the table, so a
+    reconnecting client would be shown the text the guardrail had just refused to deliver, and
+    the phase's promise - a customer never sees a message a guardrail would have stopped - would
+    hold for the push path and not for the reconnect path. Closing it now means the seam is
+    already in the right place when the guardrail arrives.
     """
     result = await session.execute(
         select(Message)
-        .where(Message.conversation_id == conversation_id)
+        .where(
+            Message.conversation_id == conversation_id,
+            (Message.direction != "outbound") | (Message.status == "sent"),
+        )
         .order_by(Message.created_at.desc(), Message.ordinal.desc(), Message.id.desc())
         .limit(limit)
     )

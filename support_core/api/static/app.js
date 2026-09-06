@@ -4,9 +4,12 @@
    explicit about the two things the design is really demonstrating.
 
    1. The conversation is identified by a *session key*, never by this connection. The key is
-      kept in localStorage, sent on the socket's query string, and reused after a reload, a
-      dropped network or a server restart - which is how a conversation suspended waiting for
-      the customer (DESIGN.md 7.2) resumes on a different connection.
+      kept in localStorage, sent in the socket's opening `hello` frame, and reused after a
+      reload, a dropped network or a server restart - which is how a conversation suspended
+      waiting for the customer (DESIGN.md 7.2) resumes on a different connection. In a frame and
+      not in the URL: the key is the whole of this channel's access control, and a query string
+      is written verbatim into every access log between the browser and the app (review finding
+      W9).
    2. A confirmation is not an ordinary message. When the run is waiting on a `confirm` node the
       page says so loudly, names the action, and shows the exact proposal the approval is bound
       to. Nothing moves until the customer answers.
@@ -44,6 +47,7 @@ const state = {
   suggestions: [],
   backoff: 250,
   closing: false,
+  fatal: false,
 };
 
 function readSession() {
@@ -70,13 +74,24 @@ function rememberSession(session) {
 
 function socketUrl() {
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-  const base = `${scheme}://${window.location.host}/channels/web_chat/ws`;
-  return state.session ? `${base}?session=${encodeURIComponent(state.session)}` : base;
+  return `${scheme}://${window.location.host}/channels/web_chat/ws`;
+}
+
+/* Three authors, not two. `human` is a reply typed by a person at the desk, which phase 6 keeps
+   distinguishable from the model's words on purpose; rendering it as the customer's own message
+   put a support agent on the wrong side of the transcript (review finding W11). Only an `agent`
+   message becomes `lastAgentMessage`, so the approval panel keeps quoting the proposal the
+   approval is actually bound to even after a human has said something. */
+function authorClass(author) {
+  if (author === "agent") {
+    return "agent";
+  }
+  return author === "customer" ? "customer" : "human";
 }
 
 function say(author, text, pending) {
   const line = document.createElement("li");
-  line.className = `turn ${author === "agent" ? "agent" : "customer"}${pending ? " pending" : ""}`;
+  line.className = `turn ${authorClass(author)}${pending ? " pending" : ""}`;
   line.textContent = text;
   el.transcript.appendChild(line);
   line.scrollIntoView({ block: "nearest" });
@@ -163,16 +178,24 @@ function onEvent(event) {
       say(event.author, event.text, false);
       break;
     case "turn":
+      /* Broadcast to every connection on this conversation, not only to the one that sent the
+         message (review finding W3), so a second tab raises the approval panel too. */
       setStatus(event.status);
       renderApproval(event.awaiting);
-      note(
-        event.queued
-          ? "another turn is running on this conversation; yours is queued and will run in order"
-          : "",
-      );
+      note("");
+      break;
+    case "queued":
+      /* Per-caller, so it is its own frame rather than a field on `turn`. */
+      note("another turn is running on this conversation; yours is queued and will run in order");
       break;
     case "error":
       note(event.detail, true);
+      if (event.fatal) {
+        /* The server has said this connection is over and why. Reconnecting with the same bad
+           key reproduces it for ever, five seconds apart (review finding W15). */
+        state.fatal = true;
+        state.closing = true;
+      }
       break;
     default:
       break;
@@ -187,6 +210,11 @@ function connect() {
   socket.addEventListener("open", () => {
     el.dot.dataset.state = "open";
     state.backoff = 250;
+    /* The opening frame names the conversation. Omitting the key asks the server for a new one,
+       which is what a first visit sends. */
+    socket.send(
+      JSON.stringify(state.session ? { type: "hello", session: state.session } : { type: "hello" }),
+    );
   });
   socket.addEventListener("message", (frame) => {
     let event;
@@ -199,6 +227,10 @@ function connect() {
   });
   socket.addEventListener("close", () => {
     el.dot.dataset.state = "closed";
+    if (state.fatal) {
+      setStatus("disconnected");
+      return;
+    }
     if (state.closing) {
       return;
     }
@@ -222,6 +254,7 @@ el.restart.addEventListener("click", () => {
   }
   state.session = null;
   state.closing = true;
+  state.fatal = false;
   if (state.socket) {
     state.socket.close();
   }

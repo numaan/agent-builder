@@ -22,18 +22,29 @@ and it writes a *copy of the customer's own row*, binding and arguments and all,
 say "yes, that action" and cannot say "yes, this other action". The human is a second signature
 on one proposal, never a way to propose something.
 
-**There is no authentication here.** Phase W's review recorded that the web chat endpoints have
-none and deferred it to phase 7, which owns the channel surface; this adds a surface where the
-same gap exposes *other people's* conversations rather than your own, so it is worse, and it is
-the first thing phase 7 must fix. It is written at the top of this module rather than in a
-review because whoever mounts this router needs to read it.
+**Every endpoint here is behind a bearer token, and the router cannot be built without one.**
+The desk is not a customer channel: it lists every conversation in the deployment, reads any
+transcript, and writes into any of them - and ``approve`` is the human half of
+``requires_human_approval``, so an unauthenticated caller could countersign their own action,
+which is the one property a second signature exists to have. Phase W's review found this router
+mounted beside the customer chat, on the same port, on by default and open (finding W1), and
+reproduced all three: enumerating the queue, reading another customer's transcript, and writing
+into it. :func:`~support_core.api.config.AppConfig.build_desk_credential` is what makes a missing
+token a startup failure rather than an open desk; :func:`require_desk_token` is what makes a
+wrong one a 401.
+
+What that is *not*: it is not per-operator identity, it is not rotation, and it is not an audit
+of who did what - the desk takes a ``human_id`` on every action for the last of those. Phase 7
+owns this surface and can put real operator accounts on it. This is the part that cannot wait,
+because the alternative to it is customer data served to anyone who can reach the chat.
 """
 
+import secrets
 import uuid
 from collections.abc import Sequence
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -122,9 +133,43 @@ def _summary(row: Handoff) -> dict[str, Any]:
     }
 
 
-def desk_router(runtime: AppRuntime) -> APIRouter:
-    """The desk endpoints, mounted by :func:`~support_core.api.app.create_app`."""
-    router = APIRouter(prefix="/desk", tags=["desk"])
+def require_desk_token(token: str) -> Any:
+    """A dependency that refuses every desk request without this exact bearer token.
+
+    Three details that are the difference between a check and a decoration:
+
+    * it is attached to the **router**, not to each endpoint, so a route added later is behind it
+      by construction rather than by whoever writes it remembering (``test_desk_auth.py``
+      enumerates the router and asserts exactly that);
+    * the comparison is :func:`secrets.compare_digest`, so the time a refusal takes does not
+      describe the token;
+    * the credential is read from the ``Authorization`` header and from nowhere else. Not a query
+      parameter: phase W's review found the web chat session key in uvicorn's access log because
+      it travelled in a URL (finding W9), and a desk token in a URL would be the same defect with
+      a much larger blast radius.
+    """
+
+    async def check(authorization: str | None = Header(default=None)) -> None:
+        scheme, _, presented = (authorization or "").partition(" ")
+        if scheme.lower() != "bearer" or not secrets.compare_digest(presented.strip(), token):
+            raise HTTPException(
+                status_code=401,
+                detail="the desk needs a bearer token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    return Depends(check)
+
+
+def desk_router(runtime: AppRuntime, *, token: str) -> APIRouter:
+    """The desk endpoints, mounted by :func:`~support_core.api.app.create_app`.
+
+    ``token`` is required rather than optional, and there is no value of it that means "no
+    credential": :func:`~support_core.api.config.AppConfig.build_desk_credential` is the only
+    thing that produces one and it refuses an empty or short string. A caller that wanted an
+    open desk would have to write the check out of this module.
+    """
+    router = APIRouter(prefix="/desk", tags=["desk"], dependencies=[require_desk_token(token)])
 
     async def _load(handoff_id: uuid.UUID) -> Handoff | None:
         async with runtime.executor.sessions() as session, session.begin():
@@ -382,4 +427,4 @@ async def _body[BodyT: BaseModel](request: Request, model: type[BodyT]) -> BodyT
         return JSONResponse({"error": f"that is not a valid request: {exc}"}, status_code=400)
 
 
-__all__: Sequence[str] = ["DESK_AUTHOR", "desk_router"]
+__all__: Sequence[str] = ["DESK_AUTHOR", "desk_router", "require_desk_token"]

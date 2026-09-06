@@ -22,7 +22,6 @@ adapter:
 
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import suppress
 from typing import Any
 
 from sqlalchemy.exc import IntegrityError
@@ -92,24 +91,34 @@ class ChannelHub:
         arrive at once - two browser tabs opened together, a webhook delivered twice. The loser
         of the race reads the winner's row back instead of starting a second conversation.
         """
-        found = await self._by_key(inbound.channel, inbound.conversation_key)
+        found = await self.find(inbound.channel, inbound.conversation_key)
         if found is not None:
             return found, False
         # An IntegrityError here means somebody else created it between the lookup and the
         # insert. Their row is the conversation; ours never existed, because the conversation
         # and its run are inserted in one transaction.
-        with suppress(IntegrityError):
+        #
+        # Caught rather than suppressed, because the answer *this* call gives to "did you create
+        # it?" is the difference between a greeting sent once and a greeting sent twelve times.
+        # Every loser of a create race used to be told `created=True`, since the flag was read
+        # off its own first lookup missing rather than off the insert committing (review finding
+        # W7). Nothing branches on it in phase W; phase 7's email adapter is exactly the caller
+        # that would.
+        created = True
+        try:
             await self.executor.start_conversation(
                 channel=inbound.channel,
                 channel_key=inbound.conversation_key,
                 customer_ref=inbound.customer_ref,
                 context=dict(context) if context else None,
             )
-        again = await self._by_key(inbound.channel, inbound.conversation_key)
+        except IntegrityError:
+            created = False
+        again = await self.find(inbound.channel, inbound.conversation_key)
         if again is None:  # pragma: no cover - would mean the unique index did not hold
             msg = f"conversation {inbound.conversation_key!r} vanished between create and read"
             raise ChannelError(msg)
-        return again, True
+        return again, created
 
     async def snapshot(self, conversation_id: uuid.UUID) -> ConversationRef | None:
         """The conversation as it stands, or ``None`` if there is no such row."""
@@ -141,6 +150,10 @@ class ChannelHub:
                 await adapter.send(conversation, message)
             except Exception as exc:  # deliberately everything: see the module docstring
                 self.on_send_error(conversation, message, exc)
+
+    async def find(self, channel: str, key: str) -> ConversationRef | None:
+        """The conversation a channel key names, or ``None``. Creates nothing."""
+        return await self._by_key(channel, key)
 
     async def _by_key(self, channel: str, key: str) -> ConversationRef | None:
         async with self.executor.sessions() as session, session.begin():

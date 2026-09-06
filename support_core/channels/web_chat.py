@@ -79,9 +79,32 @@ class ConnectionRegistry:
 
     def __init__(self) -> None:
         self._by_conversation: dict[uuid.UUID, list[ChatConnection]] = {}
+        self._waiting: dict[str, list[ChatConnection]] = {}
 
     def add(self, conversation_id: uuid.UUID, connection: ChatConnection) -> None:
         self._by_conversation.setdefault(conversation_id, []).append(connection)
+
+    def wait(self, key: str, connection: ChatConnection) -> None:
+        """Watch a *channel key* whose conversation does not exist yet.
+
+        A socket now resolves its session key without creating a conversation (phase W review
+        finding W8), so between "connected" and "said something" there is nothing to register
+        against. Two tabs opened together on a fresh key, and a tab watching while the first
+        message arrives by ``POST``, both live in this gap; :meth:`attach` closes it the moment
+        somebody's message creates the row.
+        """
+        self._waiting.setdefault(key, []).append(connection)
+
+    def attach(self, key: str, conversation_id: uuid.UUID) -> int:
+        """Move every connection waiting on ``key`` onto its now-existing conversation.
+
+        Called by the runtime *before* the turn runs, so a socket that has been waiting is
+        watching before the engine can produce a message for it. Returns how many moved.
+        """
+        waiting = self._waiting.pop(key, [])
+        for connection in waiting:
+            self.add(conversation_id, connection)
+        return len(waiting)
 
     def discard(self, conversation_id: uuid.UUID, connection: ChatConnection) -> None:
         live = self._by_conversation.get(conversation_id)
@@ -90,6 +113,21 @@ class ConnectionRegistry:
         self._by_conversation[conversation_id] = [c for c in live if c is not connection]
         if not self._by_conversation[conversation_id]:
             del self._by_conversation[conversation_id]
+
+    def forget(self, connection: ChatConnection) -> None:
+        """Remove a connection from wherever it is watching or waiting.
+
+        What a closing socket calls, because it may have been moved by :meth:`attach` since it
+        registered and so cannot know which conversation it ended up on.
+        """
+        for key, waiting in list(self._waiting.items()):
+            remaining = [c for c in waiting if c is not connection]
+            if remaining:
+                self._waiting[key] = remaining
+            else:
+                del self._waiting[key]
+        for conversation_id in list(self._by_conversation):
+            self.discard(conversation_id, connection)
 
     def watching(self, conversation_id: uuid.UUID) -> tuple[ChatConnection, ...]:
         return tuple(self._by_conversation.get(conversation_id, ()))
@@ -210,7 +248,13 @@ class ChatState(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    conversation_id: uuid.UUID
+    conversation_id: uuid.UUID | None = None
+    """``None`` for a session key no conversation exists for yet.
+
+    A socket resolves its key without creating a row (phase W review finding W8), so "connected,
+    nothing said yet" is a real state a client is sent rather than a conversation the customer
+    never started."""
+
     session: str | None = None
     status: str = "idle"
     awaiting: AwaitingSummary | None = None

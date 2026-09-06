@@ -105,6 +105,15 @@ class Conversation(Base):
     """The ``turn_count`` the stored ``summary`` covers. The pair is written together, so a
     crash leaves them consistent and the next due turn simply summarises again."""
 
+    inbound_seq: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    """How many inbound messages this conversation has ever accepted.
+
+    The counter behind ``message.queue_seq``, incremented and returned in the same statement that
+    claims the next number, which is what makes the pending queue's order a *decided* order
+    rather than a measured one (phase W review finding W4). The ``UPDATE ... RETURNING`` takes
+    the conversation's row lock, so two callers arriving at the same instant are serialised here
+    and each leaves with a number nobody else has."""
+
     created_at: Mapped[datetime] = _created_at()
     closed_at: Mapped[datetime | None] = mapped_column()
 
@@ -117,7 +126,15 @@ class Message(Base):
     """
 
     __tablename__ = "message"
-    __table_args__ = (Index("ix_message_conversation_created", "conversation_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_message_conversation_created", "conversation_id", "created_at"),
+        Index(
+            "ix_message_pending_order",
+            "conversation_id",
+            "queue_seq",
+            postgresql_where=sql_text("direction = 'inbound'"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     conversation_id: Mapped[uuid.UUID] = mapped_column(
@@ -136,6 +153,19 @@ class Message(Base):
     it and cannot order them; ``ORDER BY created_at, ordinal, id`` can (phase 2 review finding
     R4). Successive checkpoints get increasing timestamps, so the ordinal only ever breaks a
     tie within one of them."""
+
+    queue_seq: Mapped[int | None] = mapped_column(Integer)
+    """This inbound message's place in its conversation's queue. ``NULL`` for outbound rows.
+
+    The pending queue used to be ordered by ``created_at`` - which is the *transaction start*
+    timestamp, identical to the microsecond for two callers that arrived together - with a random
+    UUID breaking the tie. Phase W's reviewer posted two messages at once in a known order and
+    got them back in the other one, which ran the second message against a conversation the first
+    had not started yet and parked it for good (finding W4). Phase 2's review found two
+    message-loss bugs of the same family and fixed both in durable state; this is that fix, not a
+    tighter timestamp: the number is claimed from :attr:`Conversation.inbound_seq` under the
+    conversation's row lock, so the order the queue is drained in is the order the rows were made
+    durable in, and it is decided by the database rather than by a clock."""
 
 
 class Run(Base):

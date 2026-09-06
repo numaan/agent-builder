@@ -228,9 +228,24 @@ class AppRuntime:
         conversation, created = await self.hub.conversation_for(
             inbound, context=self.config.new_conversation_context
         )
+        # Any connection that named this channel key before the conversation existed is moved
+        # onto it now, *before* the turn runs, so it is watching in time for the turn's own
+        # messages (review finding W8: a socket no longer creates a conversation by connecting).
+        # Two tabs opened together on a fresh key, and a tab watching while the first message
+        # arrives by POST, are both this case. A channel with no live connections - phase 7's
+        # email - promotes nothing and pays a dictionary lookup.
+        self.connections.attach(inbound.conversation_key, conversation.id)
         outcome = await self.executor.on_inbound(conversation.id, inbound.text)
         if outcome.queued:
             self.drainer.submit(conversation.id)
+        else:
+            # Every turn is announced to everyone watching the conversation, not to whoever
+            # happened to cause it (review finding W3). The ``turn`` frame is the only thing that
+            # carries `status` and `awaiting`, so it is the only thing that raises the approval
+            # panel: pushing it to one connection meant a second tab - and any customer whose
+            # reply arrived on another transport - saw the refund proposal with no panel and a
+            # stale status pill, which is the one moment this phase exists to show.
+            await self.announce(conversation.id)
         return Accepted(
             conversation_id=conversation.id,
             status=outcome.status or "unknown",
@@ -250,6 +265,18 @@ class AppRuntime:
             context=self.config.new_conversation_context,
         )
         return conversation
+
+    async def conversation_if_known(self, channel: Channel, key: str) -> ConversationRef | None:
+        """The conversation for a key, or ``None`` - creating nothing (review finding W8).
+
+        What a transport that connects before it speaks should ask. Opening a socket used to
+        create a durable ``conversation`` and ``run`` before the customer had typed anything,
+        from an unauthenticated endpoint with no rate limit, so a loop of connects filled two
+        tables; phase 7's email adapter has the same shape for bounce and delivery-receipt
+        webhooks. A conversation is created by somebody saying something.
+        """
+        self.hub.adapter(channel)
+        return await self.hub.find(channel, key)
 
     async def say(self, conversation_id: uuid.UUID, text: str, *, author: str = "agent") -> None:
         """Put a message into a conversation from outside a turn (DESIGN.md sections 12, 13).

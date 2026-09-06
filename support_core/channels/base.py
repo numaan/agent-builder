@@ -64,8 +64,17 @@ class InboundMessage(BaseModel):
     """One customer message, in the form the engine can use (DESIGN.md section 12).
 
     Produced by :meth:`ChannelAdapter.parse_inbound` from the transport's own payload. Every
-    field here is a fact about the *message*; nothing about the transport survives except in
-    :attr:`metadata`, which nothing in the engine reads.
+    field here is a fact about the *message*, and nothing about the transport survives.
+
+    There was a ``metadata`` dictionary here, "transport detail the adapter wants back at
+    delivery time". It is gone (phase W review finding W16). Nothing wrote it and nothing read
+    it, and - the part that decided it - it was not reachable from :meth:`ChannelAdapter.send`,
+    which is given a :class:`ConversationRef` built from the conversation *row*. So the one job
+    it named, letting an email adapter set ``In-Reply-To`` from the message it is answering,
+    was the one job it could not do. A field that looks like a seam and is not is worse than no
+    field, because the next phase builds against it and finds out late. Carrying inbound
+    transport headers to an outbound reply is a real gap and it is written down as one, against
+    phase 7, which writes the adapter that needs it.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -88,9 +97,6 @@ class InboundMessage(BaseModel):
     Not used by phase W. Delivery towards a channel is at-least-once and the engine offers no
     de-duplication either way (phase 2 self-critique, fragility item 1), so this is the field an
     adapter that can de-duplicate inbound - email can, a socket frame cannot - will need."""
-
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    """Transport detail the adapter wants back at delivery time. Opaque to the engine."""
 
 
 class ConversationRef(BaseModel):

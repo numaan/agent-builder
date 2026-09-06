@@ -89,7 +89,6 @@ def test_an_inbound_message_says_nothing_about_a_connection() -> None:
         "text",
         "customer_ref",
         "external_id",
-        "metadata",
     }
 
 

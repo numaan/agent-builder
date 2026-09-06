@@ -24,17 +24,26 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from support_core.api import AppConfig
 from tests.app_support import ACME, CASSETTES, build_app, chatting, reset_acme_backend, serving
+from tests.test_desk_auth import DESK_AUTH, DESK_TOKEN
 
 ACCOUNT_QUESTION = "Why was I charged 40 dollars on the 3rd?"
 """The message the cassette records an ``account_question`` answer for."""
 
 
 def _config() -> AppConfig:
+    """A deployment that has turned the desk on, which since review finding W1 means a token.
+
+    Off is the default now, and on without a credential will not start; the credential itself is
+    tested in ``test_desk_auth.py``, so every client here carries it and these tests are about
+    what the desk *does*.
+    """
     return AppConfig(
         pack=ACME,
         provider="replay",
         cassette_dir=CASSETTES,
         serve_client=False,
+        serve_desk=True,
+        desk_token=DESK_TOKEN,
         new_conversation_context={
             "customer": {"ref": "cus_acme_1", "name": "Sam", "email": "me@example.com"}
         },
@@ -43,7 +52,7 @@ def _config() -> AppConfig:
 
 async def _handed_off(host: str, session: str) -> dict[str, Any]:
     """Drive the sample pack to its ``handoff`` node and return the queued row."""
-    async with httpx.AsyncClient(base_url=f"http://{host}") as client:
+    async with httpx.AsyncClient(base_url=f"http://{host}", headers=DESK_AUTH) as client:
         posted = await client.post(
             "/channels/web_chat/messages", json={"session": session, "text": ACCOUNT_QUESTION}
         )
@@ -80,7 +89,7 @@ async def test_reading_one_handoff_gives_the_whole_packet(engine: AsyncEngine) -
     app = build_app(ACME, engine, config=_config())
     async with serving(app) as host:
         row = await _handed_off(host, "desk-read-0001")
-        async with httpx.AsyncClient(base_url=f"http://{host}") as client:
+        async with httpx.AsyncClient(base_url=f"http://{host}", headers=DESK_AUTH) as client:
             response = await client.get(f"/desk/handoffs/{row['id']}")
             assert response.status_code == 200
             packet = response.json()["packet"]
@@ -115,7 +124,7 @@ async def test_a_reply_reaches_the_customers_open_socket(engine: AsyncEngine) ->
         await chat.say(ACCOUNT_QUESTION)
         row = await _open_handoff(host)
 
-        async with httpx.AsyncClient(base_url=f"http://{host}") as client:
+        async with httpx.AsyncClient(base_url=f"http://{host}", headers=DESK_AUTH) as client:
             replied = await client.post(
                 f"/desk/handoffs/{row['id']}/reply",
                 json={
@@ -141,7 +150,7 @@ async def test_resume_continues_from_the_handoff_nodes_resumed_edge(
     app = build_app(ACME, engine, config=_config())
     async with serving(app) as host:
         row = await _handed_off(host, "desk-resume-0001")
-        async with httpx.AsyncClient(base_url=f"http://{host}") as client:
+        async with httpx.AsyncClient(base_url=f"http://{host}", headers=DESK_AUTH) as client:
             response = await client.post(
                 f"/desk/handoffs/{row['id']}/resume",
                 json={
@@ -183,7 +192,7 @@ async def test_a_resume_patch_naming_an_undeclared_field_is_refused(
     app = build_app(ACME, engine, config=_config())
     async with serving(app) as host:
         row = await _handed_off(host, "desk-patch-0001")
-        async with httpx.AsyncClient(base_url=f"http://{host}") as client:
+        async with httpx.AsyncClient(base_url=f"http://{host}", headers=DESK_AUTH) as client:
             refused = await client.post(
                 f"/desk/handoffs/{row['id']}/resume",
                 json={"patch": {"identity_verified": True, "not_a_field": "x"}, "human_id": "u1"},
@@ -219,7 +228,7 @@ async def test_a_resume_patch_may_not_set_identity_verified(engine: AsyncEngine)
     app = build_app(ACME, engine, config=_config())
     async with serving(app) as host:
         row = await _handed_off(host, "desk-patch-0002")
-        async with httpx.AsyncClient(base_url=f"http://{host}") as client:
+        async with httpx.AsyncClient(base_url=f"http://{host}", headers=DESK_AUTH) as client:
             refused = await client.post(
                 f"/desk/handoffs/{row['id']}/resume", json={"patch": {"identity_verified": True}}
             )
@@ -245,7 +254,7 @@ async def test_a_resume_patch_cannot_reach_a_live_approval(engine: AsyncEngine) 
         conversation_id = uuid.UUID(row["conversation_id"])
         run = await _run_row(engine, conversation_id)
         await _propose(engine, conversation_id, run["id"], frame_seq=run["frames"][-1]["frame_seq"])
-        async with httpx.AsyncClient(base_url=f"http://{host}") as client:
+        async with httpx.AsyncClient(base_url=f"http://{host}", headers=DESK_AUTH) as client:
             refused = await client.post(
                 f"/desk/handoffs/{row['id']}/resume", json={"patch": {"intent": "whatever"}}
             )
@@ -267,7 +276,7 @@ async def test_close_takes_the_handoff_nodes_closed_edge(engine: AsyncEngine) ->
     app = build_app(ACME, engine, config=_config())
     async with serving(app) as host:
         row = await _handed_off(host, "desk-close-0001")
-        async with httpx.AsyncClient(base_url=f"http://{host}") as client:
+        async with httpx.AsyncClient(base_url=f"http://{host}", headers=DESK_AUTH) as client:
             response = await client.post(
                 f"/desk/handoffs/{row['id']}/close",
                 json={"text": "I will take this from here.", "human_id": "u2"},
@@ -307,7 +316,7 @@ async def test_approve_signs_the_action_the_customer_already_approved(
         await _propose(engine, conversation_id, run["id"], frame_seq=0)
         row = await _handed_off(host, "desk-approve-0001")
         assert row["conversation_id"] == str(conversation_id)
-        async with httpx.AsyncClient(base_url=f"http://{host}") as client:
+        async with httpx.AsyncClient(base_url=f"http://{host}", headers=DESK_AUTH) as client:
             packet = (await client.get(f"/desk/handoffs/{row['id']}")).json()["packet"]
             assert packet["pending_action"]["tool"] == "issue_refund", "the human read this"
 
@@ -339,7 +348,7 @@ async def test_approve_signs_only_the_action_the_handoff_showed(engine: AsyncEng
         row = await _handed_off(host, "desk-approve-0002")
         conversation_id = uuid.UUID(row["conversation_id"])
         run = await _run_row(engine, conversation_id)
-        async with httpx.AsyncClient(base_url=f"http://{host}") as client:
+        async with httpx.AsyncClient(base_url=f"http://{host}", headers=DESK_AUTH) as client:
             # 1. The packet showed no pending action, so there is nothing here to sign.
             nothing = await client.post(f"/desk/handoffs/{row['id']}/approve", json={})
             assert nothing.status_code == 409
@@ -376,7 +385,7 @@ async def test_a_customer_message_on_a_parked_run_is_answered_and_shown_to_the_d
     async with serving(app) as host:
         row = await _handed_off(host, "desk-queued-0001")
         conversation_id = uuid.UUID(row["conversation_id"])
-        async with httpx.AsyncClient(base_url=f"http://{host}") as client:
+        async with httpx.AsyncClient(base_url=f"http://{host}", headers=DESK_AUTH) as client:
             for text in ("are you still there?", "hello?"):
                 sent = await client.post(
                     "/channels/web_chat/messages",
@@ -406,7 +415,10 @@ async def test_a_customer_message_on_a_parked_run_is_answered_and_shown_to_the_d
 async def test_the_desk_refuses_what_it_cannot_find_or_parse(engine: AsyncEngine) -> None:
     app = build_app(ACME, engine, config=_config())
     missing = uuid.uuid4()
-    async with serving(app) as host, httpx.AsyncClient(base_url=f"http://{host}") as client:
+    async with (
+        serving(app) as host,
+        httpx.AsyncClient(base_url=f"http://{host}", headers=DESK_AUTH) as client,
+    ):
         assert (await client.get(f"/desk/handoffs/{missing}")).status_code == 404
         assert (await client.post(f"/desk/handoffs/{missing}/reply", json={})).status_code == 400
         assert (await client.get(f"/desk/conversations/{missing}/transcript")).status_code == 404
@@ -426,7 +438,10 @@ async def test_the_desk_refuses_what_it_cannot_find_or_parse(engine: AsyncEngine
 async def test_the_desk_can_be_turned_off(engine: AsyncEngine) -> None:
     """A deployment that reads the ``handoff`` table with its own tooling serves no desk."""
     app = build_app(ACME, engine, config=_config().model_copy(update={"serve_desk": False}))
-    async with serving(app) as host, httpx.AsyncClient(base_url=f"http://{host}") as client:
+    async with (
+        serving(app) as host,
+        httpx.AsyncClient(base_url=f"http://{host}", headers=DESK_AUTH) as client,
+    ):
         assert (await client.get("/desk/handoffs")).status_code == 404
 
 
@@ -434,7 +449,7 @@ async def test_the_desk_can_be_turned_off(engine: AsyncEngine) -> None:
 
 
 async def _open_handoff(host: str) -> dict[str, Any]:
-    async with httpx.AsyncClient(base_url=f"http://{host}") as client:
+    async with httpx.AsyncClient(base_url=f"http://{host}", headers=DESK_AUTH) as client:
         listed = await client.get("/desk/handoffs")
         rows = listed.json()["handoffs"]
         assert rows, listed.text
