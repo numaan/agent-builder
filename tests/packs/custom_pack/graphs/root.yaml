@@ -18,6 +18,7 @@ nodes:
       ctx.customer.attributes.mode == 'error_routed': explode_routed
       ctx.customer.attributes.mode == 'gate': gated_call
       ctx.customer.attributes.mode == 'gate_loop': gated_loop_call
+      ctx.customer.attributes.mode == 'retry': retry_boom
     default: tool_wait
 
   tool_wait:
@@ -59,6 +60,21 @@ nodes:
     graph: gated_loop
     outputs: { reached: reached }
     next: report
+
+  retry_boom:
+    type: boom
+    description: >
+      A node whose on_error edge leads back to it through a suspending node - the shape phase 4's
+      resolution left open, where each failure is a fresh attempt and, for a side-effecting tool,
+      a repeated side effect. `limits.max_node_errors` is what stops it.
+    on_error: retry_ask
+    next: report
+
+  retry_ask:
+    type: ask
+    slots: [detail]
+    prompt: That did not work. Shall I try again?
+    next: retry_boom
 
   recovered:
     type: say

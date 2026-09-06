@@ -1441,8 +1441,11 @@ def test_reference_pack_reports_the_expected_warnings_and_notices() -> None:
         "graph.confirm_exempt",
         "tools.declared_not_exported",
     }
+    # ``graph.node_not_executable`` no longer fires for this fixture: phase 6 made ``handoff``
+    # executable, which was the last core type that was not, so every node this pack uses can
+    # now run. The rule itself stays for a pack-declared type with no runner.
     infos = {f.rule for f in report.findings if f.severity is Severity.INFO}
-    assert "graph.node_not_executable" in infos
+    assert "graph.node_not_executable" not in infos
 
 
 def test_findings_name_the_file_and_the_node() -> None:

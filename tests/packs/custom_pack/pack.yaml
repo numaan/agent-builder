@@ -13,6 +13,9 @@ handoff:
   queue: engine-tests
 limits:
   max_nodes_per_turn: 10
+  # Two, so a node that keeps failing reaches the bound in two turns rather than three
+  # (DESIGN.md section 7.3's retries, bounded by phase 6).
+  max_node_errors: 2
 timeouts:
   waiting_async_tool: { seconds: 900, action: handoff }
   waiting_timer: { seconds: 60, action: none }

@@ -1163,7 +1163,12 @@ class Executor:
             # under (run, step).
             detail = dict(detail or {})
             detail["queued"] = await self._tell_a_human(
-                turn, node_id, node.reason, detail.get("detail"), sid
+                turn,
+                node_id,
+                node.reason,
+                detail.get("detail"),
+                sid,
+                next_steps=list(node.next_steps),
             )
             turn.outcome.handoff_reason = node.reason
         await self._checkpoint(
@@ -1489,7 +1494,14 @@ class Executor:
         turn.outcome.handoff_reason = reason
 
     async def _tell_a_human(
-        self, turn: _Turn, node_id: str, reason: str, detail: str | None, sid: str
+        self,
+        turn: _Turn,
+        node_id: str,
+        reason: str,
+        detail: str | None,
+        sid: str,
+        *,
+        next_steps: Sequence[str] = (),
     ) -> bool:
         """Hand the failure to the handoff hook. Returns whether it took it.
 
@@ -1509,6 +1521,7 @@ class Executor:
                     frames=list(turn.frames),
                     node_id=node_id,
                     step_id=sid,
+                    next_steps=list(next_steps),
                 )
             )
         except Exception:

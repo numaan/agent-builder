@@ -1,0 +1,22 @@
+id: alpha
+description: A workflow the pack lets a customer interrupt.
+outputs:
+  outcome: str
+state:
+  answer: str | None
+start: ask_a
+nodes:
+  ask_a:
+    type: ask
+    slots: [answer]
+    prompt: Alpha is asking you a question. What is your answer?
+    next: tell_a
+
+  tell_a:
+    type: say
+    message: "Alpha has your answer: {{ state.answer }}."
+    next: done_a
+
+  done_a:
+    type: end
+    outputs: { outcome: "alpha_done" }

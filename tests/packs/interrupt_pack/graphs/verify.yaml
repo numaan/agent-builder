@@ -1,0 +1,20 @@
+id: verify
+description: >
+  The gate's redirect. It suspends rather than ending, so a test can see that the gate stopped
+  the conversation at the redirect instead of watching a redirect that never satisfies its gate
+  spin until the per-turn node limit.
+outputs:
+  verified: bool
+state:
+  code: str | None
+start: ask_code
+nodes:
+  ask_code:
+    type: ask
+    slots: [code]
+    prompt: Before that, what is your verification code?
+    next: done_v
+
+  done_v:
+    type: end
+    outputs: { verified: false }

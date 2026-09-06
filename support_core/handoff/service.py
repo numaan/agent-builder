@@ -98,6 +98,7 @@ class HandoffService:
                 frames=request.frames,
                 node_id=request.node_id,
                 step_id=request.step_id,
+                suggested_next_steps=list(request.next_steps),
             )
         )
 

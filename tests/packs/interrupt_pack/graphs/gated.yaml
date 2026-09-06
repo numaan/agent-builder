@@ -1,0 +1,26 @@
+id: gated
+description: >
+  The workflow that proves DESIGN.md section 6.6's last sentence. Its gate fires on every entry
+  to the frame, and an interrupt pushes a *fresh* frame, so reaching this workflow by changing
+  the subject reaches its gate exactly as reaching it from the root graph does.
+outputs:
+  outcome: str
+state:
+  outcome: str | None
+start: identity_gate
+nodes:
+  identity_gate:
+    type: gate
+    predicate: ctx.customer.identity_verified
+    redirect: verify
+    next: protected
+
+  protected:
+    type: say
+    description: The node an unverified customer must never reach, by any route.
+    message: This is the protected step, and you should only see it once verified.
+    next: done_g
+
+  done_g:
+    type: end
+    outputs: { outcome: "gated_done" }

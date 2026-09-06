@@ -1,0 +1,29 @@
+# A pack for the phase-6 interrupt tests (DESIGN.md section 6.6).
+#
+# Three workflows, chosen so that every branch of the interrupt check has somewhere to go:
+# `alpha` may be interrupted, `beta` may not, and `gated` is behind a gate its redirect never
+# satisfies - which is what makes "an interrupt cannot be used to reach an unverified action"
+# testable rather than asserted.
+id: interrupt-pack
+version: 1.0.0
+core: ">=0.0.1,<1"
+entry_graph: root
+language: en
+channels: [web_chat]
+llm:
+  default_model: test-model
+  escalation_model: test-escalation-model
+  confidence_threshold: 0.4
+  retries: 0
+interrupts:
+  allowed_from: [alpha]
+  blocked_in: [beta]
+handoff:
+  queue: interrupt-tests
+  sla_minutes: 15
+limits:
+  max_nodes_per_turn: 14
+  max_tool_calls_per_turn: 2
+  max_node_errors: 2
+memory:
+  window_messages: 8

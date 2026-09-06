@@ -1,0 +1,19 @@
+id: beta
+description: >
+  A workflow in `interrupts.blocked_in`. A topic change here is recorded and offered back by the
+  root graph later (DESIGN.md section 6.6 step 5), never acted on now.
+outputs:
+  outcome: str
+state:
+  answer: str | None
+start: ask_b
+nodes:
+  ask_b:
+    type: ask
+    slots: [answer]
+    prompt: Beta is asking you a question. What is your answer?
+    next: done_b
+
+  done_b:
+    type: end
+    outputs: { outcome: "beta_done" }

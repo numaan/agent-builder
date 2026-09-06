@@ -39,12 +39,11 @@ def test_sample_pack_validates_with_its_graphs_via_cli() -> None:
     assert result.exit_code == EXIT_OK, result.output
     assert "acme-billing: well-formed" in result.output
     assert "empty" not in result.output
-    # Two of the four workflows `interrupts` names still do not exist: phase 4 added `refund`
-    # and `verify_identity`, and `update_address` and `payment_capture` are phase 6's.
-    # One, not two: pack.yaml's interrupts.blocked_in names `verify_identity`,
-    # `update_address` and `payment_capture`, and `update_address` now exists. Only
-    # `payment_capture` is still a forward reference.
-    assert result.output.count("manifest.interrupt_graph_unknown") == 1
+    # None: phase 6 dropped `payment_capture` from interrupts.blocked_in, which was the last
+    # forward reference to a graph this pack does not define. Every graph the manifest names now
+    # exists, which is what phase 3's review asked phase 6 to finish rather than leave as
+    # background noise.
+    assert result.output.count("manifest.interrupt_graph_unknown") == 0
     # Every confirm_exempt tool is reported, with the reason the pack had to give for it
     # (DESIGN.md section 8.2, phase-1 deferred finding J).
     assert result.output.count("graph.confirm_exempt") == 2
@@ -52,11 +51,13 @@ def test_sample_pack_validates_with_its_graphs_via_cli() -> None:
     # --strict fails on a warning but must not hide any finding (phase 0 review N3).
     strict = CliRunner().invoke(cli, ["pack", "validate", "--strict", str(SAMPLE_PACK)])
     assert strict.exit_code == EXIT_INVALID, strict.output
-    assert strict.output.count("manifest.interrupt_graph_unknown") == 1
+    # A warning still fails --strict, and every finding is still printed (phase 0 review N3):
+    # the confirm exemptions are what a release gate has to make somebody read.
+    assert strict.output.count("graph.confirm_exempt") == 2
 
     quiet = CliRunner().invoke(cli, ["pack", "validate", "--quiet", str(SAMPLE_PACK)])
     assert quiet.exit_code == EXIT_OK
-    assert quiet.output.strip() == "acme-billing: well-formed (19 warning(s))"
+    assert quiet.output.strip() == "acme-billing: well-formed (18 warning(s))"
 
 
 def test_sample_pack_report() -> None:
@@ -70,7 +71,6 @@ def test_sample_pack_report() -> None:
     assert report.manifest.handoff.queue == "billing-tier-1"
     assert report.manifest.limits.max_nodes_per_turn == 25
     assert {f.rule for f in report.findings} == {
-        "manifest.interrupt_graph_unknown",
         # Phase 4: the refund graph declares `charge: Charge | None`, which is the pack's own
         # tool model and not a type core can resolve, and passes `str | None` into `str` inputs.
         "graph.state_type_unresolved",
@@ -85,7 +85,7 @@ def test_sample_manifest_matches_design_section_5_1() -> None:
     assert manifest.llm.default_model == "claude-sonnet-5"
     assert manifest.llm.escalation_model == "claude-opus-5"
     assert manifest.interrupts.allowed_from == ["root", "refund", "update_address"]
-    assert manifest.interrupts.blocked_in == ["verify_identity", "payment_capture"]
+    assert manifest.interrupts.blocked_in == ["verify_identity"]
     assert manifest.handoff.sla_minutes == 30
     assert manifest.limits.max_llm_cost_per_conversation_usd == 2.0
     assert manifest.core_compatible()
@@ -198,7 +198,7 @@ def test_manifest_rejects_empty_core_specifier(pack_copy: Path, value: str) -> N
     ("old", "new", "field"),
     [
         ("allowed_from: [root, refund", "allowed_from: [root, root", "allowed_from"),
-        ("blocked_in: [verify_identity, payment_capture]", "blocked_in: [x, x]", "blocked_in"),
+        ("blocked_in: [verify_identity]", "blocked_in: [x, x]", "blocked_in"),
         ("language: en", "language: ''", "language"),
         ("language: en", "language: e", "language"),
     ],

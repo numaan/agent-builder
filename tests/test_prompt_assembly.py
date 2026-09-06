@@ -133,6 +133,9 @@ def test_a_caller_fills_slots_and_cannot_supply_an_order() -> None:
         "node_instructions",
         "decisions",
         "state",
+        # DESIGN.md section 6.6's deferred requests, rendered inside layer 6 as their own fenced
+        # block. A slot, like every other: it does not add a layer and it carries no order.
+        "pending_intents",
         "knowledge",
         "tool_results",
         "summary",

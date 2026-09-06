@@ -103,6 +103,11 @@ class HandoffRequest(BaseModel):
     step_id: str | None = None
     """The step that raised it, which is what makes delivery idempotent across a crash."""
 
+    next_steps: list[str] = Field(default_factory=list)
+    """What the pack's ``handoff`` node suggests the human does, overriding core's
+    reason-keyed checklist (DESIGN.md section 13's ``suggested_next_steps``). Empty for a
+    handoff the engine raised: core does not know a pack's desk."""
+
 
 class InterruptCheck(Protocol):
     async def __call__(self, request: InterruptRequest) -> InterruptDecision: ...

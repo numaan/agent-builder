@@ -1,0 +1,54 @@
+id: root
+description: >
+  The entry graph. DESIGN.md section 6.5: an llm node classifies the intent and each workflow
+  is a subgraph node, which is also where the interrupt check gets its list of intents (6.6).
+outputs:
+  outcome: str | None
+state:
+  intent: str | None
+  outcome: str | None
+start: classify
+nodes:
+  classify:
+    type: llm
+    description: Which of the three workflows this message belongs to.
+    instructions: |
+      Decide which workflow the customer's message belongs to: alpha, beta, gated, or finished.
+    output_schema:
+      intent: str | None
+    edges:
+      alpha: do_alpha
+      beta: do_beta
+      gated: do_gated
+      finished: done
+
+  do_alpha:
+    type: subgraph
+    description: A workflow that may be interrupted.
+    graph: alpha
+    outputs: { outcome: outcome }
+    next: wrap_up
+
+  do_beta:
+    type: subgraph
+    description: A workflow that may not be interrupted.
+    graph: beta
+    outputs: { outcome: outcome }
+    next: wrap_up
+
+  do_gated:
+    type: subgraph
+    description: A workflow behind an identity gate.
+    graph: gated
+    outputs: { outcome: outcome }
+    next: wrap_up
+
+  wrap_up:
+    type: ask
+    slots: [outcome]
+    prompt: Anything else?
+    next: classify
+
+  done:
+    type: end
+    outputs: { outcome: "finished" }

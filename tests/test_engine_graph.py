@@ -14,7 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from support_core import load_pack
 from support_core.engine import Executor
-from support_core.engine.runners import NotExecutableRunner, build_runner
+from support_core.engine.runners import NODE_RUNNERS, NotExecutableRunner, build_runner
+from support_core.graph.nodes import NODE_TYPES
 from support_core.graph.pack import Pack
 from tests.engine_support import (
     DETERMINISTIC_PACK,
@@ -132,19 +133,23 @@ async def test_a_router_without_a_matching_branch_hands_off(
     assert "node_error" in failed["error"]
 
 
-async def test_the_engine_refuses_node_types_core_cannot_run_yet() -> None:
-    """Core does not pretend to run a node type it has not implemented.
+async def test_every_core_node_type_is_now_executable() -> None:
+    """Phase 6 finishes DESIGN.md section 6.2's vocabulary.
 
-    ``llm`` became executable in phase 3 and ``tool`` and ``confirm`` in phase 4, so ``handoff``
-    is the last one left; the refusal is asserted where it lives, in the runner registry. The
-    standing rule about tools is no longer about *whether* a tool can run - it can - and is
-    asserted in ``tests/test_tool_policy.py`` and ``tests/test_adversarial_approvals.py``.
+    ``llm`` became executable in phase 3, ``tool`` and ``confirm`` in phase 4, and ``handoff`` -
+    the last one - in phase 6, with the packet, the sinks and the desk of section 13 behind it.
+    So the assertion inverts: no core type falls through to :class:`NotExecutableRunner` any
+    more, and the registry and the runners agree about which types exist.
+
+    The refusal machinery stays and is still asserted, in ``tests/test_engine_registry.py``:
+    it is what a *pack-registered* type meets when its factory is missing.
     """
     pack = load_pack(PACKS / "refund_pack")
     graph = pack.graphs["refund"]
     runner = build_runner("handoff_dispute", graph.nodes["handoff_dispute"])
-    assert isinstance(runner, NotExecutableRunner)
-    assert runner.phase == 6
+    assert not isinstance(runner, NotExecutableRunner)
+    assert runner.type == "handoff"
+    assert {name for name, spec in NODE_TYPES.items() if spec.executable} == set(NODE_RUNNERS)
     for node_id in ("fetch_charge", "confirm_refund"):
         assert not isinstance(build_runner(node_id, graph.nodes[node_id]), NotExecutableRunner)
 

@@ -14,7 +14,7 @@ from support_core.engine import build_runner, register_node_type, unregister_nod
 from support_core.engine.errors import NodeNotExecutableError
 from support_core.engine.runners import NODE_RUNNERS, SayRunner
 from support_core.graph.manifest import PackManifest, TimeoutRule, TimeoutsConfig
-from support_core.graph.nodes import NODE_TYPES, executable_types
+from support_core.graph.nodes import NODE_TYPES, NodeTypeSpec, executable_types
 from tests.engine_support import BOOM_SPEC, BoomRunner, custom_node_types
 
 
@@ -64,13 +64,33 @@ def test_unregistering_something_that_was_never_registered_is_refused() -> None:
         unregister_node_type("say")
 
 
-async def test_a_node_type_core_cannot_run_names_its_phase() -> None:
-    block = NODE_TYPES["handoff"].model.model_validate(
-        {"type": "handoff", "reason": "x", "edges": {"resumed": "a", "closed": "b"}}
+async def test_a_node_type_with_no_runner_names_the_phase_that_will_add_one() -> None:
+    """Every *core* type is executable from phase 6, so this is now about a declared-only type.
+
+    The path still exists and still matters: :func:`register_node_type` declares a spec and a
+    factory together, but the node *models* are read by the loader and the validator, so a type
+    that reaches the executor without a runner has to refuse rather than do something. It names
+    the phase, because "not implemented" should never be a mystery.
+    """
+    spec = NodeTypeSpec(
+        name="not_yet",
+        model=NODE_TYPES["handoff"].model,
+        chooses_edge=True,
+        suspends="waiting_human",
+        executable=False,
+        executable_phase=99,
     )
-    runner = build_runner("escalate", block)
-    with pytest.raises(NodeNotExecutableError, match="not executable until phase 6"):
-        await runner.run(None, None, _FakeRuntime())
+    NODE_TYPES[spec.name] = spec
+    try:
+        block = spec.model.model_validate(
+            {"type": "handoff", "reason": "x", "edges": {"resumed": "a", "closed": "b"}}
+        )
+        object.__setattr__(block, "type", "not_yet")
+        runner = build_runner("escalate", block)
+        with pytest.raises(NodeNotExecutableError, match="not executable until phase 99"):
+            await runner.run(None, None, _FakeRuntime())
+    finally:
+        NODE_TYPES.pop(spec.name, None)
 
 
 class _FakeRuntime:
