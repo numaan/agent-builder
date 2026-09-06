@@ -1,12 +1,18 @@
 """Declarative tool manifest for validation. Implements DESIGN.md sections 8.1 to 8.3 as far as
 phase 1 needs them, and unblocks the confirm-on-all-paths rule of section 5.2.
 
-DESIGN.md section 8.3 says packs export ``TOOLS: list[Tool]`` from Python, and phase 4 builds
-the registry by importing that module. The validator cannot wait for phase 4: the most valuable
-rule in the system ("every write or high-risk tool node has a ``confirm`` node on all paths
-between the last customer input and the call") is meaningless without a risk tier per tool.
+DESIGN.md section 8.3 says packs export ``TOOLS: list[Tool]`` from Python, and from phase 4 the
+registry built by importing that module is what everything reads:
+:func:`manifest_from_registry` turns it into the shape the rules want, and
+:mod:`support_core.graph.tools_source` decides which source a given pack gets.
 
-So a pack also declares its tools as data, in ``tools/tools.yaml``::
+The declarative form below is what remains of phase 1, when the validator could not import pack
+code. A pack that exports tools may still write it, as a reader's summary; the validator then
+compares the two and reports any disagreement (``tools.registry_drift``,
+``tools.declaration_stale``). A pack that exports *none* is validated against it as phase 1 did,
+with a warning saying so, because such a pack cannot run a tool at all.
+
+The file::
 
     tools:
       - name: issue_refund
@@ -20,11 +26,8 @@ So a pack also declares its tools as data, in ``tools/tools.yaml``::
         async: false
         timeout_s: 15
 
-**Phase 4 replaces this file as the source of truth.** When the real registry exists, the
-manifest becomes a cross-check: the validator should compare the declared tiers and models
-against the imported ``TOOLS`` and report any drift, or the manifest should be generated from
-them. Until then, a missing ``tools/tools.yaml`` means the pack declares no tools, and every
-``tool`` node in it is an unknown-tool error - which is the safe direction.
+A pack with neither a manifest nor an export declares no tools, and every ``tool`` node in it is
+an unknown-tool error - which is the safe direction.
 """
 
 from pathlib import Path

@@ -9,7 +9,7 @@ Each phase follows the five-step workflow in [PLAN.md](PLAN.md). Design referenc
 | 1 | Graph model, loader, validator, expression language | done | reviews/phase-1.md |
 | 2 | Execution engine and durability | done | reviews/phase-2.md |
 | 3 | LLM layer and prompted nodes | done | reviews/phase-3.md |
-| 4 | Tool runtime and safety nodes | todo | reviews/phase-4.md |
+| 4 | Tool runtime and safety nodes | self-critique | reviews/phase-4.md |
 | W | Web chat slice (pulled forward from 7) | todo | reviews/phase-w.md |
 | 5 | Knowledge layer and citations | todo | reviews/phase-5.md |
 | 6 | Interrupts, root graph, handoff | todo | reviews/phase-6.md |
@@ -91,25 +91,25 @@ Exit criterion: `packs/acme_billing` has a `root.yaml` with a classify node and 
 
 Design: sections 8.1 to 8.4, 6.2 (`tool`, `confirm`, `gate`), 6.4.
 
-- [ ] `Tool`, `Risk`, `ToolContext`; registry with duplicate and schema checks.
-- [ ] Risk policy enforcement in the runtime, not in prompts: READ only from llm loops, WRITE and HIGH only from tool nodes with approval, `confirm_exempt` reporting.
-- [ ] Idempotency: `tool_call` row keyed by step id; at-most-once for non-idempotent tools.
-- [ ] Migration adding `run_id` (FK, indexed) and `step_id` to `tool_call` so calls can be joined to a run and conversation without parsing the idempotency key (phase 0 deferred finding F6).
-- [ ] `confirm` node computing `sha256(tool_name + canonical_json(args))`, storing `action_approval`, yes/no edges.
-- [ ] `action_approval` is single-use: `consumed_by_tool_call_id`/`consumed_at`, and a consumed approval is treated as absent; covered by the adversarial tests (phase 0 deferred finding N1).
-- [ ] `tool` node with `args` expressions, `into` mapping, `on_error`, `requires_approval` hash check.
-- [ ] `gate` node pushing the redirect graph and re-evaluating.
-- [ ] Async tools completing via callback (`waiting_async_tool`).
-- [ ] MCP adapter with mandatory risk map, unknown tools default HIGH.
-- [ ] Sample pack tools: `list_recent_charges`, `get_charge`, `check_refund_eligibility`, `issue_refund`, `send_otp`, `verify_otp`, backed by an in-memory fake billing system.
-- [ ] `verify_identity.yaml` and `refund.yaml` graphs from section 6.4.
-- [ ] The registry built from the imported `TOOLS` is authoritative for risk tiers; the validator reports drift against `tools/tools.yaml` (phase 1 deferred finding I: a HIGH tool declared `read` removes every check today).
-- [ ] The engine's approval hash classifies scalars with the same `parse_value` rule the validator canonicalises with, so a static pass is not followed by a run-time refusal (phase 1 review F7, run-time half).
-- [ ] Reject a state write, between a `confirm` and the call it approves, to any field the approved arguments read; today the comparison is textual and identical text that evaluates differently passes (phase 1 deferred finding H).
-- [ ] Decide whether `confirm_exempt` on a WRITE tool stays an INFO or gains a required reason string now that the registry is authoritative (phase 1 deferred finding J).
-- [ ] Adversarial tests: approval hash mismatch refused; WRITE tool from llm loop refused; gate bypass by direct sub-graph entry refused; confirmed amount changed before execution refused.
+- [x] `Tool`, `Risk`, `ToolContext`; registry with duplicate and schema checks. (`support_core/tools/base.py`, `registry.py`; `FunctionTool` wraps a coroutine for packs that would rather not subclass. `ToolContext.patch_customer` is how DESIGN.md 19 step 9's `verify_otp` sets `ctx.customer.identity_verified` without a node writing `ctx`.)
+- [x] Risk policy enforcement in the runtime, not in prompts: READ only from llm loops, WRITE and HIGH only from tool nodes with approval, `confirm_exempt` reporting. (`support_core/tools/runtime.py`. The tier check is made twice - once in phase 3's gateway, once in the runtime - so a bug in the gateway is not sufficient to execute a write.)
+- [x] Idempotency: `tool_call` row keyed by step id; at-most-once for non-idempotent tools. (The row is claimed *before* the call, so a dead process leaves a `running` row - a call whose outcome nobody knows - and a non-idempotent tool is then refused rather than repeated. `tests/test_tool_crash_recovery.py` kills a real OS process inside the tool, after the side effect and before the record.)
+- [x] Migration adding `run_id` (FK, indexed) and `step_id` to `tool_call` so calls can be joined to a run and conversation without parsing the idempotency key (phase 0 deferred finding F6). (Migration `0006`, which also adds `node_id`, `error`, `attempts`, `finished_at` and `context_patch`.)
+- [x] `confirm` node computing `sha256(tool_name + canonical_json(args))`, storing `action_approval`, yes/no edges. (`ConfirmRunner`. The hash is taken when the proposal is *shown* and travels with the suspension, so the customer's answer is read against what they were asked; a difference re-presents rather than approving. The yes/no reading is the `confirm_decision` hook, with a conservative keyword default and `StructuredConfirmClassifier` where a provider is configured - and a third answer, `unclear`, which asks again.)
+- [x] `action_approval` is single-use: `consumed_by_tool_call_id`/`consumed_at`, and a consumed approval is treated as absent; covered by the adversarial tests (phase 0 deferred finding N1). (Also bound to the run, the frame and the confirm node, so an approval from an earlier invocation of the same graph is refused before single use has to catch it.)
+- [x] `tool` node with `args` expressions, `into` mapping, `on_error`, `requires_approval` hash check. (`ToolRunner`; both `into` forms, and a refusal or a failure is a `NodeError` with a distinguishable `reason`.)
+- [x] `gate` node pushing the redirect graph and re-evaluating. (Executable since phase 2; `tests/test_adversarial_approvals.py` shows the re-check stopping a refund whose identity stopped holding while the confirmation was suspended.)
+- [x] Async tools completing via callback (`waiting_async_tool`). (`Tool.async_`; the node suspends after the dispatch and `Executor.resume_async_tool` completes the row.)
+- [x] MCP adapter with mandatory risk map, unknown tools default HIGH. (`support_core/tools/mcp.py`, over a client protocol the `mcp` package's `ClientSession` satisfies; a wrapped tool is an ordinary `Tool`, so the same registry, approval binding and idempotency key apply.)
+- [x] Sample pack tools: `list_recent_charges`, `get_charge`, `check_refund_eligibility`, `issue_refund`, `send_otp`, `verify_otp`, backed by an in-memory fake billing system. (`packs/acme_billing/tools/`. `issue_refund` is HIGH and *not* idempotent, which is the honest setting for money.)
+- [x] `verify_identity.yaml` and `refund.yaml` graphs from section 6.4. (In `packs/acme_billing/graphs/`, reachable from `root.yaml`'s new `refund` edge.)
+- [x] The registry built from the imported `TOOLS` is authoritative for risk tiers; the validator reports drift against `tools/tools.yaml` (phase 1 deferred finding I: a HIGH tool declared `read` removes every check today). (`support_core/graph/tools_source.py`: a tier that disagrees is `tools.registry_drift` (ERROR), a shape that disagrees `tools.declaration_stale` (WARNING), and a pack that declares tools but exports none `tools.declared_not_exported` (WARNING).)
+- [x] The engine's approval hash classifies scalars with the same `parse_value` rule the validator canonicalises with, so a static pass is not followed by a run-time refusal (phase 1 review F7, run-time half). (Both nodes evaluate their arguments through `value_of`, which is `parse_value`, and then coerce through the tool's own input model - so `{amount: 100}` and `{amount: 100.0}` are the same call and `{amount: "100"}` is not.)
+- [x] Reject a state write, between a `confirm` and the call it approves, to any field the approved arguments read; today the comparison is textual and identical text that evaluates differently passes (phase 1 deferred finding H). (`graph.approval_args_mutated`.)
+- [x] Decide whether `confirm_exempt` on a WRITE tool stays an INFO or gains a required reason string now that the registry is authoritative (phase 1 deferred finding J). (Decided: a required `confirm_exempt_reason`, and the report is a WARNING so `--strict` fails until a human has looked. See the Decisions log.)
+- [x] Adversarial tests: approval hash mismatch refused; WRITE tool from llm loop refused; gate bypass by direct sub-graph entry refused; confirmed amount changed before execution refused. (`tests/test_adversarial_approvals.py`, plus a replayed approval, two concurrent turns racing one approval, and a pack-registered node type trying to forge an approval, invoke a tool, or declare the customer verified. Each was mutation-tested: switching the enforcement off makes the test fail.)
 
-Exit criterion: adversarial approval tests pass and the refund graph runs with the fake provider through confirm and issue_refund.
+Exit criterion: adversarial approval tests pass and the refund graph runs with the fake provider through confirm and issue_refund. Met on 2026-09-06: `tests/test_golden_conversation.py` replays a five-turn refund conversation through `packs/acme_billing` against `FakeProvider`, and `tests/test_refund_flow.py` asserts what the path cannot - one approval, bound to the arguments the customer was shown, consumed by the call it authorised, and one refund in the billing system rather than none or two. 1137 tests green (two deselected - the `live` group). Self-critique recorded in reviews/phase-4.md; the independent review is PLAN.md step 4.
 
 ## Phase W: Web chat slice (pulled forward from Phase 7)
 
@@ -217,14 +217,14 @@ Exit criterion: the sample pack builds as its own image, starts, and answers "wh
 Populated by phase reviews. Format: `- [phase N] finding, severity, reason deferred`.
 
 - ~~[phase 0] F5: `trace_step` has no ordering column; `started_at` defaults to `now()`, which is identical for every step written in one transaction, so replay (DESIGN 7.3) cannot order steps by it, should-fix, deferred to phase 2 which owns the checkpoint transaction and its migration.~~ **Closed in phase 2**: migration `0002` adds `trace_step.seq` with a unique `(run_id, seq)`, and the engine writes both timestamps from an injectable clock instead of the server default.
-- [phase 0] F6: `tool_call` has no `run_id`, `conversation_id` or `step_id`; the only link to a conversation is the idempotency key string, should-fix, deferred to phase 4 which owns the `tool_call` migration (checklist line added there).
-- [phase 0] N1: `action_approval` has no single-use marker or expiry, so one approval row could satisfy two tool calls with the same args hash, nit (a design gap: DESIGN 8.2 does not demand single use), deferred to phase 4 (checklist line added there).
+- ~~[phase 0] F6: `tool_call` has no `run_id`, `conversation_id` or `step_id`; the only link to a conversation is the idempotency key string, should-fix, deferred to phase 4 which owns the `tool_call` migration.~~ **Closed in phase 4**: migration `0006` adds `run_id` (FK, indexed), `step_id` and `node_id`, and `repositories.tool_calls_for_run` is the join.
+- ~~[phase 0] N1: `action_approval` has no single-use marker or expiry, so one approval row could satisfy two tool calls with the same args hash, nit (a design gap: DESIGN 8.2 does not demand single use), deferred to phase 4.~~ **Closed in phase 4**: `consumed_at`/`consumed_by_tool_call_id`, taken by an atomic update that is also the claim, so two racing callers cannot both win. The approval is bound to the run, the frame and the confirm node besides.
 - [phase 0] N2 (downgrade half): the initial migration's downgrade drops the `vector` extension, which fails or removes a shared extension if an administrator pre-installed it, nit, deferred to phase 5 which owns pgvector; editing the initial migration for a shared-instance concern is not a risk-free few lines. The superuser requirement is documented in README.
 - [phase 0] N9: two concurrent `pytest` processes against one database corrupt each other's fixtures (reviewer measured 47 passed, 8 errors); README warns but nothing enforces it, nit, deferred because a session-long advisory lock needs a connection that outlives the per-test event loops, which the fixture design avoids on purpose. The dedicated `support_test` database (F2) removes the developer-database half of the risk.
 - [phase 1] N3: `graph.subgraph_cycle` fires only when *no* graph in the cycle contains a suspending node anywhere, not one on the cycle path, so mutual recursion through a graph with an unrelated `ask` on an untaken branch is missed (reviewer's hostile case T, reproduced after resolution), nit, deferred to phase 6, which owns interrupts and has to rebuild the cross-graph control-flow model for the push and resume edges anyway; a path-sensitive cross-graph cycle check is not a few safe lines (checklist line added there).
-- [phase 1] H: the approval-argument comparison is textual, so a `tool` node that rewrites a field the approved arguments read, between the confirm and the call, passes `graph.approval_mismatch` (reviewer's hostile case H, still accepted after resolution), should-fix, deferred to phase 4, which owns the run-time hash check DESIGN.md 8.2 says exists for exactly this and can enforce the static half beside it (checklist line added there).
-- [phase 1] I: risk tiers come from the pack-authored `tools/tools.yaml`, so declaring `issue_refund` as `read` removes every confirm check and makes it callable from an `llm` loop (reviewer's hostile case I), should-fix, deferred to phase 4, which replaces the manifest with the registry built from the imported `TOOLS` and must report drift; phase 1 cannot import pack code (checklist line added there).
-- [phase 1] J: a WRITE tool marked `confirm_exempt` is reported as INFO only, which does not fail `--strict` and forces no human to look (reviewer's hostile case J), nit (DESIGN.md 8.2 asks for exactly this reporting), deferred to phase 4, which owns the registry and can require a reason string (checklist line added there).
+- ~~[phase 1] H: the approval-argument comparison is textual, so a `tool` node that rewrites a field the approved arguments read, between the confirm and the call, passes `graph.approval_mismatch` (reviewer's hostile case H), should-fix, deferred to phase 4.~~ **Closed in phase 4**, both halves: `graph.approval_args_mutated` refuses it at load, and the run-time hash check refuses it at execution even in a pack that never met the validator.
+- ~~[phase 1] I: risk tiers come from the pack-authored `tools/tools.yaml`, so declaring `issue_refund` as `read` removes every confirm check and makes it callable from an `llm` loop (reviewer's hostile case I), should-fix, deferred to phase 4.~~ **Closed in phase 4**: nothing at run time reads that file. The registry built from the imported `TOOLS` is what the validator type-checks against and what the runtime enforces, and a declared tier that disagrees is `tools.registry_drift` (ERROR).
+- ~~[phase 1] J: a WRITE tool marked `confirm_exempt` is reported as INFO only, which does not fail `--strict` and forces no human to look (reviewer's hostile case J), nit, deferred to phase 4.~~ **Closed in phase 4**: `confirm_exempt_reason` is required, and `graph.confirm_exempt` is a WARNING quoting it.
 - ~~[phase 1] P1: `load_pack` reads and parses every graph twice, so a pack edited on disk while it runs can produce a `PackPin` whose hashes describe a mix of two versions, nit, deferred to phase 2, which owns hot reload.~~ **Closed in phase 2**: the validator snapshots the text it read onto the report and the loader parses that snapshot, so the pin hashes the bytes that were parsed.
 - ~~[phase 1] P2: `templates.ENVIRONMENT` is a process-wide Jinja environment with a shared template cache; harmless while nothing varies per pack, a concurrency bug the moment a pack supplies a filter or two pack versions load side by side, nit, deferred to phase 2.~~ **Closed in phase 2**: `Pack.environment` per pack, one per validation run; the module-level environment is only a fallback.
 - [phase 2] R7: a caller that cannot take the conversation lock waits, holding a connection each, so N+1 concurrent inbound messages on one conversation with a bounded pool is a stall (reviewer measured five OS processes, four of them blocked for a whole turn), should-fix, deferred to phase 7. The mechanism for the fix already exists (`lock_wait_seconds=0` returns `queued=True`, `drain` is the poller's entry point); what R7 asks for is a *default* for channel webhooks and a poller to make it safe, and phase 2 has neither a channel adapter nor a scheduler - the same reason `sweep_timeouts` and `recover_stalled` are methods rather than a daemon (checklist line added there).
@@ -235,6 +235,47 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
 ---
 
 ## Decisions log
+
+- 2026-09-06: the approval hash is taken over arguments **coerced through the tool's own input
+  model**, and the approval is bound to more than DESIGN.md 8.2 asks for. The design says
+  `sha256(tool_name + canonical_json(args))` and does not say which `args`; coercing first means
+  `29` and `29.0` are one call when the input is a `float` - which they are - while any
+  difference the model does not erase is still a mismatch, and the hash then covers exactly what
+  the tool receives, because `model_validate` drops anything the input model does not declare.
+  The row is additionally bound to the run, the frame sequence and the `confirm` node that
+  recorded it, and is single-use: `frame_seq` is monotonic and never reused (7.1), so an
+  approval from an earlier trip through the same graph is refused before single use has to catch
+  it, and neither binding can be satisfied by getting the arguments right.
+
+- 2026-09-06: a **tool may change `ctx.customer`**, and nothing else may. DESIGN.md 19 step 9
+  has `verify_otp` set `ctx.customer.identity_verified` while 6.1 says `ctx` is read-only *to
+  nodes*; both hold if the node does not write it and the tool does, through
+  `ToolContext.patch_customer`, with the engine committing the patch in the checkpoint
+  transaction. Only a WRITE or HIGH tool may (READ means no side effects) and only a node the
+  graph declares `type: tool` may carry one out, which is what stops a pack-registered node type
+  declaring its own customer verified.
+
+- 2026-09-06: `confirm_exempt` requires a written reason and is reported at **WARNING**
+  (phase-1 deferred finding J). DESIGN.md 8.2 asks for exemptions to be "reviewed deliberately";
+  an INFO line in a report that exits 0 is noticed rather than reviewed, and a required sentence
+  makes the author write down the argument a reviewer would otherwise have to reconstruct. The
+  cost is that `--strict` now fails on any pack with an exemption until somebody has read it,
+  which is the intended cost.
+
+- 2026-09-06: a `confirm` node's yes/no reading has **three answers**, and `unclear` asks again.
+  DESIGN.md 6.2 gives the node `yes` and `no` edges and requires "an explicit yes"; a model asked
+  for a boolean has to put "hmm, how much was it?" somewhere, and both places are wrong. The hook
+  (`EngineHooks.confirm_decision`, default a closed keyword list, `StructuredConfirmClassifier`
+  where a provider is configured) may return `unclear`, and the node re-presents the proposal -
+  which costs a turn and cannot loop, because each iteration needs a new customer message.
+
+- 2026-09-06: **`issue_refund` is not idempotent**, and a non-idempotent call whose outcome is
+  unknown is refused rather than retried. DESIGN.md 8.1 defaults `idempotent` to true and its
+  example is silent. The `tool_call` row is claimed before the call, so a crash in the window
+  leaves a `running` row that means "this may already have happened"; retrying it is a second
+  refund and pretending it succeeded is a lie, so the call fails, the graph routes to `on_error`
+  and, in the sample pack, tells the customer a person will check.
+
 
 - 2026-09-06: Web chat pulled forward out of Phase 7 into a new Phase W, sequenced after Phase 4. Reason: nothing is demonstrable until a person can type at the agent, and every later phase then improves something visible. Phase 7 keeps email, observability, replay, guardrails and the scheduler. Target for a demo is Phases 4, W, 5 and 6 complete.
 

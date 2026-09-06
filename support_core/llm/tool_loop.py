@@ -5,8 +5,9 @@ the first row of section 8.2's risk table.
     tool, runtime validates against the node's allowed list and READ tier, executes, feeds
     result back. ... This is where the model gathers facts; it is never where it acts.
 
-Phase 4 owns tool execution, so what phase 3 leaves is a seam - but a seam shaped so that phase 4
-cannot widen it. :class:`ModelToolRunner` is the injectable half and it is never spoken to
+Phase 4 owns tool execution, and what phase 3 left is a seam shaped so that phase 4 could not
+widen it - :class:`~support_core.tools.runtime.RegistryToolRunner` is what fills it now.
+:class:`ModelToolRunner` is the injectable half and it is never spoken to
 directly: :class:`ReadOnlyToolGateway` wraps every runner, and an ``llm`` node only ever holds a
 gateway. The gateway refuses, before the runner is called at all:
 
@@ -30,7 +31,7 @@ from support_core.tools.risk import MODEL_CALLABLE, Risk
 
 
 class ToolsUnavailableError(LLMError):
-    """A node declares tools but nothing can execute them (phase 4 has not arrived)."""
+    """A node declares tools but nothing can execute them: no tool runtime is configured."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +58,8 @@ class ToolOutcome:
 
 
 class ModelToolRunner(Protocol):
-    """The phase 4 seam. Deliberately two methods and no policy."""
+    """The tool-execution seam. Deliberately two methods and no policy: the policy is the
+    gateway's, above, and the runtime's, below (:mod:`support_core.tools.runtime`)."""
 
     async def describe(self, names: Sequence[str]) -> Sequence[ModelToolSpec]: ...
 
@@ -67,19 +69,24 @@ class ModelToolRunner(Protocol):
 
 
 class UnavailableToolRunner:
-    """The default: there is no tool runtime yet, and saying so is better than pretending."""
+    """A runner for a runtime that has none: it refuses, loudly, rather than pretending.
+
+    Used by a :class:`~support_core.engine.runners.NodeRuntime` built outside an executor. The
+    executor always builds a real one from the pack's registry, so a node that reaches this has
+    no tool runtime at all, and a node that gathers no facts must not answer as though it had.
+    """
 
     async def describe(self, names: Sequence[str]) -> Sequence[ModelToolSpec]:
         msg = (
-            f"this node offers the model {sorted(names)}, but tool execution arrives in phase 4; "
-            f"no tool can be described to the model until then"
+            f"this node offers the model {sorted(names)}, but no tool runtime is configured, so "
+            f"no tool can be described to it"
         )
         raise ToolsUnavailableError(msg)
 
     async def invoke(
         self, name: str, arguments: Mapping[str, Any], *, call_id: str, step_id: str
     ) -> ToolOutcome:  # pragma: no cover - describe already refused
-        msg = f"tool execution arrives in phase 4; {name!r} cannot be called"
+        msg = f"no tool runtime is configured; {name!r} cannot be called"
         raise ToolsUnavailableError(msg)
 
 
@@ -92,9 +99,10 @@ class ReadOnlyToolGateway:
     """The node's own ``tools:`` list (DESIGN.md section 6.4)."""
 
     manifest_risk: Mapping[str, Risk] = field(default_factory=dict)
-    """Risk tiers from the pack, as a cross-check against what the runner reports. Phase 4 makes
-    the imported ``TOOLS`` registry authoritative (phase-1 deferred finding I); until then a
-    disagreement between the two sources is treated as untrustworthy and refused."""
+    """Risk tiers the executor read from the pack's registry, as a cross-check against what the
+    runner reports. Both now come from the imported ``TOOLS`` (phase-1 deferred finding I), so a
+    disagreement means something is wrong with the wiring rather than with the pack - and it is
+    still a refusal, because a tier nobody agrees on is not a tier."""
 
     max_calls: int = 5
     step_id: str = ""

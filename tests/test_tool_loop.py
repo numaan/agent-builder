@@ -123,9 +123,14 @@ async def test_refusals_count_against_the_budget() -> None:
 
 
 async def test_the_default_runner_refuses_to_describe_anything() -> None:
-    """Nothing executes a tool in phase 3, and the model is not told otherwise."""
+    """A node with no tool runtime is told so, rather than answering as though it had one.
+
+    The executor always builds a real runner from the pack's registry, so this is what a
+    ``NodeRuntime`` constructed outside one does: it refuses at ``specs()``, before the model is
+    told a tool exists, and the ``llm`` node turns that into a node error.
+    """
     gateway = ReadOnlyToolGateway(runner=UnavailableToolRunner(), declared=("get_charge",))
-    with pytest.raises(ToolsUnavailableError, match="phase 4"):
+    with pytest.raises(ToolsUnavailableError, match="no tool runtime is configured"):
         await gateway.specs()
 
 

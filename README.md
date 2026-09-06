@@ -134,10 +134,12 @@ ERROR   graph.unconfirmed_write [graphs/refund.yaml:issue_refund]: tool 'issue_r
 
 Exit status is 0 when the pack is well-formed, 1 when it has errors; `--strict` also fails on
 warnings, `--quiet` prints only the summary. The checks cover the manifest (`pack.yaml`,
-DESIGN.md 5.1), the directory layout (5), and every graph rule in 5.2. `packs/acme_billing` has a
-`root.yaml` from phase 3 on and reports `well-formed` with four warnings (the workflows phase 4
-adds, already named in `interrupts`); `tests/packs/refund_pack` is the worked DESIGN.md 6.4 example
-and reports `well-formed` with warnings.
+DESIGN.md 5.1), the directory layout (5), and every graph rule in 5.2. **Validating a pack
+imports its `tools/` package**, because a risk tier that a file the pack author writes could
+misstate governs nothing (DESIGN.md 8.3); an import that raises is a finding, not a crash.
+`packs/acme_billing` reports `well-formed` with nine warnings - the two workflows phase 6 still
+adds, the two `confirm_exempt` passcode tools with the reason each gave, and five notes about
+optional values and a state field typed as a pack model.
 
 `support pack knowledge sync`, `support pack eval` and `support replay` exist but exit with
 status 3 and name the phase that delivers them.
@@ -153,6 +155,7 @@ pack = load_pack("packs/acme_billing")
 service = service_for_pack(pack, AnthropicProvider())          # DESIGN.md 11.1
 hooks = EngineHooks(
     extract_slots=StructuredSlotExtractor(service),            # DESIGN.md 6.2
+    confirm_decision=StructuredConfirmClassifier(service),     # DESIGN.md 6.2, 8.2
     summarize=LlmSummarizer(service),                          # DESIGN.md 10
 )
 executor = Executor(pack, make_engine(), hooks=hooks, llm=service)
@@ -160,7 +163,8 @@ conversation_id = await executor.start_conversation(channel="web_chat")
 await executor.on_inbound(conversation_id, "I was charged twice")
 ```
 
-(`service_for_pack` and `StructuredSlotExtractor` are in `support_core.llm.wiring`,
+(`service_for_pack`, `StructuredSlotExtractor` and `StructuredConfirmClassifier` are in
+`support_core.llm.wiring`,
 `LlmSummarizer` in `support_core.memory`. An `Executor` built without `llm=` still runs a pack
 with no `llm` nodes; one that reaches an `llm` node hands off with reason `llm_unavailable`
 rather than walking past it.)
@@ -173,7 +177,7 @@ What the engine guarantees (DESIGN.md 7.1 to 7.3, 17), and what it does not yet 
 - **A checkpoint after every node**, writing the frame stack, the trace step and the node's
   outbound messages in one transaction. A process that dies anywhere resumes from the last
   checkpoint to the same outcome; the step id (`run_id:frame_seq:node_id:attempt`) is the same
-  on the retry, which is what will make phase 4's tool calls idempotent.
+  on the retry, and is the idempotency key of every tool call.
 - **Suspension** into `waiting_customer`, `waiting_human`, `waiting_async_tool` and
   `waiting_timer`, with per-status and per-channel timeouts from `pack.yaml`'s `timeouts:` block.
   Resume with `on_inbound`, `resume_human`, `resume_async_tool`, `resume_timer`; a sweep of
@@ -190,16 +194,26 @@ What the engine guarantees (DESIGN.md 7.1 to 7.3, 17), and what it does not yet 
   and the rolling summary are rendered inside `-----BEGIN UNTRUSTED DATA (...)-----` fences in a
   fixed nine-layer prompt (DESIGN.md 11.2) that a pack can fill but cannot reorder or escape.
 - **Only READ-tier tools, and only the ones the node declared,** can be reached from a prompted
-  step: the node holds a gateway, the gateway holds phase 4's runtime, and a refusal is fed back
-  to the model rather than executed.
+  step: the node holds a gateway, the gateway holds the runtime, the runtime refuses a
+  non-READ tier a second time, and a refusal is fed back to the model rather than executed.
+- **Nothing runs a `write` or `high` tool without a matching approval.** A `confirm` node hashes
+  `sha256(tool + canonical_json(args))` over the arguments it *shows the customer*, records an
+  `action_approval` on an explicit yes, and the `tool` node re-computes the hash and consumes
+  that approval - which is bound to the run, the frame, the confirm node and the arguments, and
+  is good for exactly one call. A mismatch is refused and routed to `on_error`. The check is in
+  the runtime and assumes nothing about the validator having run.
+- **A tool call is claimed before it runs**, under the step id. A completed call replays instead
+  of running again; a call whose process died with the outcome unknown is retried only if the
+  tool declared itself `idempotent`, and otherwise refused - at-most-once, in the one place where
+  the difference is one refund or two.
 - **A rolling summary every K turns** (`memory.summarize_every_turns`), stored on the
   conversation with the turn it covers. It is prompt context only: nothing a turn depends on is
   read from it, and a lost summary changes no durable outcome.
 - Everything a later phase owns is a hook on `EngineHooks` with a default that does nothing
   surprising: the interrupt check answers `continue` (phase 6), handoff records nothing but the
   run still parks for a human (phase 6), no summary is written unless one is wired up, and
-  outbound messages stay `pending_send` because there is no channel adapter (phase 7). `tool`
-  and `confirm` nodes refuse to run and name their phase.
+  outbound messages stay `pending_send` because there is no channel adapter (phase 7). A
+  `handoff` node refuses to run and names its phase.
 
 ## Writing a pack's graphs
 
@@ -214,14 +228,22 @@ Three things are worth knowing before the first one:
 - **Templates** in `say`, `ask` and `confirm` are sandboxed Jinja with the same four filters.
   `{% if %}` is allowed; loops, assignment, calls and subscripts are not. Every variable is
   type-checked against the graph's declared `state` at load time.
-- **Tools** are declared as data in `tools/tools.yaml` (name, `risk`, `input`, `output`,
-  `confirm_exempt`, ...) so the validator can enforce DESIGN.md 5.2's confirm-on-all-paths rule
-  before the phase 4 tool registry exists. Phase 4 replaces this file as the source of truth.
+- **Tools** are Python. `tools/__init__.py` exports `TOOLS: list[Tool]` (DESIGN.md 8.3), and
+  that list is the only source of a risk tier: the validator type-checks argument expressions
+  against the real input models and the runtime enforces the real tiers. The declarative
+  `tools/tools.yaml` from phase 1 is now optional, and is compared against the export - a
+  different tier is an error, a different shape a warning. A pack that declares tools and
+  exports none is warned that it cannot run any of them.
+- **`confirm_exempt`** (DESIGN.md 8.2, for a side effect the customer cannot be asked about,
+  such as a passcode) is available on `write` tools only, requires a written reason, and is
+  reported as a warning so `--strict` fails until somebody has looked at it.
 
 The rule that matters most: a `write` or `high` risk tool node must have a `confirm` node on every
 path from the last customer input, and must name that confirm in `requires_approval` with matching
 arguments (DESIGN.md 5.2 and 8.2). The validator proves this with a dataflow analysis over the
-graph, across sub-graph calls, not with a pattern match.
+graph, across sub-graph calls, not with a pattern match - and refuses, besides, a node between
+the confirm and the call that rewrites what the approved arguments read, and a second tool node
+that would spend the same approval. All of it is checked again at run time.
 
 ## Conventions
 
