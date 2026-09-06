@@ -1,7 +1,14 @@
-# Local and CI Postgres for support-core (DESIGN.md section 17, PLAN.md "Environment needs").
-# Bring it up with `scripts/db-up.sh` or `make db-up`; see README.md.
+# Local and CI stores for support-core (DESIGN.md sections 17 and 9.1, PLAN.md "Environment
+# needs"). Bring them up with `scripts/db-up.sh` or `make db-up`; see README.md.
 # No fixed container_name: the compose project (directory) name namespaces the container, so
-# two checkouts on one host can each run their own database on different SUPPORT_DB_PORTs.
+# two checkouts on one host can each run their own stores on different SUPPORT_DB_PORTs.
+#
+# There are two services and DESIGN.md 4.1 says there is one stateful dependency. The relaxation
+# is deliberate and is recorded in BACKLOG.md's decisions log (2026-09-06): Qdrant stores the
+# ColBERT multivectors and scores MaxSim natively, and retrieval is a read *outside* the
+# checkpoint transaction, so a second store cannot cost a checkpoint or a resume - which is the
+# property section 4.1 existed to protect. Postgres keeps the lexical half, so retrieval degrades
+# rather than fails when Qdrant is down. The real price is operational: one Qdrant per domain.
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -21,5 +28,23 @@ services:
       timeout: 3s
       retries: 30
 
+  # The vector side of the knowledge layer (DESIGN.md section 9.1, BACKLOG.md phase 5).
+  # 6333 is the REST port the client uses; 6334 (gRPC) is deliberately not published, because
+  # nothing here speaks it and an unpublished port is one fewer thing to secure.
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "${SUPPORT_QDRANT_PORT:-6333}:6333"
+    volumes:
+      - support-core-qdrant:/qdrant/storage
+    healthcheck:
+      # The image carries no curl and no wget; bash's /dev/tcp is what it does have. This only
+      # proves the port accepts a connection, which is what `--wait` needs it to prove.
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333'"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
 volumes:
   support-core-pgdata:
+  support-core-qdrant:

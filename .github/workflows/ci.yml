@@ -32,8 +32,18 @@ jobs:
           --health-timeout 3s
           --health-retries 30
 
+      qdrant:
+        # The vector side of the knowledge layer (DESIGN.md 9.1, BACKLOG.md phase 5). Same image
+        # as docker-compose.yml. No health check: the image carries neither curl nor wget, and
+        # `docker run --health-cmd` has no shell of its own to fall back on, so the wait is done
+        # in a step below instead of being silently skipped here.
+        image: qdrant/qdrant:latest
+        ports:
+          - 6333:6333
+
     env:
       SUPPORT_DATABASE_URL: postgresql+asyncpg://support:support@localhost:5432/support_test
+      SUPPORT_QDRANT_URL: http://localhost:6333
       PYTHONDONTWRITEBYTECODE: "1"
 
     steps:
@@ -47,6 +57,20 @@ jobs:
 
       - name: Install
         run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+
+      - name: Wait for Qdrant
+        # The knowledge tests skip themselves when Qdrant is unreachable, which is right for a
+        # developer's machine and wrong here: a CI run that silently skipped the whole vector
+        # side would look identical to one that passed it. So CI waits, and fails if it never
+        # comes up, which turns a skipped suite into a red build.
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS http://localhost:6333/readyz >/dev/null 2>&1; then
+              echo "Qdrant is ready."; exit 0
+            fi
+            sleep 2
+          done
+          echo "Qdrant did not become ready." >&2; exit 1
 
       - name: Ruff lint
         run: python -m ruff check .
