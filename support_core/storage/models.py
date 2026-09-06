@@ -223,28 +223,60 @@ class TraceStep(Base):
 class ActionApproval(Base):
     """Customer or human approval bound to ``sha256(tool_name + canonical_json(args))``.
 
-    See section 8.2.
+    See section 8.2. Beyond the design's columns this records *where* the approval was given -
+    the run, the frame, the confirm node and its step - and whether it has been used.
+
+    The extra binding is what makes an approval un-replayable. ``frame_seq`` is monotonic and
+    never reused (section 7.1's step id depends on that), so an approval given in an earlier
+    invocation of the same graph does not match a later one however identical the arguments;
+    ``consumed_at`` then makes even the right approval good for exactly one call (phase-0 review
+    finding N1). ``uq_action_approval_run_step`` keeps a confirm node whose step re-executes
+    after a crash from recording a second approval.
     """
 
     __tablename__ = "action_approval"
     __table_args__ = (
         Index("ix_action_approval_conversation_hash", "conversation_id", "args_hash"),
+        UniqueConstraint("run_id", "step_id", name="uq_action_approval_run_step"),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     conversation_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("conversation.id", ondelete="CASCADE"), nullable=False
     )
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("run.id", ondelete="CASCADE"), index=True
+    )
+    frame_seq: Mapped[int | None] = mapped_column(Integer)
+    node_id: Mapped[str | None] = mapped_column()
+    """The ``confirm`` node that recorded it; a ``tool`` node's ``requires_approval`` names it."""
+
+    step_id: Mapped[str | None] = mapped_column()
     tool: Mapped[str] = mapped_column(nullable=False)
+    args: Mapped[JsonObject | None] = mapped_column()
+    """The canonical arguments the hash was taken over, so an auditor need not reverse it."""
+
     args_hash: Mapped[str] = mapped_column(nullable=False)
     approved_by: Mapped[str] = mapped_column(nullable=False)
     approved_at: Mapped[datetime] = mapped_column(nullable=False, server_default=_NOW)
+    consumed_by_tool_call_id: Mapped[uuid.UUID | None] = mapped_column(
+        # ``use_alter``: ``tool_call.approval_id`` points back here, so the two tables are a
+        # cycle. It is a hint for ``create_all`` only - the migrations are the schema - but
+        # without it ``Base.metadata.sorted_tables`` cannot order the tables, and the test
+        # fixtures truncate that list.
+        ForeignKey("tool_call.id", ondelete="SET NULL", use_alter=True)
+    )
+    consumed_at: Mapped[datetime | None] = mapped_column()
+    """Set in the same transaction as the call it authorised. A consumed approval is absent."""
 
 
 class ToolCall(Base):
     """Every tool invocation, keyed by the idempotency key derived from the step id.
 
-    See sections 7.1, 8.1 and 17.
+    See sections 7.1, 8.1 and 17. The row is written *before* the tool runs and updated after,
+    which is what gives a non-idempotent tool at-most-once semantics: a row left ``running`` by
+    a process that died is a call whose outcome nobody knows, and the runtime refuses to repeat
+    it rather than guessing (section 8.1, ``idempotent: bool``).
     """
 
     __tablename__ = "tool_call"
@@ -252,15 +284,28 @@ class ToolCall(Base):
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     idempotency_key: Mapped[str] = mapped_column(nullable=False)
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("run.id", ondelete="CASCADE"), index=True
+    )
+    step_id: Mapped[str | None] = mapped_column()
+    node_id: Mapped[str | None] = mapped_column()
     tool: Mapped[str] = mapped_column(nullable=False)
     args: Mapped[JsonObject] = mapped_column(nullable=False, server_default=_EMPTY_OBJECT)
     result: Mapped[JsonObject | None] = mapped_column()
+    context_patch: Mapped[JsonObject | None] = mapped_column()
+    """The ``ctx`` change this call asked for, replayed with the result (section 19 step 9)."""
+
     risk: Mapped[str] = mapped_column(nullable=False)
     approval_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("action_approval.id", ondelete="SET NULL")
     )
     status: Mapped[str] = mapped_column(nullable=False, server_default="pending")
+    """``running``, ``succeeded``, ``failed``, ``awaiting_callback`` or ``indeterminate``."""
+
+    error: Mapped[str | None] = mapped_column()
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
     created_at: Mapped[datetime] = _created_at()
+    finished_at: Mapped[datetime | None] = mapped_column()
     updated_at: Mapped[datetime] = _updated_at()
 
 

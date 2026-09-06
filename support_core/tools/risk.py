@@ -35,3 +35,22 @@ REQUIRES_CONFIRM: frozenset[Risk] = frozenset({Risk.WRITE, Risk.HIGH})
 
 MODEL_CALLABLE: frozenset[Risk] = frozenset({Risk.READ})
 """Tiers an ``llm`` node's bounded tool loop may call at all (DESIGN.md sections 8.2, 8.4)."""
+
+SIDE_EFFECTING: frozenset[Risk] = frozenset({Risk.WRITE, Risk.HIGH})
+"""Tiers that may change anything outside the conversation - including ``ctx`` (section 19)."""
+
+
+def needs_confirm(risk: Risk, *, confirm_exempt: bool = False) -> bool:
+    """Whether a ``confirm`` node must authorise a call at this tier (DESIGN.md section 8.2).
+
+    One function, called by the validator's :class:`~support_core.graph.tools_manifest.ToolSpec`
+    and by the runtime's :class:`~support_core.tools.base.Tool`, so a tool cannot be exempt to
+    one of them and not to the other.
+
+    ``confirm_exempt`` is honoured for WRITE only. Section 8.2 offers it for "side effects the
+    customer cannot reasonably be asked about, such as sending a one-time passcode"; HIGH is
+    "money, access, irreversible", and no phrasing of the flag makes that askable-about.
+    """
+    if risk is Risk.HIGH:
+        return True
+    return risk is Risk.WRITE and not confirm_exempt

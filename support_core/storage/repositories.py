@@ -12,6 +12,7 @@ the run row, the trace step, and the messages the node produced - and it writes 
 so there is no state in which a step happened but the stack does not know it.
 """
 
+import json
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -21,7 +22,14 @@ from typing import Any
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from support_core.storage.models import Conversation, Message, Run, TraceStep
+from support_core.storage.models import (
+    ActionApproval,
+    Conversation,
+    Message,
+    Run,
+    ToolCall,
+    TraceStep,
+)
 
 
 @dataclass(slots=True)
@@ -57,6 +65,37 @@ class TurnStart:
     updated_at: datetime
     awaiting: dict[str, Any] | None = None
     pack_fingerprint: str | None = None
+    status: str = "running"
+
+
+@dataclass(slots=True)
+class ApprovalWrite:
+    """One ``action_approval`` row, as a ``confirm`` node's checkpoint writes it (8.2, 17)."""
+
+    conversation_id: uuid.UUID
+    run_id: uuid.UUID
+    frame_seq: int
+    node_id: str
+    step_id: str
+    tool: str
+    args: dict[str, Any]
+    args_hash: str
+    approved_by: str
+    approved_at: datetime
+
+
+@dataclass(slots=True)
+class ToolCallStart:
+    """The ``tool_call`` row written *before* the tool runs (DESIGN.md sections 8.1, 17)."""
+
+    idempotency_key: str
+    run_id: uuid.UUID
+    step_id: str
+    node_id: str
+    tool: str
+    risk: str
+    args: dict[str, Any]
+    created_at: datetime
     status: str = "running"
 
 
@@ -334,6 +373,8 @@ async def write_checkpoint(
     step: StepWrite,
     conversation_id: uuid.UUID,
     outbound: Sequence[str] = (),
+    approval: ApprovalWrite | None = None,
+    customer_context: dict[str, Any] | None = None,
     before_commit: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """The checkpoint of DESIGN.md section 7.1, in one transaction.
@@ -343,10 +384,25 @@ async def write_checkpoint(
     node under the *same* step id; a process that dies after it finds the stack already
     advanced. There is no third state.
 
+    Two things phase 4 adds to the same transaction, for the same reason:
+
+    * ``approval`` - the ``ActionApproval`` a ``confirm`` node's "yes" produced. An approval
+      that committed without its checkpoint would be an authorisation for a step the run does
+      not believe happened; one that did not commit with it would be a confirmed action with no
+      authorisation. Neither is a state this system should be able to reach.
+    * ``customer_context`` - the ``ctx.customer`` a tool asked to change (DESIGN.md section 19
+      step 9). The tool's own effect is already durable in its ``tool_call`` row; committing the
+      context beside the step keeps a gate from being re-evaluated against a context the step
+      that changed it never finished writing.
+
     ``before_commit`` runs inside the transaction, immediately before it commits. The engine
     passes the probe hook, which is how a test kills a turn mid-transaction.
     """
     async with session.begin():
+        if approval is not None:
+            await record_approval(session, approval)
+        if customer_context is not None:
+            await patch_customer_context(session, conversation_id, customer_context)
         await session.execute(
             update(Run)
             .where(Run.id == run.run_id)
@@ -440,6 +496,221 @@ async def stalled_runs(session: AsyncSession, cutoff: datetime, limit: int = 100
         .limit(limit)
     )
     return list(result.scalars())
+
+
+# -- the tool runtime (DESIGN.md sections 8.1, 8.2, 17) ------------------------------------
+
+
+async def record_approval(session: AsyncSession, approval: ApprovalWrite) -> uuid.UUID:
+    """Store a customer's approval of one proposed action (DESIGN.md section 8.2).
+
+    Idempotent under ``(run_id, step_id)``: a ``confirm`` node whose step re-executes after a
+    crash records the same approval, not a second one that a later call could also spend.
+    """
+    result = await session.execute(
+        text(
+            "INSERT INTO action_approval "
+            "(conversation_id, run_id, frame_seq, node_id, step_id, tool, args, args_hash, "
+            " approved_by, approved_at) "
+            "VALUES (:conversation_id, :run_id, :frame_seq, :node_id, :step_id, :tool, "
+            "        CAST(:args AS jsonb), :args_hash, :approved_by, :approved_at) "
+            "ON CONFLICT (run_id, step_id) DO UPDATE SET args_hash = EXCLUDED.args_hash "
+            "RETURNING id"
+        ),
+        {
+            "conversation_id": approval.conversation_id,
+            "run_id": approval.run_id,
+            "frame_seq": approval.frame_seq,
+            "node_id": approval.node_id,
+            "step_id": approval.step_id,
+            "tool": approval.tool,
+            "args": json.dumps(approval.args),
+            "args_hash": approval.args_hash,
+            "approved_by": approval.approved_by,
+            "approved_at": approval.approved_at,
+        },
+    )
+    return uuid.UUID(str(result.scalar_one()))
+
+
+async def consume_approval(
+    session: AsyncSession,
+    *,
+    conversation_id: uuid.UUID,
+    run_id: uuid.UUID,
+    frame_seq: int,
+    node_id: str,
+    tool: str,
+    args_hash: str,
+    approved_by: Sequence[str],
+    now: datetime,
+    tool_call_id: uuid.UUID | None = None,
+) -> ActionApproval | None:
+    """Take one live approval for this exact action, atomically, or return ``None``.
+
+    Every clause is a defence and they are independent:
+
+    * ``args_hash`` is DESIGN.md section 8.2's binding - a model that confirms one amount and
+      calls with another does not match;
+    * ``run_id`` and ``frame_seq`` bind the approval to the *invocation* it was given in.
+      ``frame_seq`` is monotonic and never reused, so an approval from an earlier trip through
+      the same graph cannot authorise a later one however identical the arguments;
+    * ``node_id`` is the ``confirm`` node the tool node named in ``requires_approval``;
+    * ``consumed_at IS NULL`` makes it single use (phase-0 review finding N1). The update is the
+      claim: two callers racing cannot both win, because the row is locked by the first.
+
+    ``FOR UPDATE SKIP LOCKED`` rather than plain ``FOR UPDATE``: a caller that would block on a
+    row somebody else is spending should look at the next candidate, not wait for a decision it
+    will lose anyway.
+    """
+    result = await session.execute(
+        text(
+            "UPDATE action_approval SET consumed_at = :now, "
+            "  consumed_by_tool_call_id = :tool_call_id "
+            "WHERE id = ("
+            "  SELECT id FROM action_approval"
+            "   WHERE conversation_id = :conversation_id AND run_id = :run_id"
+            "     AND frame_seq = :frame_seq AND node_id = :node_id"
+            "     AND tool = :tool AND args_hash = :args_hash"
+            "     AND approved_by = ANY(:approved_by) AND consumed_at IS NULL"
+            "   ORDER BY approved_at, id"
+            "   FOR UPDATE SKIP LOCKED"
+            "   LIMIT 1) "
+            "RETURNING id"
+        ),
+        {
+            "now": now,
+            "tool_call_id": tool_call_id,
+            "conversation_id": conversation_id,
+            "run_id": run_id,
+            "frame_seq": frame_seq,
+            "node_id": node_id,
+            "tool": tool,
+            "args_hash": args_hash,
+            "approved_by": list(approved_by),
+        },
+    )
+    row = result.first()
+    if row is None:
+        return None
+    return await session.get(ActionApproval, row[0])
+
+
+async def live_approvals(
+    session: AsyncSession, conversation_id: uuid.UUID, *, tool: str | None = None
+) -> list[ActionApproval]:
+    """Unconsumed approvals in a conversation. For tests and, later, the desk view."""
+    query = select(ActionApproval).where(
+        ActionApproval.conversation_id == conversation_id,
+        ActionApproval.consumed_at.is_(None),
+    )
+    if tool is not None:
+        query = query.where(ActionApproval.tool == tool)
+    result = await session.execute(query.order_by(ActionApproval.approved_at))
+    return list(result.scalars())
+
+
+async def get_tool_call(session: AsyncSession, idempotency_key: str) -> ToolCall | None:
+    result = await session.execute(
+        select(ToolCall).where(ToolCall.idempotency_key == idempotency_key)
+    )
+    return result.scalar_one_or_none()
+
+
+async def start_tool_call(session: AsyncSession, start: ToolCallStart) -> ToolCall:
+    """Claim the idempotency key *before* the tool runs (DESIGN.md sections 7.1, 8.1).
+
+    The row is what makes at-most-once possible: a process that dies between this insert and
+    the result leaves a ``running`` row, which is a call whose outcome nobody knows. The
+    alternative - write the row after the call - cannot distinguish "never ran" from "ran and
+    we never heard", which for a refund is the whole question.
+    """
+    call = ToolCall(
+        idempotency_key=start.idempotency_key,
+        run_id=start.run_id,
+        step_id=start.step_id,
+        node_id=start.node_id,
+        tool=start.tool,
+        args=start.args,
+        risk=start.risk,
+        status=start.status,
+        created_at=start.created_at,
+        updated_at=start.created_at,
+        attempts=1,
+    )
+    session.add(call)
+    await session.flush()
+    return call
+
+
+async def finish_tool_call(
+    session: AsyncSession,
+    tool_call_id: uuid.UUID,
+    *,
+    status: str,
+    when: datetime,
+    result: dict[str, Any] | None = None,
+    context_patch: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> None:
+    await session.execute(
+        update(ToolCall)
+        .where(ToolCall.id == tool_call_id)
+        .values(
+            status=status,
+            result=result,
+            context_patch=context_patch,
+            error=error,
+            finished_at=when,
+            updated_at=when,
+        )
+    )
+
+
+async def reenter_tool_call(
+    session: AsyncSession, tool_call_id: uuid.UUID, *, status: str, when: datetime
+) -> None:
+    """Record another pass over an existing key: a retry, or a refusal to retry."""
+    await session.execute(
+        update(ToolCall)
+        .where(ToolCall.id == tool_call_id)
+        .values(status=status, attempts=ToolCall.attempts + 1, updated_at=when)
+    )
+
+
+async def set_tool_call_approval(
+    session: AsyncSession, tool_call_id: uuid.UUID, approval_id: uuid.UUID
+) -> None:
+    await session.execute(
+        update(ToolCall).where(ToolCall.id == tool_call_id).values(approval_id=approval_id)
+    )
+
+
+async def tool_calls_for_run(session: AsyncSession, run_id: uuid.UUID) -> list[ToolCall]:
+    """Every tool call of a run, in order. The join phase-0 finding F6 asked for."""
+    result = await session.execute(
+        select(ToolCall).where(ToolCall.run_id == run_id).order_by(ToolCall.created_at, ToolCall.id)
+    )
+    return list(result.scalars())
+
+
+async def patch_customer_context(
+    session: AsyncSession, conversation_id: uuid.UUID, customer: dict[str, Any]
+) -> None:
+    """Replace ``conversation.context->'customer'`` (DESIGN.md sections 10, 19 step 9).
+
+    Surgical rather than a whole-document write: ``context`` also carries the entry graph's
+    inputs and whatever a channel put there, none of which a tool has any business rewriting.
+    """
+    await session.execute(
+        text(
+            "UPDATE conversation "
+            "SET context = jsonb_set(COALESCE(context, '{}'::jsonb), '{customer}', "
+            "                        CAST(:customer AS jsonb), true) "
+            "WHERE id = :id"
+        ),
+        {"customer": json.dumps(customer), "id": conversation_id},
+    )
 
 
 async def due_runs(session: AsyncSession, now: datetime, limit: int = 100) -> list[Run]:
