@@ -1,0 +1,19 @@
+{
+  "title": "Acme Billing support",
+  "pack": "packs/acme_billing",
+  "provider": "auto",
+  "cassette_dir": "tests/cassettes",
+  "new_conversation_context": {
+    "customer": {
+      "ref": "cus_acme_1",
+      "name": "Sam",
+      "email": "me@example.com"
+    }
+  },
+  "suggestions": [
+    "I got charged twice for the Pro Plan this month; can I have one of them back?",
+    "The code is 581139.",
+    "Yes please, go ahead and refund it.",
+    "No, that is all. Thanks!"
+  ]
+}

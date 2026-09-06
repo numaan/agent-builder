@@ -27,7 +27,7 @@ see a message a guardrail would have stopped.
 
 import re
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -168,16 +168,6 @@ class WebChatAdapter:
         )
 
 
-def history_events(
-    rows: Iterable[tuple[str, str, str]],
-) -> list[dict[str, Any]]:
-    """``(author, text, status)`` triples as the client's history entries."""
-    return [
-        {"author": author, "text": text, "pending": status == "pending"}
-        for author, text, status in rows
-    ]
-
-
 class AwaitingSummary(BaseModel):
     """What the run is waiting for, in the little the client is allowed to know.
 
@@ -190,7 +180,12 @@ class AwaitingSummary(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: str = "ask"
+    kind: str = "question"
+    """``confirm`` when a ``confirm`` node is waiting for the customer's explicit yes, and
+    ``question`` for every other node that is. Anything else - a run parked for a human, say -
+    keeps the engine's own word for it (``handoff``), because a client that shows a customer
+    "waiting" wants to know which kind of waiting this is."""
+
     node: str | None = None
     tool: str | None = None
 
@@ -200,10 +195,11 @@ class AwaitingSummary(BaseModel):
             return None
         detail = awaiting.get("detail")
         detail = detail if isinstance(detail, Mapping) else {}
-        kind = detail.get("kind") or awaiting.get("kind") or "ask"
+        waiting_on_a_node = awaiting.get("kind") == "node"
+        kind = detail.get("kind") or ("question" if waiting_on_a_node else awaiting.get("kind"))
         node = awaiting.get("node") or detail.get("node")
         return cls(
-            kind=str(kind),
+            kind=str(kind or "question"),
             node=str(node) if node is not None else None,
             tool=str(detail["tool"]) if isinstance(detail.get("tool"), str) else None,
         )

@@ -63,7 +63,7 @@ def test_the_protocol_is_exactly_the_three_methods_the_design_names() -> None:
     A fourth method added for the convenience of one transport is how a protocol stops being
     one; if a later phase needs one, this test is where the decision gets made deliberately.
     """
-    attrs: set[str] = getattr(ChannelAdapter, "__protocol_attrs__")
+    attrs: set[str] = ChannelAdapter.__protocol_attrs__  # type: ignore[attr-defined]
     assert attrs == {
         "channel",
         "conversation_key",
@@ -318,7 +318,7 @@ def test_a_waiting_confirm_is_visible_to_the_client_without_its_hash() -> None:
     it is happening. The argument hash is the engine's binding and stays there."""
     summary = AwaitingSummary.of(
         {
-            "kind": "customer_message",
+            "kind": "node",
             "node": "confirm_refund",
             "frame_seq": 2,
             "detail": {
@@ -337,8 +337,12 @@ def test_a_waiting_confirm_is_visible_to_the_client_without_its_hash() -> None:
 
 
 def test_an_ordinary_question_is_not_reported_as_a_confirmation() -> None:
-    summary = AwaitingSummary.of({"kind": "customer_message", "node": "ask_code", "detail": {}})
+    summary = AwaitingSummary.of({"kind": "node", "node": "ask_code", "detail": {}})
     assert summary is not None
-    assert summary.kind == "customer_message"
+    assert summary.kind == "question"
     assert summary.tool is None
     assert AwaitingSummary.of(None) is None
+
+    parked = AwaitingSummary.of({"kind": "handoff", "reason": "engine_error"})
+    assert parked is not None
+    assert parked.kind == "handoff"

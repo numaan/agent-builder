@@ -155,6 +155,35 @@ class Cassette:
         return cassette
 
 
+def load_cassettes(directory: Path) -> Cassette:
+    """Every ``*.json`` cassette in a directory, merged into one.
+
+    What a *service* replaying recorded conversations needs, as against a test, which replays
+    one: a person typing at the running application picks which recorded conversation to have,
+    and the provider has to hold all of them. Merging is safe because the key is the request
+    fingerprint - two recordings of the same request are the same recording - and a genuine
+    disagreement about one fingerprint is refused rather than resolved by directory order.
+    """
+    merged = Cassette(description=f"every cassette in {directory}", path=directory)
+    origin: dict[str, Path] = {}
+    for path in sorted(directory.glob("*.json")):
+        cassette = Cassette.load(path)
+        for key, interaction in cassette.interactions.items():
+            seen = merged.interactions.get(key)
+            if seen is not None and seen.response != interaction.response:
+                msg = (
+                    f"{path} and {origin[key]} record different responses for the same request "
+                    f"{key}; one of them is stale"
+                )
+                raise ValueError(msg)
+            merged.interactions[key] = interaction
+            origin[key] = path
+    if not merged.interactions:
+        msg = f"no cassettes in {directory}: nothing to replay"
+        raise ValueError(msg)
+    return merged
+
+
 class RecordingProvider(StructuredByCompletion):
     """Wrap any provider and write everything it answers into a cassette.
 

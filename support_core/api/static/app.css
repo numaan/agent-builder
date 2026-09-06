@@ -1,0 +1,246 @@
+/* The demo client's styles. No framework, no build step, no web font: everything the page
+   needs is served by this application, so it works with no network. */
+
+:root {
+  color-scheme: light dark;
+  --ink: #16181d;
+  --paper: #f6f7f9;
+  --card: #ffffff;
+  --line: #d9dce3;
+  --muted: #5d6470;
+  --agent: #eef1f6;
+  --customer: #1f6feb;
+  --customer-ink: #ffffff;
+  --warn-line: #b8860b;
+  --warn-bg: #fff8e2;
+  --warn-ink: #4a3a05;
+  --ok: #1a7f37;
+  --busy: #b8860b;
+  --stop: #b42318;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #e8eaee;
+    --paper: #14161a;
+    --card: #1c1f25;
+    --line: #333944;
+    --muted: #9aa3b2;
+    --agent: #242932;
+    --customer: #2f6fd0;
+    --warn-bg: #35300f;
+    --warn-ink: #f2e4b4;
+    --warn-line: #c9a227;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+}
+
+.bar-left,
+.bar-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.dot[data-state="open"] {
+  background: var(--ok);
+}
+.dot[data-state="connecting"] {
+  background: var(--busy);
+}
+.dot[data-state="closed"] {
+  background: var(--stop);
+}
+
+.tag,
+.status {
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 9px;
+  white-space: nowrap;
+}
+
+button {
+  font: inherit;
+  color: var(--ink);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 12px;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: var(--muted);
+}
+
+main {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+.transcript {
+  list-style: none;
+  margin: 0 0 14px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 40vh;
+}
+
+.turn {
+  max-width: 82%;
+  padding: 9px 13px;
+  border-radius: 14px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.turn.agent {
+  background: var(--agent);
+  border: 1px solid var(--line);
+  align-self: flex-start;
+  border-bottom-left-radius: 4px;
+}
+
+.turn.customer {
+  background: var(--customer);
+  color: var(--customer-ink);
+  align-self: flex-end;
+  border-bottom-right-radius: 4px;
+}
+
+.turn.pending {
+  opacity: 0.65;
+}
+
+.approval {
+  border: 2px solid var(--warn-line);
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+  border-radius: 12px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+}
+
+.approval h2 {
+  margin: 0 0 6px;
+  font-size: 17px;
+}
+
+.approval p {
+  margin: 0 0 8px;
+}
+
+.approval-tool code {
+  font-weight: 700;
+}
+
+.approval blockquote {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--card);
+  color: var(--ink);
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  white-space: pre-wrap;
+}
+
+.suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.suggestions button {
+  font-size: 13px;
+  text-align: left;
+  color: var(--muted);
+}
+
+.composer {
+  display: flex;
+  gap: 8px;
+}
+
+.composer input {
+  flex: 1;
+  font: inherit;
+  color: var(--ink);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.composer input:focus,
+button:focus-visible {
+  outline: 2px solid var(--customer);
+  outline-offset: 1px;
+}
+
+.note {
+  min-height: 1.5em;
+  margin: 10px 2px 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.note.warn {
+  color: var(--stop);
+}
+
+.foot {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 4px 16px 24px;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}

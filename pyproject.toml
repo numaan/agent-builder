@@ -25,6 +25,11 @@ dependencies = [
   "pyyaml>=6.0",
   "click>=8.1",
   "packaging>=24",
+  # The service of DESIGN.md 4.1 has to be startable from the library that defines it, and its
+  # web chat channel (section 12) is a WebSocket: uvicorn serves the app and `websockets` is the
+  # protocol implementation it uses for one. Both are also what the api tests drive.
+  "uvicorn>=0.30",
+  "websockets>=12",
 ]
 
 [project.optional-dependencies]
@@ -62,7 +67,7 @@ python_version = "3.12"
 strict = true
 warn_unreachable = true
 plugins = ["pydantic.mypy"]
-files = ["support_core", "tests", "packs"]
+files = ["support_core", "tests", "packs", "app.py"]
 # Name modules by their path from the repo root (packs.acme_billing.tools), so a second
 # pack's tools/__init__.py is not a duplicate top-level module named `tools`.
 explicit_package_bases = true

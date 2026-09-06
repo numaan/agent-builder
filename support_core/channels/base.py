@@ -30,7 +30,6 @@ fields a transport can legitimately need has neither problem.
 """
 
 import uuid
-from collections.abc import Mapping
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -155,8 +154,3 @@ class ChannelAdapter(Protocol):
         customer sees text that a guardrail (phase 7) would later have stopped.
         """
         ...
-
-
-def as_metadata(raw: Mapping[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
-    """The named keys of a payload, for :attr:`InboundMessage.metadata`."""
-    return {key: raw[key] for key in keys if key in raw}
