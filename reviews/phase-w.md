@@ -427,3 +427,146 @@ A script then drove the four recorded messages over a real websocket to
 The phase W exit criterion holds: `create_app(load_pack("packs/acme_billing"))` starts and a
 websocket client completes the phase-4 refund flow end to end, including the confirmation step,
 against the recorded provider.
+
+---
+
+## Independent review
+
+Reviewer: a separate agent that did not write this code. PLAN.md step 4, against DESIGN.md 4.1,
+7.1 to 7.3, 12 and 14, the Phase W backlog checklist and its exit criterion, and the current
+state of the tree (`c589c70`), not the state at which phase W was committed.
+
+**Verdict.** The core of the phase is sound and the exit criterion holds independently: I started
+`app:app` on a free port against a database nothing else was using, drove the four-message refund
+conversation over a real WebSocket, and got the identity gate, the confirmation panel's
+`awaiting: {kind: confirm, node: confirm_refund, tool: issue_refund}`, the refund, and `done` -
+with exactly one `action_approval` row, bound to run, frame, confirm node and step, its arguments
+hashed and consumed by exactly one `tool_call`. The channel boundary itself held every attack I
+made on it: a forged key opens a new conversation rather than reaching one, a frame that carries
+somebody else's `session` is overridden by the connection's, `extra="forbid"` refuses
+`customer_ref` and `identity_verified`, the length cap holds, a socket that dies mid-turn does not
+disturb the turn, twelve simultaneous callers on one key get one conversation, and nothing the
+socket sends carries an approval hash, tool arguments, prompt text or a stack trace. The
+queue-and-return path is real: twelve concurrent messages on one conversation returned in 0.43 s
+total with eleven `202 queued`, and six conversations at once did not serialise. Every command in
+the orchestrator's verification section reproduces. What stops this being a clean pass is not the
+channel but what has been mounted beside it: `create_app` serves phase 6's **desk API on the same
+port as the customer chat, with no authentication and `serve_desk` defaulting to on**, so any
+browser that can open the demo page can list every conversation in the deployment, read another
+customer's whole transcript and handoff packet, and post into it - no session key needed. That is
+a live exposure on the surface being demoed, and it is not covered by the deferred phase-W auth
+finding, whose stated premise ("phase 7 ... adds a desk API where the same gap would expose
+somebody else's conversation") was overtaken when phase 6 shipped that desk early and on by
+default. Two smaller must-fixes and nine should-fixes follow. The verification section itself is
+honest apart from one phantom finding: the README never said `/health`.
+
+### Findings
+
+| id | severity | location | finding | suggested fix |
+|----|----------|----------|---------|---------------|
+| W1 | must-fix | `support_core/api/config.py:114`, `support_core/api/app.py:145-147` | The desk API is mounted on the customer-facing app, on the same port and origin, unauthenticated, and `serve_desk` defaults to `True`. Reproduced against a running server with no credentials: `GET /desk/handoffs` enumerated every conversation in the database (conversation id, run id, queue, reason, SLA); `GET /desk/handoffs/{id}` returned another conversation's full packet including its internal failure detail, prompt hash and filesystem path; `GET /desk/conversations/{id}/transcript` returned another customer's entire transcript. `POST /desk/handoffs/{id}/{reply,resume,close}` writes into another conversation, and `POST .../approve` is the human half of `requires_human_approval` - so a customer can supply both signatures on their own action, which is the one property a second signature exists to have. | Default `serve_desk` to `False`, and require a bearer token or mTLS on the `/desk` router before it can be turned on. Better: give the desk its own `create_desk_app` on its own port, so "the same API surface" (DESIGN.md 12) does not mean the same listener. |
+| W2 | must-fix | `support_core/api/app.py:258` | A binary WebSocket frame where text is expected raises an unhandled `KeyError: 'text'` out of `socket.receive_text()`. The connection dies abnormally and Starlette logs a full ASGI traceback; an anonymous client can produce one per frame. The registry is cleaned up by the `finally`, so nothing is corrupted, but this is an uncaught exception on the phase's public entry point and no test sends a non-text frame. | Use `await socket.receive()` and branch on `"text" in message`, answering a binary frame with an error frame and `close(1003)`. |
+| W3 | should-fix | `support_core/api/app.py:292-297`, `support_core/api/runtime.py:190-204` | The `turn` frame - the only thing that carries `status` and `awaiting`, and therefore the only thing that raises the approval panel - is pushed to the *connection that sent the message*, and `announce` broadcasts only after a **drain**. Reproduced: with two sockets on one conversation, the sender got `message` + `turn`, the second got `message` only; the same holds for a turn run by the `POST` handler while a socket watches (which is what `test_a_message_posted_by_webhook_reaches_the_open_socket` asserts, without noticing). So a second tab, and any customer whose reply arrived on another transport, sees the refund proposal with no approval panel and a stale status pill - the exact moment the phase says it exists to demonstrate. | Broadcast the `turn` frame to the conversation (`connections.broadcast`) rather than pushing it to one connection; keep `queued` in the HTTP response, where it is per-caller, rather than in the frame. |
+| W4 | should-fix | `support_core/storage/repositories.py:216-238`, `:552-562` | Two inbound messages accepted concurrently on one conversation can be processed in the reverse of the order they were accepted. The pending queue orders by `created_at` - the *transaction start* timestamp - and every inbound row carries `ordinal = 0`, so the tie-break is a random UUID. Reproduced: two `POST`s issued together, first "I got charged twice...", second "The code is 581139."; the second was written 149 microseconds earlier, ran first, dead-ended the conversation into an `llm_unavailable` handoff, and the first message is still `pending` and will stay so. A single socket is serial and preserved order over eight rapid messages, so this is specific to the multi-caller burst that queue-and-return exists for. | Give `message` a per-conversation monotonic sequence assigned inside `enqueue_inbound` and order the pending queue by it. |
+| W5 | should-fix | `support_core/engine/executor.py:1952-1978`, `support_core/storage/repositories.py:552` | `deliver_pending` deliberately runs outside the conversation lock, and `pending_outbound` selects without `FOR UPDATE SKIP LOCKED`, so a desk `reply` concurrent with a turn's `_flush_outbound` reads the same `pending_send` rows in both transactions and delivers each message twice before either marks them `sent`. Web chat shows a duplicated bubble; phase 7's email adapter sends a duplicated email. | `SELECT ... FOR UPDATE SKIP LOCKED` in `pending_outbound`. |
+| W6 | should-fix | `support_core/engine/executor.py` (the 7.3 failure path), surfaced at `support_core/api/app.py:292` | On the turn where a node fails, the customer is told nothing at all. Reproduced: a message on a `done` conversation produced an `llm_unavailable` handoff and `waiting_human`, with **zero** outbound messages - the socket carried only a `turn` frame whose `status` changed. The *next* message is answered correctly ("Thank you - I have added that to the conversation..."), so phase 6's P6 fix works; the failing turn itself is silent. A web chat client can render the status; an email customer would get pure silence after asking a question. | Say the same "it is with one of our people" line on the turn that raises the handoff, not only on the ones queued behind it. |
+| W7 | should-fix | `support_core/channels/hub.py:100-112` | `conversation_for` returns `created=True` for every loser of a create race, because it only looks at whether *its own first read* missed. Reproduced: twelve concurrent `POST`s on one key produced one conversation and twelve responses saying `"created": true`. Harmless today (nothing branches on it) and exactly the flag phase 7's email adapter would branch on to send a greeting. | Catch the `IntegrityError` explicitly rather than with `suppress`, and set the flag from whether the insert actually committed. |
+| W8 | should-fix | `support_core/api/runtime.py:241-252` | Opening a WebSocket with any well-formed session key creates a durable `conversation` **and** `run` row before the customer has said anything, from an unauthenticated endpoint, with no rate limit. A loop of connects fills the table. Phase 7's email adapter has the same shape for bounce and delivery-receipt webhooks. | Resolve without creating on connect: send `ready` with a null conversation for an unknown key and create on the first message. |
+| W9 | should-fix | `support_core/api/app.py:236`, `support_core/api/static/app.js:70-73` | The session key is the whole of the access control (self-critique item 1) and it travels in the WebSocket **query string**, so it is written verbatim into the access log by uvicorn and would be into any proxy, CDN or APM log. Verified in the server log: `WebSocket /channels/web_chat/ws?session=ba7515fd7978306d7a29e0d4 [accepted]`. The deferred finding says "no auth"; it does not say the one secret is logged. | Accept the key in a `Sec-WebSocket-Protocol` value or in the first frame after `accept()`, and take it out of the URL. |
+| W10 | should-fix | `support_core/storage/repositories.py:565-581`, `support_core/api/runtime.py:280-303` | `transcript` returns outbound rows regardless of `status`, so `AppRuntime.state` shows a reconnecting client every committed message including any left `pending_send`. Today that is right (delivery is the only thing that can fail). It stops being right the moment phase 7 puts DESIGN.md 14's outbound guardrail at send time: the reconnect path reads rows directly and would show the customer text the guardrail had refused to deliver. The phase's promise - "a customer must never see text the outbound guardrails would have stopped" - holds only for the push path. | Filter `transcript` to `status = 'sent'` for outbound rows now, so the guardrail seam is not silently bypassed later. |
+| W11 | should-fix | `support_core/api/static/app.js:79`, `:95-102` | The client renders any author that is not `agent` as the **customer** - so a human's desk reply (`author = "human"`, which phase 6 deliberately made distinguishable "so an audit can tell the model's words from a human's") appears in the transcript styled and positioned as the customer's own message. It also does not update `state.lastAgentMessage`, so a confirmation panel raised after a desk reply quotes the wrong proposal. | Render three authors; use the last `agent` message for the panel, which it already tracks. |
+| W12 | nit | this file, "Verification run" | The recorded finding "the README's own instructions say `/health`; the endpoint is `/healthz`" is not reproducible. `git show 032fb6a:README.md` contains exactly one `/health` mention and it is `GET /healthz`; the current README is the same. Nothing was ever wrong and nothing was fixed. | Strike it. |
+| W13 | nit | this file, "Verification run" | The section's numbers are stale relative to the tree it is now read against: 1259 passed (now 1361), 9 pack warnings (now 18), migration head 0007 (now 0008). All three are phase 6 landing on top, not a regression, but a reader checking the phase against the repository finds three mismatches and no note saying why. | Date-stamp the table, or re-run it at resolution. |
+| W14 | nit | `support_core/api/config.py:38` | `RESOLVED = ("replay", "anthropic", "none")` is unused anywhere in the tree and no longer lists `glm`, which `resolve_provider` can return. Dead and wrong. | Delete it, or derive it from `ProviderChoice`. |
+| W15 | nit | `support_core/api/static/app.js:180-190` | A fatal error frame (`close(1008)` after a malformed `?session=`) is followed by the ordinary reconnect handler, which reconnects with the same bad key for ever, backing off to five seconds. `fatal` is sent by the server and ignored by the client. | Do not reconnect when the last frame said `fatal`. |
+| W16 | nit | `support_core/channels/base.py:92` | `InboundMessage.metadata` is written by nobody and read by nobody in the whole tree. As a seam it points the wrong way - see "Missed by self-critique". | Either drop it or make it reachable at send time. |
+
+### Channel boundary attempts
+
+Every scenario below was run against a real uvicorn server on port 8100 with
+`demo/acme_web_chat.json` and a private database, over real WebSocket and HTTP.
+
+| # | attempt | result |
+|---|---------|--------|
+| A1 | Connect with a guessed/forged session key (`aaaaaaaaaaaaaaaa`) | **Held.** A new, empty conversation; no history, `status: idle`. No path to an existing one. (It did create a row: W8.) |
+| A2 | Reconnect with another client's key | Full transcript returned, as designed - the key is a bearer token. Known, deferred; sharpened by W9 (the key is in the access log). |
+| A3 | Two sockets on one session key | Same conversation for both; both got the `message` frames. Only the sender got the `turn` frame - **W3**. |
+| A4 | Frame carrying somebody else's `session` (`{"type":"message","session":"<victim>","text":...}`) | **Held.** `_handle_frame` overwrites `payload["session"]` with the connection's; the turn landed on the attacker's own conversation. |
+| A5 | Frames shaped like another message type: `{"type":"ready"}`, `customer_ref`, `identity_verified`, a JSON array, non-JSON, no `text`, whitespace-only `text` | **Held.** Each answered with a non-fatal `error` frame naming the rejected field, socket stayed open. No identity field is accepted from a browser. |
+| A6 | Oversized frames: 4 001 and 400 000 characters | **Held.** Both refused with "at most 4000 characters". |
+| A7 | Binary frame where text is expected | **Broke.** Unhandled `KeyError: 'text'`, ASGI traceback, abnormal close - **W2**. |
+| A8 | Send after the conversation is `done` | Accepted, run went to `waiting_human` via a 7.3 handoff, and **no message was sent to the customer** - **W6**. No cross-conversation effect. |
+| A9 | Reconnect to a conversation parked `waiting_human` by phase 6's handoff, and speak into it | **Held and correct.** Transcript returned; the message was queued and acknowledged once with "it is with one of our people", and the run did not resume. |
+| A10 | Read every frame the socket sends for leakage (`ready`, `turn`, `message`, `error`) | **Held.** `awaiting` carries `kind`, `node`, `tool` and no `args_hash`; no tool arguments, no prompt text, no other customer's identifier, no stack trace, no internal paths. The only internal detail is the node id (`confirm_refund`, `classify`), which the client needs. |
+| A11 | Cross-conversation `POST /channels/web_chat/messages` with another key and `Origin: https://evil.example` | Wrote into that conversation. Known (no auth, no origin check), deferred to phase 7. |
+| A12 | Unauthenticated `/desk/*` from the customer origin | **Broke, badly.** Enumerated every conversation, read another customer's packet and transcript - **W1**. |
+| A13 | The confirm step's "yes" over the socket, checked against the approval chain | **Held.** One `action_approval` row, `approved_by: customer`, bound to run + frame + `confirm_refund` + step id, arguments hashed, `consumed_by_tool_call_id` set; exactly one `issue_refund` `tool_call`. No route around 8.2 from this channel. |
+
+### Concurrency attempts
+
+| # | attempt | result |
+|---|---------|--------|
+| C1 | Twelve simultaneous `POST`s on one new session key | One conversation (unique index held), eleven `202 queued`, one `200`, **0.43 s wall for all twelve** - no handler waited for the lock. All twelve inbound rows durable. `created` wrong on all twelve - **W7**. |
+| C2 | Six conversations started simultaneously | 0.44 s wall against a 0.10 s single-turn baseline: they do not serialise against each other. |
+| C3 | Client disconnects 50 ms into its own turn | Turn completed; the transcript on reconnect had the customer message and the agent's reply, nothing lost or duplicated. |
+| C4 | Eight messages sent back-to-back on one socket faster than turns complete | All eight present, **in order**, none lost or duplicated. |
+| C5 | Reconnect racing an in-flight turn | `ready` returned `status: running` with the partial history, then the new socket received the turn's `message` frame; the final transcript was correct. No loss, no duplicate. |
+| C6 | Two `POST`s issued together on one conversation, in a known order | **Reordered** - the second ran first and permanently parked the conversation - **W4**. |
+| C7 | Turn run by the drain worker with a socket watching | The watcher got the agent message *and* an announced `turn` frame. `on_drained` works; it is the non-drain path that does not (W3). |
+
+### Commands run
+
+| Command | Result |
+|---|---|
+| `ruff check .` (scratch dir excluded) | All checks passed |
+| `ruff format --check .` | 160 files already formatted |
+| `mypy` (strict) | Success: no issues found in 160 source files |
+| `pytest -q` | **1361 passed, 2 deselected, 493 s** (the section's 1259 predates phase 6) |
+| `pytest -m live -q` | 2 skipped, 1361 deselected (no `ANTHROPIC_API_KEY`) |
+| `pytest tests/verify_phase_2_resolution.py -q` | 39 passed, 130 s |
+| `support pack validate packs/acme_billing` | `acme-billing: well-formed (18 warning(s))`, exit 0 |
+| `alembic downgrade base` then `upgrade head` then `check` then `current` | clean; "No new upgrade operations detected"; head is **0008** |
+| `uvicorn app:app --port 8100` with `demo/acme_web_chat.json` on a private database | started; `GET /healthz` returned `{"status":"ok","provider":"replay","channels":["web_chat"],"database":"ok"}` and the pack fingerprint |
+| the four-message refund conversation over a real WebSocket to that server | reproduced end to end: identity gate, then `awaiting {kind: confirm, node: confirm_refund, tool: issue_refund}`, then "That is refunded...", then `done`; one approval, one `issue_refund` call |
+| README `/health` claim | **not reproducible**: `032fb6a:README.md` says `/healthz`, as does the current README (W12) |
+
+Everything else in the verification section reproduced. The demo servers on ports 8000 and 8001
+were not touched; the review used port 8100 and a `support_review` database created and dropped
+for the purpose.
+
+### Missed by self-critique
+
+The self-critique is unusually good - four of its six "where email will strain this protocol"
+items are exactly right, and its fragility list predicted W5's shape. What it missed:
+
+1. **`InboundMessage.metadata` points the wrong way, and is the email threading gap.** The
+   critique's item 5 worries that `conversation_key` is a pure function; the harder problem is
+   that `metadata` - the field an email adapter would put `Message-ID` and `References` in - is
+   written by nobody, read by nobody, and, decisively, **not reachable from `send`**. `send` is
+   given a `ConversationRef` built from the conversation *row*; nothing carries the inbound
+   message's transport headers to the outbound reply. An email adapter cannot set `In-Reply-To`
+   without its own second lookup, which is the thing the protocol was supposed to spare it.
+2. **`InboundMessage.customer_ref` is dropped on the way to the context.** The protocol carries
+   who the transport believes the sender is - which for email is the whole point of the `From`
+   header - and `conversation_for` seeds every new conversation from the single constant
+   `AppConfig.new_conversation_context` instead. `customer_ref` reaches
+   `conversation.customer_ref` and never reaches `ctx.customer`, which is what gates and prompts
+   read. The critique names the missing CRM seam (item 5) but not that the protocol already
+   carries half of what that seam needs and the hub discards it.
+3. **`send` cannot fail.** It returns `None`, and `ChannelHub.deliver` swallows every exception by
+   design, so an adapter has no way to say "this one is a permanent bounce, do not mark it sent".
+   The critique's email item 2 sees that a buffering adapter is recorded as having delivered what
+   it queued; the sharper version is that *no* adapter can refuse a delivery, so `mark_sent` is
+   unconditional for every channel, not only a buffering one.
+4. **The status of a turn reaches one socket, not the conversation** (W3). The critique reasons
+   carefully about message delivery being per-conversation and does not notice that the *state*
+   frame is per-connection - which breaks the one screen element the phase says it exists to show.
+5. **A non-text frame crashes the handler** (W2). "Which tests are weak" lists the JavaScript and
+   the missing crash tests; the transport's own frame types are not considered at all.
+6. **Two callers on one conversation can be reordered** (W4). The critique asserts the loser's
+   message is "durable, `pending` and in order"; the order is by transaction-start timestamp with
+   a random tie-break, and I reversed it.
+7. **The desk arrived early and unauthenticated on this surface** (W1). The critique correctly
+   files the auth gap under "for a demo on 127.0.0.1 that is honest" and points at phase 7 - but
+   phase 6 then mounted the desk on this app, default on, which turns a self-inflicted risk into
+   somebody else's data. That deferral needs re-opening, not re-deferring.
