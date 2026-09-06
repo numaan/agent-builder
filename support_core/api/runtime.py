@@ -41,6 +41,7 @@ from support_core.channels import (
 from support_core.channels.web_chat import AwaitingSummary
 from support_core.engine import Executor
 from support_core.engine.hooks import EngineHooks
+from support_core.engine.types import OutboundMessage
 from support_core.graph.context import ConversationContext
 from support_core.graph.manifest import Channel
 from support_core.graph.pack import Pack
@@ -54,6 +55,9 @@ from support_core.llm.wiring import (
 from support_core.memory import LlmSummarizer
 from support_core.storage import repositories as repo
 from support_core.storage.session import make_engine
+
+SEND_FAILURES_KEPT = 50
+"""How many delivery failures :attr:`AppRuntime.send_failures` remembers."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +128,24 @@ def _check_context(context: Mapping[str, Any]) -> dict[str, Any]:
     return dict(context)
 
 
+def _check_channels(pack: Pack, adapters: Sequence[ChannelAdapter]) -> None:
+    """Serve only the channels the pack enabled (DESIGN.md section 12).
+
+    "Packs enable channels in ``pack.yaml``." A service that answered on a channel its pack
+    never declared would run that pack's workflows under timeouts, a persona and a policy set
+    written for somewhere else - and the manifest is where a pack author says which somewhere
+    that is.
+    """
+    declared = set(pack.manifest.channels)
+    undeclared = sorted({adapter.channel for adapter in adapters} - declared)
+    if undeclared:
+        msg = (
+            f"pack {pack.manifest.id!r} does not enable {undeclared}; its pack.yaml declares "
+            f"{sorted(declared)}"
+        )
+        raise ConfigError(msg)
+
+
 @dataclass(slots=True)
 class AppRuntime:
     """The service's moving parts, built once per application."""
@@ -139,9 +161,11 @@ class AppRuntime:
     llm: LlmService | None
     owns_engine: bool
     send_failures: list[str] = field(default_factory=list)
-    """Deliveries a transport refused, most recent last. Phase 7 replaces this with the metrics
-    and structured logs of DESIGN.md section 15; until then it is what makes a dropped delivery
-    visible at all rather than silent."""
+    """Deliveries a transport refused, most recent last, capped at :data:`SEND_FAILURES_KEPT`.
+
+    Phase 7 replaces this with the metrics and structured logs of DESIGN.md section 15; until
+    then it is what makes a dropped delivery visible at all rather than silent. Capped because a
+    service runs for weeks and an unbounded list of every failed delivery is a leak."""
 
     async def start(self) -> None:
         self.drainer.on_drained = self.announce
@@ -273,18 +297,20 @@ def build_runtime(
 
     connections = ConnectionRegistry()
     chosen = list(adapters) if adapters is not None else [WebChatAdapter(connections)]
+    _check_channels(pack, chosen)
     for adapter in chosen:
         registry = getattr(adapter, "connections", None)
         if isinstance(registry, ConnectionRegistry):
             connections = registry
     failures: list[str] = []
-    hub = ChannelHub(
-        executor,
-        chosen,
-        on_send_error=lambda conversation, message, error: failures.append(
-            f"{conversation.id}: {type(error).__name__}: {error}"
-        ),
-    )
+
+    def note_failure(
+        conversation: ConversationRef, message: OutboundMessage, error: Exception
+    ) -> None:
+        failures.append(f"{conversation.id}: {type(error).__name__}: {error}")
+        del failures[:-SEND_FAILURES_KEPT]
+
+    hub = ChannelHub(executor, chosen, on_send_error=note_failure)
     # The hook and the hub each need the other: the hub sends through the executor's
     # conversations, the executor sends through the hub. Binding after construction is the
     # honest way round it, and it is what makes `hooks.send` a channel rather than a stub.

@@ -71,10 +71,10 @@ async def test_the_client_page_is_served_and_needs_no_network(engine: AsyncEngin
     assert "text/html" in page.headers["content-type"]
     for asset in (script, style):
         assert asset.status_code == 200
-    body = page.text
-    assert "//fonts." not in body
-    assert "https://" not in body
-    assert "http://" not in body
+    for body in (page.text, script.text, style.text):
+        assert "//fonts." not in body
+        assert "https://" not in body
+        assert "http://" not in body
 
 
 async def test_a_message_posted_to_the_webhook_runs_a_turn(engine: AsyncEngine) -> None:

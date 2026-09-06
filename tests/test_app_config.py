@@ -20,6 +20,7 @@ from support_core.api.config import (
     ProviderChoice,
 )
 from support_core.api.runtime import build_provider
+from support_core.channels import InboundMessage
 from support_core.llm.recording import Cassette, load_cassettes
 from support_core.llm.types import CompletionRequest, CompletionResponse, SystemBlock
 from tests.app_support import ACME, CASSETTES, DEMO_CONFIG, TEST_PACKS
@@ -155,3 +156,33 @@ def test_a_context_that_is_a_customer_record_is_accepted() -> None:
     assert runtime.config.new_conversation_context["customer"]["ref"] == "cus_acme_1"
     assert runtime.provider_name == "none"
     assert runtime.llm is None
+
+
+def test_a_channel_the_pack_did_not_enable_is_not_served() -> None:
+    """DESIGN.md section 12: "Packs enable channels in ``pack.yaml``."
+
+    ``queue_pack`` declares ``web_chat`` only, so an email adapter is refused rather than served
+    under a pack whose timeouts, persona and policies were written for a browser.
+    """
+
+    class Mail:
+        channel = "email"
+
+        def conversation_key(self, raw: object) -> str:  # pragma: no cover - never reached
+            raise NotImplementedError
+
+        async def parse_inbound(self, raw: object) -> InboundMessage:  # pragma: no cover
+            raise NotImplementedError
+
+        async def send(self, conversation: object, msg: object) -> None:  # pragma: no cover
+            raise NotImplementedError
+
+    config = AppConfig(pack=QUEUE_PACK, provider="none")
+    with pytest.raises(ConfigError, match="does not enable"):
+        build_runtime(load_pack(QUEUE_PACK), config, adapters=[Mail()])
+
+
+def test_the_sample_pack_enables_web_chat() -> None:
+    runtime = build_runtime(load_pack(ACME), AppConfig(pack=ACME, provider="none"))
+    assert sorted(runtime.hub.adapters) == ["web_chat"]
+    assert "web_chat" in load_pack(ACME).manifest.channels
