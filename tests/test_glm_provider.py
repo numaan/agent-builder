@@ -134,3 +134,30 @@ def test_a_string_that_is_not_json_still_fails_loudly() -> None:
         model.model_validate(
             {"decision": "refund", "state_updates": "not json at all", "confidence": 0.9}
         )
+
+
+def test_the_word_null_as_a_message_means_no_message() -> None:
+    """GLM spelled an absent message as the text "null"; the customer was shown that word."""
+    from support_core.llm.schemas import build_node_output_model
+
+    model = build_node_output_model("classify", ["refund"], None)
+    for sent in ("null", "NULL", "  null  ", None):
+        answer = model.model_validate(
+            {"message_to_customer": sent, "decision": "refund", "confidence": 0.9}
+        )
+        assert answer.message_to_customer is None
+
+
+def test_a_real_message_containing_that_word_is_left_alone() -> None:
+    from support_core.llm.schemas import build_node_output_model
+
+    model = build_node_output_model("classify", ["refund"], None)
+    answer = model.model_validate(
+        {
+            "message_to_customer": "The field came back null, so I checked again.",
+            "decision": "refund",
+            "confidence": 0.9,
+        }
+    )
+    assert answer.message_to_customer is not None
+    assert "null" in answer.message_to_customer

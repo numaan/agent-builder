@@ -31,6 +31,22 @@ class LlmNodeOutput(BaseModel):
     message_to_customer: str | None = Field(
         default=None, description="What to say to the customer, or null to say nothing."
     )
+
+    @field_validator("message_to_customer", mode="before")
+    @classmethod
+    def _saying_nothing_is_not_a_message(cls, value: Any) -> Any:
+        """A model that writes ``null`` as *text* means the field is empty, not that word.
+
+        Found on the first live GLM run: the first thing the customer was shown was the word
+        "null". The model had answered correctly - the decision and confidence were right - and
+        had spelled the absent message as the four characters of its JSON name rather than as
+        JSON null. Sending that to a customer is worse than sending nothing, and nothing is what
+        it meant. Only an exactly-equal, case-insensitive ``null`` is read this way: a message
+        that merely contains the word is a real message and is left alone.
+        """
+        if isinstance(value, str) and value.strip().lower() == "null":
+            return None
+        return value
     decision: str = Field(description="One of the allowed decision labels, exactly as written.")
     state_updates: dict[str, Any] = Field(
         default_factory=dict, description="Values to write into the workflow state."
