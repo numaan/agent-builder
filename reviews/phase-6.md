@@ -603,3 +603,112 @@ on, and it was right that the answer is "it holds". What it missed:
 **Verdict: 1 must-fix, 6 should-fix, 3 nits.** The interrupt machinery and the frame stack are
 sound and I could not get past a gate or an approval with them. Fix P1 before the desk is exposed
 to anything, and P2 before the sample pack's promise is demonstrated to anyone.
+
+## Resolution
+
+Resolver: a fresh agent that wrote none of the phase-6 code, 2026-09-06 (PLAN.md step 5). The
+must-fix is fixed with three regression tests that fail against the reviewed code; every
+should-fix is fixed, none was deferred whole; both nits that were a few safe lines are fixed and
+the third (P10) is a checklist line where it belongs. The review itself was committed first as
+`7323080` (it was sitting uncommitted), and its own verification-numbers correction landed
+alongside as `42c81e6`.
+
+Two findings did not turn out to be quite what the review said, and both are recorded as what
+they were rather than as what was reported: **P5** does not reproduce (a re-presented proposal
+writes no approval at all - `ConfirmRunner` records one on a *yes*, and `ACME_INTERRUPT_SWITCH`
+leaves exactly one row for `confirm_refund`), and the **suite deadlock** turned out to be a quick
+safe fix rather than a backlog line.
+
+| id | severity | action | commit |
+|----|----------|--------|--------|
+| P1 | must-fix | **Fixed.** `Executor._check_patch` validates a desk `resume` patch against the declared state model of the frame the run is suspended in, *before* anything is written, and refuses with the offending field names and the fields the graph declares. Two further rules it enforces: `identity_verified` is refused whatever a graph declares (DESIGN.md 10 gives it to `verify_identity` alone, through a tool - the rule `AppConfig` is already held to), and a patch is refused with 409 while an approval is live on that frame, because the proposal the customer agreed to was computed from the state it would edit and the desk's one route to an action is `approve`. `check_state_patch` is the same check without the lock, so the desk refuses before it writes the human's parting message into the transcript. Three regression tests in `tests/test_desk_api.py`; **all three fail against the reviewed code**, and the first is the reviewer's own repro, `{"identity_verified": true, "not_a_field": "x"}` - which left `frames[-1].state == {"not_a_field": "x", "identity_verified": true}` and a `pack_incompatible` handoff, and now leaves a 400 and a run that has not moved. The `desk.py` docstring that stated the opposite of what the code did now says what it does. | b660e1e |
+| P2 | should-fix | **Fixed.** `HandoffHook` now answers whether a human was actually told: `HandoffService.deliver` returns it, `no_handoff` returns `False` (an engine with no desk configured has told nobody), and a `CompositeSink` partial failure counts as delivered, because a webhook down while the Postgres row was written is still a page a desk can find. When nothing took the packet, core **replaces** the pack's sentence with `HANDOFF_UNDELIVERED_MESSAGE`, which claims only what is still true - the run is parked, the conversation is saved, nobody has it yet - and promises nothing about when, because the thing that would have paged a person is the thing that failed. `test_a_queue_that_is_down_does_not_promise_a_specialist` drives the sample pack's whole account-question conversation with every sink refusing and asserts no queue row, `queued=False`, and no "billing specialist". The durable half - an `undelivered` row and a sweep - is deferred to phase 7 with a checklist line, which is where the reviewer put it. | 35f7382 |
+| P3 | should-fix | **Fixed.** `pack.yaml`'s `llm.confidence_threshold` gates the interrupt decision, as it already gates an `llm` node's decision and a `confirm` node's yes. `cancel` and `new_intent` are the only two answers the engine acts on and both are destructive; below the threshold it does not act and does not pretend it understood - one core sentence, a hint on the `ResumeEvent` so a slot extractor does not read the reply as an answer, and the node that asked the question asks it again. Two parametrised tests. Every recorded interrupt-check confidence in the seven cassettes is 0.9 or higher against a threshold of 0.4, so no prompt changed and no cassette was regenerated. | 09d3f73 |
+| P4 | should-fix | **Fixed.** `approve` resolves the approval *from the packet*: the handoff's `run_id`, and the confirm node, tool and arguments the packet's `pending_action` showed - all four - and only while the handoff is `open`. A packet that showed nothing, or showed an unfinished call, signs nothing and says to re-read the handoff. The existing test signed an approval written *after* the packet was built, which is the bug rather than the feature; it now writes the proposal first, which is the order the real `requires_human_approval` path has, and a second test covers the three ways the old endpoint could sign the wrong thing. | 754ff96 |
+| P5 | should-fix | **Not reproduced as written; the invariant is enforced anyway.** A parked `confirm` re-presenting its proposal writes no `ActionApproval`: `ConfirmRunner` records one on a *yes*, not when it presents, and `ACME_INTERRUPT_SWITCH` leaves exactly one row for `confirm_refund`, not two. The shape behind the finding is real - a confirm re-entered in one frame and answered yes twice would leave two live rows for one run, frame, node, tool and hash - so `record_approval` now supersedes the frame's earlier live approvals for that node in the same statement batch as the insert, and therefore in the same checkpoint transaction. Scoped by `approved_by`, so the human half of a `requires_human_approval` pair does not cancel the customer half it countersigns. The superseded row is kept with `consumed_by_tool_call_id` NULL: spent by nothing, which is what superseded means. | 2286347 |
+| P6 | should-fix | **Fixed, both halves the reviewer named.** The refusal stands - a customer message on a run parked `waiting_human` still stays `pending`, because a topic change must not smuggle a workflow past the person it was escalated to - but the ending changed. The desk's handoff view now carries `waiting_messages`, everything the customer has said since the handoff was raised (`repo.pending_inbound`), and the engine says one sentence, once per parking, recorded on `run.awaiting`. `test_a_customer_message_on_a_parked_run_is_answered_and_shown_to_the_desk` sends two messages and asserts one acknowledgement, two rows on the desk, and both still queued. The SLA half - counting a queued message against the handoff's deadline - is deferred to phase 7 as a nit, since phase 7 owns the metrics and the scheduler. | 754ff96 |
+| P7 | should-fix | **Fixed by the reviewer's second option: DESIGN.md 7.3 is amended to two tiers.** "Otherwise the frame's `on_error` graph" is removed, with the amendment and its reasons inline in the design and in the decisions log. Three phases running recorded it as unimplemented and argued nothing needed it; the reviewer's point was that the argument had to end. Graphs have no `on_error` key, no error `FrameKind` exists, nothing the engine can raise at frame level is beyond a node-level edge, and the fall-through now reaches a real packet carrying the failure's own reason rather than a bare status. Adding the tier later is additive and needs a use case first. `_route_error`'s docstring says two tiers rather than apologising for one. | b8e2c8e |
+| P8 | nit | **Fixed**, without a field on the frame. The label is derived at offer time from the root graph's own declared edges (`Executor._label_for`, over the same `workflow_intents` the check and the validator share), so "shall we go back to *update address*?" reads from the pack's vocabulary, and it falls back to the graph id for a parked frame the root declares no edge to. No stored state, no migration. | 754ff96 |
+| P9 | nit | **Fixed.** `record_human_approval`'s `ValueError` for an unbound template approval is a 409 carrying its own message, not a 500. | 754ff96 |
+| P10 | nit | **Fixed where it belongs**: a phase-7 checklist line on `conversation_replay` naming `__interrupt_return__` and its three core-only edges, so replay handles the reserved id rather than discovering it. | b8e2c8e |
+| the fixture deadlock | (reviewer asked for a backlog line) | **Fixed instead - it was a few safe lines.** The per-test `TRUNCATE ... RESTART IDENTITY CASCADE` takes an `AccessExclusiveLock` on every mapped table, so anything holding a `RowShareLock` on some of them deadlocks it and the rest of the file fails behind it. `tests/conftest.py` now sets `lock_timeout` and retries on `deadlock_detected`/`lock_not_available`, which is the documented remedy; verified two ways against a held reader - waiting 1.66 s behind a live transaction and then succeeding, and retrying past a forced 300 ms `lock_timeout` and then succeeding. The *other* half - another process truncating rows out from under a running test - no retry can fix, and it is recorded against phase-0 finding N9, which was deferred for exactly the session-long lock that would. | b8e2c8e |
+
+### Deferred, each with a checklist line in the owning phase
+
+- **[phase 7] P2's durable half.** A handoff no sink would take is visible only in
+  `HandoffService.failures`, a per-process list nothing sweeps. The customer-facing half is
+  closed; a durable `handoff.status = 'undelivered'` row and a retry need the scheduler phase 7
+  owns.
+- **[phase 7] P6's SLA half.** A queued customer message is acknowledged and shown, but nothing
+  counts it against the handoff's deadline or re-prioritises the queue.
+- **[phase 7] Spans, and a cheaper model, for the two new out-of-node model calls.** The
+  interrupt check and the handoff summary have no `node` parent for section 15's `llm_call` span,
+  and the check has no `llm.interrupt_model` to run on because the per-node `model:` override
+  cannot reach it. Both from the reviewer's forward-compatibility section.
+- **[phase 5] A retriever seam through `gather()` and `HandoffSummaryRequest`**, so
+  `HandoffPacket.citations` stops being an empty shape - named now so phase 5 does not invent a
+  second one.
+
+### The reviewer's two attempt matrices, re-run
+
+Re-run as the review's logs describe them, against `tests/packs/interrupt_pack` and the sample
+pack, with the real executor and real Postgres. Scratch tests again, deleted again: sixteen of
+the nineteen as a scratch file (`14 passed`, three attempts sharing a test), and attempts 10, 16
+and 18 through the committed tests that already *are* those matrices
+(`tests/test_interrupt_check_schema.py`, `tests/test_desk_api.py`,
+`tests/test_prompt_injection_matrix.py`: `457 passed` together).
+
+| | before | after |
+|---|---|---|
+| Interrupt bypass (attempts 1-10) | 9 held, 1 broken (#9's frame write) | **10 held** |
+| Crash and handoff (attempts 11-19) | 7 held, 2 broken (#15, #19) | **9 held** |
+
+**Nothing that held before fails now**, and in particular no interrupt reaches a guarded action:
+attempt 1 still ends `root/alpha/gated/verify` with `protected` absent from the trace; attempt 2
+still defers `gated` twice from inside the gate's own redirect and never reaches `protected`;
+attempts 11 to 13 kill at `claim_before_commit`, `before_node` and `after_checkpoint` and each
+re-drains with `protected` absent and no inbound message left pending; and attempt 5's
+`ACME_INTERRUPT_SWITCH` still authorises exactly one refund with exactly one approval, with
+nothing left live afterwards.
+
+Three attempts changed outcome for the better and two changed shape:
+
+- **#9** (a desk patch setting `identity_verified`) was "held for the gate, broken for the
+  frame"; it is now refused outright, by name, and the frame is untouched.
+- **#15** (a desk patch naming an undeclared field) was **broken**; it is now a 400 naming the
+  field and the fields that exist.
+- **#19** (sink failure) was **broken, quietly**; it is now loud - `queued=False`, no queue row,
+  and a customer sentence that promises nothing.
+- **#14** (a customer message on a run parked `waiting_human`) held and still holds - the trace
+  is byte-identical and the message is still exactly one `pending` row - but the customer is now
+  told so once, which is the behaviour change P6 asked for.
+- **#16** (desk `approve`) could sign the wrong action; it can now sign only the one the packet
+  showed, on an open handoff, on that run.
+
+Attempt 7 (nesting three deep) is still not reachable in `interrupt_pack`, so the self-critique's
+"arguably right and certainly untested" stands untested, as it did for the reviewer.
+
+### Commands run after the fixes
+
+From the repository root with `.venv/Scripts/python.exe`; Postgres 16 in
+`customer-support-agent-db-1`, database `support_test`; no `ANTHROPIC_API_KEY` and no GLM key.
+The two demo servers on ports 8000 and 8001 were left running throughout and neither port was
+bound by anything here.
+
+| Command | Result |
+|---------|--------|
+| `python -m ruff check .` | `All checks passed!` (exit 0) |
+| `python -m ruff format --check .` | `160 files already formatted` (exit 0) |
+| `python -m mypy` (strict) | `Success: no issues found in 160 source files` |
+| `python -m pytest -q` | `1361 passed, 2 deselected in 502.28s` (exit 0) |
+| `python -m pytest -q -m live` | `2 skipped, 1361 deselected in 1.18s` - skips on the missing key, does not fail |
+| `python -m pytest tests/verify_phase_2_resolution.py -q` | `39 passed in 128.44s` - phase 2's proof harness still holds |
+| `support pack validate packs/acme_billing` | `acme-billing: well-formed (18 warning(s))`, exit 0 - the same 18 as before |
+| `alembic downgrade base`, `upgrade head`, `check` (`support_test`) | all eight revisions down and back up cleanly; `No new upgrade operations detected.` |
+| the two attempt matrices | see above |
+
+The 1361 are the reviewer's 1352 plus 9: three desk-patch refusals, one `approve` scoping, one
+queued-message acknowledgement, two interrupt-confidence cases, one queue-that-is-down, and one
+approval supersede. No cassette was regenerated, because no prompt changed: the interrupt
+threshold reads a value the recordings already carry, and every core sentence this resolution
+added or replaced is written by the engine rather than by a model.
