@@ -235,21 +235,23 @@ From the repository root with `.venv/Scripts/python.exe`; Postgres 16 in
 | `python -m ruff check .` | `All checks passed!` (exit 0) |
 | `python -m ruff format --check .` | `160 files already formatted` (exit 0) |
 | `python -m mypy` (strict) | `Success: no issues found in 160 source files` |
-| `python -m pytest -q` | `1351 passed, 2 deselected in 465.79s` |
+| `python -m pytest -q` | `1352 passed, 2 deselected in 387.45s` |
 | `python -m pytest -q -m live` | `2 skipped, 1352 deselected` - skips on the missing key rather than failing |
-| `python -m pytest tests/verify_phase_2_resolution.py -q` | `39 passed in 131.40s` - phase 2's proof harness still holds |
+| `python -m pytest tests/verify_phase_2_resolution.py -q` | `39 passed in 125.38s` - phase 2's proof harness still holds |
 | `support pack validate packs/acme_billing` | `acme-billing: well-formed (18 warning(s))`, exit 0 |
-| `alembic downgrade base`, `upgrade head`, `check` (`support_test`) | all eight revisions down and up cleanly; `No new upgrade operations detected.` |
+| `alembic downgrade base`, `upgrade head`, `check` | all eight revisions down and up cleanly; `No new upgrade operations detected.` |
 | `alembic check` (development database) | `No new upgrade operations detected.` |
 | `python -m tests.cassettes.build_cassettes` | seven cassettes; the committed files are what the builder produces |
 
-**If a re-run of that suite fails, check for a second `pytest` first.** Phase-0 finding N9 is
-still open and it bites hard: two `pytest` processes against one database corrupt each other's
-fixtures, and the signature is a dozen unrelated failures - leaked rows, `NoResultFound`,
-websocket timeouts - that do not reproduce individually. It happened here between the first and
-second runs of this suite (a reviewer had started theirs), and every failure of the second run
-vanished when the tests were re-run alone. The number recorded above is from a run with nothing
-else touching `support_test`.
+**Where those runs happened, and why it matters.** Phase-0 finding N9 is still open and it bites
+hard: two `pytest` processes against one database corrupt each other's fixtures, and the
+signature is a spray of unrelated failures - leaked rows, `NoResultFound`, websocket timeouts -
+that do not reproduce individually. A reviewer began working in this tree while this phase was
+being verified, and two full runs collided with theirs (13 failures, then 56, none of which
+reproduced alone). The numbers above are from a run against a **private database**,
+`support_phase6_test`, named through `SUPPORT_TEST_DATABASE_URL` - which is the explicit opt-in
+phase-0 finding F2 added for exactly this. Same code, same Postgres, same migrations; only the
+database name differs. Anyone reproducing them should do the same, or make sure they are alone.
 
 The 1351 are phase W's 1259 plus 92: 23 interrupts, 16 handoff, 8 desk, 21 interrupt-check
 spellings, 9 more golden-conversation cases (two new scenarios), 5 validator (the two new rules
