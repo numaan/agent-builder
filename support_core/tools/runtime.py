@@ -286,11 +286,13 @@ class ToolRuntime:
         """Take the key, or find that somebody else already has.
 
         Two callers on one step id both read no row and both insert; the unique constraint on
-        ``idempotency_key`` picks the winner, and the loser's job is to behave exactly like a
-        retry - replay the completed call, or refuse a non-idempotent one whose outcome is
-        unknown. Without this it lost with a raw ``IntegrityError``, which is a dead turn rather
-        than a routed failure. Only the *claim* is retried, and only once: the row exists by
-        then, so the second pass reads it rather than inserting again.
+        ``idempotency_key`` picks the winner. The loser used to get a raw ``IntegrityError``,
+        which is a dead turn rather than a routed failure, and it must not simply re-enter
+        either: a ``running`` row left by a *dead* process may be repeated when the tool says it
+        is idempotent, but a ``running`` row held by a caller who is still executing it is a
+        different thing wearing the same clothes, and repeating that one is two calls at once.
+        Losing the insert is the one moment the difference is knowable, so the loser refuses,
+        and a later attempt - a retry, a resumed step - reads the finished row and replays it.
         """
         try:
             return await self._claim_once(
@@ -302,14 +304,24 @@ class ToolRuntime:
                 requires_approval=requires_approval,
             )
         except IntegrityError:
-            return await self._claim_once(
-                tool=tool,
-                canonical=canonical,
-                args_hash=args_hash,
-                site=site,
-                key=key,
-                requires_approval=requires_approval,
+            return await self._lost_the_race(tool, key)
+
+    async def _lost_the_race(self, tool: Tool, key: str) -> _Claim:
+        """Somebody else claimed this key between our read and our insert."""
+        now = self.clock()
+        async with self.sessions() as session, session.begin():
+            row = await repo.get_tool_call(session, key)
+            if row is None:  # pragma: no cover - the constraint that fired says it is there
+                msg = f"{tool.name!r} lost a race for {key!r} and the winner's row is gone"
+                return _Claim(refusal=ToolRefused(msg))
+            await repo.reenter_tool_call(session, row.id, status=row.status, when=now)
+            if row.status == "succeeded":
+                return _Claim(replay=self._replayed(tool, row))
+            msg = (
+                f"another caller claimed this step ({key}) for {tool.name!r} and has not "
+                f"recorded an outcome yet; this attempt is refused rather than run beside it"
             )
+            return _Claim(refusal=ToolRefused(msg))
 
     async def _claim_once(
         self,

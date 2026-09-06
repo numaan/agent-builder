@@ -126,7 +126,14 @@ async def test_04_a_death_during_the_record_is_the_same_state_and_the_same_answe
 
 
 async def test_05_two_callers_racing_one_step_id(engine: AsyncEngine) -> None:
-    """The unique ``idempotency_key`` makes one of them the claimant."""
+    """The unique ``idempotency_key`` makes one of them the claimant.
+
+    The loser refuses rather than re-entering. A ``running`` row left by a dead process may be
+    repeated when the tool declares itself idempotent; a ``running`` row held by a caller who is
+    still executing it is a different thing wearing the same clothes, and losing the insert is
+    the one moment the two are distinguishable. ``ping`` is idempotent, so this is exactly the
+    case where re-entering would have run it twice.
+    """
     conversation_id, run_id = await conversation_and_run(engine)
     where = site(conversation_id, run_id)
 
