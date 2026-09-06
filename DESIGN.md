@@ -163,7 +163,7 @@ llm:
   default_model: claude-sonnet-5
   escalation_model: claude-opus-5     # used for handoff summaries and hard reasoning nodes
 interrupts:
-  allowed_from: [root, refund, update_address]
+  allowed_from: [root, refund, update_address]   # `root` is inert; see 6.6
   blocked_in: [verify_identity, payment_capture]
 handoff:
   queue: billing-tier-1
@@ -381,6 +381,8 @@ A conversation holds a stack of frames. Normal sub-graph calls push and pop. Int
 
 Gates fire on every entry to a frame, so an interrupt cannot be used to reach an unverified action.
 
+Two rules settled while this was built (2026-09-06, phase 6). `allowed_from` is an **allow-list**, not a default: a graph named in neither list is treated exactly like one in `blocked_in`, because the safe reading of "the current graph allows interrupts" is "says so". And the **root frame is never parked** - a topic change while the root frame is waiting is the root graph's own intent classifier's business (6.5), which knows every edge the root declares while this check knows only the ones leading to a workflow, and parking it would mean offering it back ("shall we return to: is there anything else?"). Listing the root graph in `allowed_from`, as the example manifest in 5.1 does, is therefore inert. A `new_intent` or `cancel` below the pack's `llm.confidence_threshold` is not acted on: both are destructive, and the suspended node asks its own question again rather than the engine guessing.
+
 ### 6.7 Graph versioning
 
 Graphs are versioned with the pack. A running conversation pins the graph version it started with. On deploy, in-flight conversations continue on the old version (the engine keeps the last two pack versions loaded) and new conversations use the new one. A migration hook lets a pack declare how to map old state to new when a graph changes incompatibly; if none exists and the shapes differ, the conversation is handed off.
@@ -428,7 +430,7 @@ Timeouts are per status and configurable per pack. A `waiting_customer` timeout 
 ### 7.3 Failure handling
 
 - LLM call failure: retry with backoff, then fall back to `escalation_model`, then handoff with reason `llm_unavailable`.
-- Tool failure: the node's `on_error` edge if declared; otherwise the frame's `on_error` graph; otherwise handoff.
+- Tool failure: the node's `on_error` edge if declared; otherwise handoff. *(Amended 2026-09-06, phase 6 review finding P7. The original had a middle tier - "otherwise the frame's `on_error` graph" - which three phases in a row recorded as not implemented and argued nothing needed. Graphs have no `on_error` key, no error `FrameKind` exists, and nothing in the engine can raise a frame-level error that a node-level edge could not catch; the fall-through now reaches a real handoff packet carrying the failure's own reason rather than a bare status. Amending the design is the honest end of that argument: a tier nobody implements is not a design, it is a note. Adding it later is additive - a key on the graph schema, a frame kind, and CFG edges - and needs a use case first.)*
 - Engine crash mid-node: on resume, the step is re-executed. Tool idempotency keys make re-execution safe. LLM calls replay from the trace if the step already completed.
 - Limits hit (`max_nodes_per_turn`, cost): handoff with reason `limit_exceeded`.
 

@@ -24,6 +24,7 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import Connection, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -82,14 +83,47 @@ def migrated_database() -> None:
     asyncio.run(_rebuild_schema())
 
 
+TRUNCATE_ATTEMPTS = 5
+TRUNCATE_LOCK_TIMEOUT = "5s"
+CONTENDED = frozenset({"40P01", "55P03"})
+"""``deadlock_detected`` and ``lock_not_available``: somebody else is holding these tables.
+
+Reported by phase 6's reviewer, who lost twenty minutes to it. ``TRUNCATE`` takes an
+``AccessExclusiveLock`` on every mapped table, and anything else touching ``support_test`` at the
+same moment - a second ``pytest``, an app pointed at it - holds a ``RowShareLock`` on some of
+them, so the two orders meet and Postgres kills one side. The whole file then fails behind it
+with ``no conversation <uuid>`` and foreign-key violations that reproduce for nobody.
+
+Retrying is the documented answer to a deadlock and it is the fixture's own problem, not the
+product's. What a retry cannot fix is the *other* half - another process truncating rows out from
+under a running test - which is phase-0 finding N9 and needs a session-long lock the fixture
+design deliberately avoids. So the last attempt says what is probably happening, which is the
+part the next person actually needs."""
+
+
+async def _truncate(engine: AsyncEngine) -> None:
+    """Empty every mapped table, waiting rather than hanging and retrying rather than failing."""
+    table_list = ", ".join(f'"{t.name}"' for t in ALL_TABLES)
+    for attempt in range(TRUNCATE_ATTEMPTS):
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(f"SET LOCAL lock_timeout = '{TRUNCATE_LOCK_TIMEOUT}'"))
+                await conn.execute(text(f"TRUNCATE {table_list} RESTART IDENTITY CASCADE"))
+        except DBAPIError as exc:
+            code = getattr(getattr(exc, "orig", None), "sqlstate", None) or ""
+            if code not in CONTENDED or attempt == TRUNCATE_ATTEMPTS - 1:
+                raise
+            await asyncio.sleep(0.1 * (attempt + 1))
+        else:
+            return
+
+
 @pytest.fixture
 async def engine(migrated_database: None) -> AsyncIterator[AsyncEngine]:
     """Per-test engine; every mapped table is truncated before the test starts."""
     engine = create_async_engine(test_database_url(), poolclass=NullPool)
     try:
-        table_list = ", ".join(f'"{t.name}"' for t in ALL_TABLES)
-        async with engine.begin() as conn:
-            await conn.execute(text(f"TRUNCATE {table_list} RESTART IDENTITY CASCADE"))
+        await _truncate(engine)
         yield engine
     finally:
         await engine.dispose()

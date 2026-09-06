@@ -157,6 +157,10 @@ Design: sections 9.1 to 9.3, 14 (citation guardrail).
   - [ ] Passages still pass through phase 3's per-render delimiter token. A ColBERT passage is untrusted text like any other.
 - [ ] Migration fixing `doc_chunk.embedding` to `vector(N)` for the chosen embedding model (while the table is empty) and adding the HNSW index; decide whether downgrade should keep the `vector` extension (phase 0 deferred findings N12, N2).
 - [ ] `LiveLookupRetriever` routing to READ tools.
+- [ ] Thread a retriever through `handoff/builder.py`'s `gather()` and `HandoffSummaryRequest`
+      so a handoff summary can be grounded and `HandoffPacket.citations` stops being empty.
+      The shape is already there - `citations` is on the packet and `Passage` is defined - and
+      naming it now stops phase 5 inventing a second one (phase 6 review, forward compatibility).
 - [ ] Ingestion CLI `support pack knowledge sync` for `markdown_dir` and `html_crawl` sources, with `source_version` and stale-chunk marking.
 - [ ] `knowledge:` block on llm nodes; passages inserted as delimited data with ids.
 - [ ] Outbound citation guardrail: factual-claim classifier (rule-based first), re-prompt once, then handoff.
@@ -190,9 +194,25 @@ Design: sections 12, 15, 4.1.
 - [ ] Extend `create_app` from Phase W with the desk API and the email webhook.
 - [ ] A queue-and-return mode for channel webhooks: `lock_wait_seconds=0` plus something that calls `Executor.drain`, made the default for the webhook path, and a scheduler for `recover_stalled` and `sweep_timeouts` (phase 2 review finding R7). Both mechanisms exist; what is missing is a caller that cannot afford to block a connection per waiter, which is the HTTP handler this phase adds.
 - [ ] OpenTelemetry spans for turn, node, llm_call, tool_call, retrieval, guardrail with the attributes in section 15.
-- [ ] Metrics listed in section 15.
+- [ ] Metrics listed in section 15. Two model calls phase 6 added are made *outside* any node -
+      the interrupt check and the handoff summary - so section 15's `llm_call` span has no `node`
+      parent for either and the two most-often-run and most-expensive new calls will not appear
+      in the per-node attribution. Give them a `turn -> llm_call` span of their own.
+- [ ] A durable record of a handoff nobody took, and a sweep for it (phase 6 review finding P2,
+      the half phase 6 could not close). Today a sink that refuses is recorded in
+      `HandoffService.failures`, a per-process list nothing sweeps: the customer is told the
+      truth and the run is parked, but no queue row exists and no second replica can see it.
+      A `handoff.status = 'undelivered'` row written before delivery and resolved after, plus a
+      retry in the scheduler this phase adds, is the shape.
+- [ ] A cheaper model for the interrupt check (`llm.interrupt_model`). DESIGN.md 20 asks for it
+      and phase 6 could not give it one, because the per-node `model:` override exists and the
+      interrupt check is not a node - and it runs on *every* reply to a suspended workflow,
+      inside the conversation lock, before the claim (phase 6 review, forward compatibility).
 - [ ] Structured JSON logs with PII redaction applied before emission.
-- [ ] `conversation_replay` endpoint rendering the frame stack over time.
+- [ ] `conversation_replay` endpoint rendering the frame stack over time. It must resolve the
+      reserved node id `__interrupt_return__` (phase 6's return offer, with the core-only edges
+      `offer`, `resumed` and `abandoned`), which no graph declares, rather than discovering it
+      against a graph that has no such node (phase 6 review finding P10).
 - [ ] Replay an LLM call from the trace when a step re-executes (DESIGN.md 7.3: "LLM calls replay from the trace if the step already completed"). `trace_step.llm_response` is written and never read back, so a crash between the model answering and the checkpoint committing pays for the question again and may get a different answer. The step id on `NodeRuntime` is the documented cache key (phase 3 self-critique fragility item 1, endorsed by the phase-3 review).
 - [ ] Inbound guardrails: PII tagging and redaction in traces, injection flag, language detection.
 - [ ] Authentication and abuse control on the channel surface: the web chat session key is currently the whole of the access control, and there is no WebSocket origin check, no rate limit and no webhook signature verification (phase W self-critique). This phase adds the desk API, where the same gap is somebody else's customer data.
@@ -348,7 +368,7 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
 - ~~[phase 0] F6: `tool_call` has no `run_id`, `conversation_id` or `step_id`; the only link to a conversation is the idempotency key string, should-fix, deferred to phase 4 which owns the `tool_call` migration.~~ **Closed in phase 4**: migration `0006` adds `run_id` (FK, indexed), `step_id` and `node_id`, and `repositories.tool_calls_for_run` is the join.
 - ~~[phase 0] N1: `action_approval` has no single-use marker or expiry, so one approval row could satisfy two tool calls with the same args hash, nit (a design gap: DESIGN 8.2 does not demand single use), deferred to phase 4.~~ **Closed in phase 4**: `consumed_at`/`consumed_by_tool_call_id`, taken by an atomic update that is also the claim, so two racing callers cannot both win. The approval is bound to the run, the frame and the confirm node besides.
 - [phase 0] N2 (downgrade half): the initial migration's downgrade drops the `vector` extension, which fails or removes a shared extension if an administrator pre-installed it, nit, deferred to phase 5 which owns pgvector; editing the initial migration for a shared-instance concern is not a risk-free few lines. The superuser requirement is documented in README.
-- [phase 0] N9: two concurrent `pytest` processes against one database corrupt each other's fixtures (reviewer measured 47 passed, 8 errors); README warns but nothing enforces it, nit, deferred because a session-long advisory lock needs a connection that outlives the per-test event loops, which the fixture design avoids on purpose. The dedicated `support_test` database (F2) removes the developer-database half of the risk.
+- [phase 0] N9: two concurrent `pytest` processes against one database corrupt each other's fixtures (reviewer measured 47 passed, 8 errors); README warns but nothing enforces it, nit, deferred because a session-long advisory lock needs a connection that outlives the per-test event loops, which the fixture design avoids on purpose. The dedicated `support_test` database (F2) removes the developer-database half of the risk. **Half closed in phase 6** (its reviewer hit the same thing and asked for a line): the per-test `TRUNCATE ... RESTART IDENTITY CASCADE` takes an `AccessExclusiveLock` on every mapped table while another connection holds a `RowShareLock` on some of them, so under load the two deadlock and the rest of the file fails behind them with `no conversation <uuid>` and foreign-key violations that reproduce for nobody. The fixture now sets `lock_timeout` and retries the truncate on `deadlock_detected`/`lock_not_available`, which is the documented answer and was verified against a held reader; what is still open is the other half - another process truncating rows out from under a *running* test, which no retry can fix and which still needs the session-long lock this entry was deferred for.
 - ~~[phase 1] N3: `graph.subgraph_cycle` fires only when *no* graph in the cycle contains a suspending node anywhere, not one on the cycle path, so mutual recursion through a graph with an unrelated `ask` on an untaken branch is missed (reviewer's hostile case T, reproduced after resolution), nit, deferred to phase 6.~~ **Closed in phase 6**: each leg of a cycle is judged on its own path - can this graph reach the call that continues the cycle from its start without passing a suspending node? - and the cycle is refused only when every leg can. Hostile case T is now an error. The interprocedural CFG also gained the interrupt push and return edges of DESIGN.md 6.6, which can only shrink the confirm-coverage sets and makes the phase-1 self-critique's item 4 honest.
 - ~~[phase 1] H: the approval-argument comparison is textual, so a `tool` node that rewrites a field the approved arguments read, between the confirm and the call, passes `graph.approval_mismatch` (reviewer's hostile case H), should-fix, deferred to phase 4.~~ **Closed in phase 4**, both halves: `graph.approval_args_mutated` refuses it at load, and the run-time hash check refuses it at execution even in a pack that never met the validator.
 - ~~[phase 1] I: risk tiers come from the pack-authored `tools/tools.yaml`, so declaring `issue_refund` as `read` removes every confirm check and makes it callable from an `llm` loop (reviewer's hostile case I), should-fix, deferred to phase 4.~~ **Closed in phase 4**: nothing at run time reads that file. The registry built from the imported `TOOLS` is what the validator type-checks against and what the runtime enforces, and a declared tier that disagrees is `tools.registry_drift` (ERROR).
@@ -367,9 +387,66 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
 - ~~[phase 4] The `graph.confirm_exempt` warning names the tool but not the *arguments* the pack's nodes pass it ... Nit, deferred to phase 6.~~ **Closed in phase 6**: the warning lists every call site of the exempt tool, across every graph, with the argument expression each one passes - so `verify_identity.send_code(email: 'ctx.customer.email')` reads differently from a node passing `state.email`.
 - ~~[phase 4] An `on_error` edge that returns to its own `tool` node re-enters at the next attempt, claims a fresh idempotency key, and calls the tool again ... Should-fix, deferred to phase 6.~~ **Closed in phase 6, both ways**: `graph.on_error_repeats_side_effect` reports it at load (a WARNING, because re-sending a one-time passcode is this exact shape and is right), and `limits.max_node_errors` bounds it at run time - consecutive failures per node, counted in the frame so a crash does not reset them and an ordinary loop does not trip them, and a handoff with reason `limit_exceeded` when the bound is reached.
 
+- [phase 6] P2 (durable half): a handoff no sink would take is visible only in
+  `HandoffService.failures`, a per-process list nothing sweeps, so a second replica cannot see it
+  and no queue row exists to find later, should-fix, deferred to phase 7. The customer-facing half
+  is closed - the run is parked, the pack's promise is replaced with one that is true, and
+  `suspend_detail.queued` records that nobody was told - but a durable `undelivered` row and a
+  retry need the scheduler phase 7 owns (checklist line added there).
+- [phase 6] P6 (SLA half): a customer message queued behind a `waiting_human` run is now
+  acknowledged once and shown on the desk's handoff view, but nothing counts it against the
+  handoff's SLA or re-prioritises the queue, nit, deferred to phase 7, which owns the metrics and
+  the scheduler that would do the counting.
+- [phase 6] The interrupt check and the handoff summary are model calls made outside any node, so
+  section 15's `llm_call` span has no `node` parent for them and the two most expensive new calls
+  in the system will not appear in per-node cost attribution; and the check has no cheaper model
+  to run on because the per-node `model:` override cannot reach it, should-fix, deferred to phase
+  7, which owns tracing, metrics and DESIGN.md 20's cost controls (two checklist lines added
+  there).
+
 ---
 
 ## Decisions log
+
+- 2026-09-06: **when no sink takes a handoff packet, the customer is told so**, in core's words
+  rather than the pack's. The handoff hook now answers whether a human was actually told, and a
+  `handoff` node whose packet nobody took has its message replaced by
+  `HANDOFF_UNDELIVERED_MESSAGE` (phase 6 review finding P2). What that sentence claims is what
+  the engine can still guarantee with every sink refusing: the run is parked `waiting_human` and
+  checkpointed, so the conversation, its stack and its transcript are durable and a later attempt
+  resumes exactly here. What it does not claim is that anybody will come, because the thing that
+  would have paged a person is the thing that failed - and DESIGN.md 14 forbids the promise the
+  pack's own sentence makes. A `CompositeSink` partial failure counts as delivered: a webhook
+  down while the Postgres row was written is still a page a desk can find, which is why
+  `default_sink` composes the two.
+
+- 2026-09-06: **a desk `resume` state patch is validated before it is written**, against the
+  declared state model of the frame the run is suspended in, and refused with the fields that are
+  wrong and the fields that exist (phase 6 review finding P1, the must-fix). Writing first and
+  validating on the next node entry made one mistyped field unrecoverable through any API call
+  and reported it as `pack_incompatible`, which is the wrong DESIGN.md 7.3 reason because the
+  pack was never at fault. Two further rules the patch obeys, both already settled elsewhere: it
+  may never set `identity_verified` (DESIGN.md 10 gives that to `verify_identity` alone, through
+  a tool, and `AppConfig` is held to the same rule), and it is refused while an approval is live
+  on that frame, because the proposal the customer agreed to was computed from the state it would
+  edit and the desk's one route to an action is `approve`.
+
+- 2026-09-06: **`llm.confidence_threshold` gates the interrupt check's decision too** (phase 6
+  review finding P3). The confidence was collected, carried through three layers and read by
+  nobody, so a `cancel` at 0.0 unwound the whole frame stack and a `new_intent` at 0.0 discarded
+  a workflow. Those are the only two answers here the engine acts on and both are destructive,
+  which is the same argument the threshold already wins for an `llm` node's decision and a
+  `confirm` node's yes. Below it the engine does not act and does not pretend it understood: one
+  core sentence, a hint on the resume event so a slot extractor does not read the reply as an
+  answer, and the node that asked the question asks it again.
+
+- 2026-09-06: **DESIGN.md 7.3 is amended to two failure tiers**, dropping "otherwise the frame's
+  `on_error` graph" (phase 6 review finding P7). Three phases running recorded it as
+  unimplemented and argued nothing needed it; the reviewer's point was that the argument had to
+  end somewhere. Graphs have no `on_error` key, no error `FrameKind` exists, nothing the engine
+  can raise at frame level is beyond a node-level edge, and the fall-through now reaches a real
+  packet carrying the failure's own reason rather than a bare status. Adding the tier later is
+  additive and needs a use case first.
 
 - 2026-09-06: **the root frame is never parked by an interrupt.** DESIGN.md 6.6 step 4 pushes a
   workflow over a suspended frame and offers the old one back afterwards; when the suspended

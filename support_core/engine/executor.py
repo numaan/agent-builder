@@ -1598,9 +1598,12 @@ class Executor:
     ) -> bool:
         """DESIGN.md section 7.3: the node's ``on_error`` edge if it declares one, else handoff.
 
-        Returns whether the loop should continue. The middle tier of 7.3 - "otherwise the
-        frame's ``on_error`` graph" - has no place in the graph schema phase 1 delivered, so it
-        is not silently invented here; the fall-through is straight to handoff.
+        Returns whether the loop should continue. Two tiers, which is what 7.3 now says: the
+        middle one - "otherwise the frame's ``on_error`` graph" - was recorded as unimplemented
+        by three phases running, and phase 6's review (finding P7) asked for the argument to be
+        finished rather than repeated. It was: DESIGN.md 7.3 is amended to two tiers, because
+        nothing here can raise a frame-level error a node-level edge could not catch and the
+        fall-through reaches a real packet carrying the failure's own reason.
         """
         on_error = getattr(node, "on_error", None)
         node_id = frame.node_id
