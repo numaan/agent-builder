@@ -33,6 +33,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ValidationError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession as Session
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -273,6 +274,44 @@ class ToolRuntime:
     # -- the claim -------------------------------------------------------------------------
 
     async def _claim(
+        self,
+        *,
+        tool: Tool,
+        canonical: dict[str, Any],
+        args_hash: str,
+        site: CallSite,
+        key: str,
+        requires_approval: str | None,
+    ) -> _Claim:
+        """Take the key, or find that somebody else already has.
+
+        Two callers on one step id both read no row and both insert; the unique constraint on
+        ``idempotency_key`` picks the winner, and the loser's job is to behave exactly like a
+        retry - replay the completed call, or refuse a non-idempotent one whose outcome is
+        unknown. Without this it lost with a raw ``IntegrityError``, which is a dead turn rather
+        than a routed failure. Only the *claim* is retried, and only once: the row exists by
+        then, so the second pass reads it rather than inserting again.
+        """
+        try:
+            return await self._claim_once(
+                tool=tool,
+                canonical=canonical,
+                args_hash=args_hash,
+                site=site,
+                key=key,
+                requires_approval=requires_approval,
+            )
+        except IntegrityError:
+            return await self._claim_once(
+                tool=tool,
+                canonical=canonical,
+                args_hash=args_hash,
+                site=site,
+                key=key,
+                requires_approval=requires_approval,
+            )
+
+    async def _claim_once(
         self,
         *,
         tool: Tool,
