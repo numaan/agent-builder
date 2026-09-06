@@ -10,6 +10,7 @@ that would call the API is in the opt-in ``live`` group and skips cleanly withou
 """
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -17,10 +18,12 @@ import pytest
 from pydantic import BaseModel, ConfigDict
 
 from support_core.llm.anthropic_provider import (
+    DEFAULT_MIN_CACHEABLE_TOKENS,
     AnthropicProvider,
     _translate,
     api_key_present,
     build_payload,
+    min_cacheable_tokens,
     parse_message,
 )
 from support_core.llm.fake import FakeProvider, Rule, ScriptedProvider
@@ -93,11 +96,47 @@ def test_with_read_tools_the_answer_tool_is_offered_rather_than_forced() -> None
     assert payload["tool_choice"] == {"type": "auto"}
 
 
-def test_the_static_prefix_carries_the_cache_breakpoint() -> None:
-    """DESIGN.md section 11.1: "prompt caching for the static prefix"; 11.2 says which layers."""
-    payload = build_payload(a_request())
+def test_the_static_prefix_carries_the_cache_breakpoint_when_it_is_long_enough() -> None:
+    """DESIGN.md section 11.1: "prompt caching for the static prefix"; 11.2 says which layers.
+
+    Review finding V3: a breakpoint on a prefix shorter than the model's minimum is accepted,
+    ignored, and reported nowhere, so the phase shipped code that looked like it cached and did
+    not. The breakpoint is now conditional on the measured prefix.
+    """
+    long_prefix = "word " * 900  # comfortably over the 1024-token Sonnet minimum
+    payload = build_payload(a_request(system=[SystemBlock(text=long_prefix, cache=True)]))
     assert payload["system"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_a_prefix_below_the_models_minimum_is_not_marked_and_says_so(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The shipped pack's own case: 676 estimated tokens against a 1024-token minimum."""
+    # The migration harness runs alembic's ``fileConfig``, which disables every logger that
+    # already exists, so a test that runs after it sees nothing unless the logger is revived.
+    logger = logging.getLogger("support_core.llm.anthropic_provider")
+    logger.disabled = False
+    logger.propagate = True
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        payload = build_payload(a_request())
+    assert "cache_control" not in payload["system"][0]
     assert "cache_control" not in payload["system"][1]
+    assert "prompt cache breakpoint skipped" in caplog.text
+
+
+def test_the_minimum_cacheable_prefix_is_model_aware() -> None:
+    """``claude-opus-5`` caches from 512 tokens, so the same prefix is worth marking there."""
+    prefix = "word " * 500  # about 625 estimated tokens: under Sonnet's floor, over Opus's
+    sonnet = build_payload(
+        a_request(model="claude-sonnet-5", system=[SystemBlock(text=prefix, cache=True)])
+    )
+    opus = build_payload(
+        a_request(model="claude-opus-5", system=[SystemBlock(text=prefix, cache=True)])
+    )
+    assert "cache_control" not in sonnet["system"][0]
+    assert opus["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert min_cacheable_tokens("claude-haiku-4-5") == 2048
+    assert min_cacheable_tokens("some-unknown-model") == DEFAULT_MIN_CACHEABLE_TOKENS
 
 
 def test_tool_use_and_tool_results_round_trip_into_the_payload() -> None:
@@ -340,3 +379,27 @@ async def test_the_live_provider_answers_a_structured_call() -> None:
     )
     answer = await provider.structured(request, Answer)
     assert isinstance(answer.verdict, str)
+
+
+@pytest.mark.live
+async def test_the_cache_breakpoint_is_read_back_on_the_second_turn() -> None:
+    """Review finding V3's one-line settlement, which needs a key.
+
+    A static prefix long enough for the model to cache should show
+    ``cache_creation_input_tokens`` on the first call and ``cache_read_input_tokens`` on the
+    second. If this fails with both at zero, the breakpoint is not doing what section 11.1 says
+    it does and :data:`MIN_CACHEABLE_TOKENS` is wrong for this model.
+    """
+    if not api_key_present():
+        pytest.skip("ANTHROPIC_API_KEY is not set; the live group needs one")
+    provider = AnthropicProvider()
+    prefix = "You are a careful assistant. " * 200  # well over the 1024-token minimum
+    request = CompletionRequest(
+        model="claude-sonnet-5",
+        system=[SystemBlock(text=prefix, cache=True)],
+        messages=[PromptMessage(role="user", content=[TextPart(text="Say the word yes.")])],
+        max_tokens=64,
+    )
+    first = await provider.complete(request)
+    second = await provider.complete(request)
+    assert first.usage.cache_creation_input_tokens or second.usage.cache_read_input_tokens

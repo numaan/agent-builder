@@ -14,9 +14,10 @@ function precisely so that the request this provider *would* send can be tested 
   model produces its structured decision."
 * **Prompt caching on the static prefix.** Layers 1 to 3 of DESIGN.md section 11.2 are identical
   across turns, so the assembler marks that block ``cache=True`` and this provider puts a
-  ``cache_control`` breakpoint on it. Caching is a prefix match: anything before the breakpoint
-  that changes between turns silently costs the cache, which is why the assembler puts every
-  volatile layer *after* it.
+  ``cache_control`` breakpoint on it *when the block is long enough for the model to cache it*
+  (:data:`MIN_CACHEABLE_TOKENS`, review finding V3). Caching is a prefix match: anything before
+  the breakpoint that changes between turns silently costs the cache, which is why the assembler
+  puts every volatile layer *after* it - including this turn's delimiter token.
 
 **This class is unexercised.** There is no ``ANTHROPIC_API_KEY`` in the environment this phase
 was built in, so nothing here has ever spoken to the API. What is tested is the payload it
@@ -28,9 +29,11 @@ validation requires every object in the schema to close itself, which
 :func:`~support_core.llm.schemas.json_schema_for` does.
 """
 
+import logging
 import os
 from typing import Any
 
+from support_core.llm.prompt import estimate_tokens
 from support_core.llm.provider import StructuredByCompletion
 from support_core.llm.types import (
     CompletionRequest,
@@ -47,19 +50,60 @@ from support_core.llm.types import (
 
 API_KEY_ENV = "ANTHROPIC_API_KEY"
 
+log = logging.getLogger(__name__)
+
+DEFAULT_MIN_CACHEABLE_TOKENS = 1024
+MIN_CACHEABLE_TOKENS: dict[str, int] = {
+    "haiku": 2048,
+    "opus": 512,
+}
+"""Minimum cacheable prefix, by model family (review finding V3).
+
+Anthropic's prompt caching has a minimum prefix length below which a ``cache_control``
+breakpoint is *silently ignored*: the request succeeds, nothing is cached, and no error comes
+back. The shipped pack's static layer 1 to 3 prefix measures ~676 estimated tokens against the
+1024-token minimum for the Sonnet family, so the breakpoint the phase advertised was a no-op on
+the pack's own default model. Rather than pad layer 1 to reach a threshold - padding a
+compliance surface to win a cache is the wrong trade - the breakpoint is now *conditional on the
+measured prefix* and says so in the log when it is skipped. Under-threshold packs pay nothing
+and learn why; a pack whose persona and policies grow past the threshold (phases 5 and 6 will do
+that) starts caching with no code change.
+
+Keyed by a substring of the model id, longest match wins, because model ids carry the family
+name (``claude-sonnet-5``, ``claude-opus-5``, ``claude-haiku-4-5``)."""
+
 
 def api_key_present() -> bool:
     """Whether a live call could be made at all. The ``live`` test group skips on this."""
     return bool(os.environ.get(API_KEY_ENV))
 
 
+def min_cacheable_tokens(model: str) -> int:
+    """The smallest prefix this model will cache. See :data:`MIN_CACHEABLE_TOKENS`."""
+    name = model.lower()
+    matches = [(len(key), value) for key, value in MIN_CACHEABLE_TOKENS.items() if key in name]
+    return max(matches)[1] if matches else DEFAULT_MIN_CACHEABLE_TOKENS
+
+
 def build_payload(req: CompletionRequest) -> dict[str, Any]:
     """The keyword arguments for ``messages.create``. Pure, so it is testable without a key."""
+    minimum = min_cacheable_tokens(req.model)
+    prefix = 0
     system: list[dict[str, Any]] = []
     for block in req.system:
         entry: dict[str, Any] = {"type": "text", "text": block.text}
+        prefix += estimate_tokens(block.text)
         if block.cache:
-            entry["cache_control"] = {"type": "ephemeral"}
+            if prefix >= minimum:
+                entry["cache_control"] = {"type": "ephemeral"}
+            else:
+                log.info(
+                    "prompt cache breakpoint skipped: the static prefix is about %d tokens and "
+                    "%s caches nothing below %d, so the breakpoint would be a silent no-op",
+                    prefix,
+                    req.model or "this model",
+                    minimum,
+                )
         system.append(entry)
 
     tools: list[dict[str, Any]] = [
