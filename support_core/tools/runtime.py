@@ -572,8 +572,20 @@ class ToolRuntime:
                 f"be patched"
             )
             raise ToolFailed(msg)
+        fields = dict(patch[CUSTOMER_KEY])
+        undeclared = sorted(set(fields) - set(tool.patches_context))
+        if undeclared:
+            # DESIGN.md 8.2's controls aim at the model, the customer and the graph; this one
+            # aims at the pack, and it is the cheapest narrowing available (review finding R4).
+            # A tool that may set ``identity_verified`` has to say so where a reader can see it.
+            msg = (
+                f"{tool.name!r} patched ctx.customer field(s) {undeclared} it does not declare "
+                f"in patches_context ({sorted(tool.patches_context) or 'nothing'}); a tool may "
+                f"only change what it wrote down that it changes"
+            )
+            raise ToolFailed(msg)
         merged = dict(context.customer.model_dump(mode="json"))
-        merged.update(dict(patch[CUSTOMER_KEY]))
+        merged.update(fields)
         try:
             CustomerContext.model_validate(merged)
         except ValidationError as exc:

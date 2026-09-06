@@ -132,6 +132,21 @@ class Tool(BaseModel):
     """DESIGN.md section 8.2, WRITE only. Requires :attr:`confirm_exempt_reason`."""
 
     confirm_exempt_reason: str | None = None
+
+    patches_context: frozenset[str] = frozenset()
+    """Fields of :class:`~support_core.graph.context.CustomerContext` this tool may change.
+
+    Empty - the default - means the tool may change nothing about the customer, which is what
+    almost every tool wants. "Any WRITE tool may declare the customer verified" was a far wider
+    grant than "the tool that checks the passcode may set ``identity_verified``", and the
+    difference is the whole identity gate (review finding R4): a WRITE tool may be
+    ``confirm_exempt``, so nothing else stood between a careless tool and a verified customer.
+
+    The names are checked against ``CustomerContext`` when the tool is built, so a typo is a
+    load error rather than a patch that silently never applies, and :meth:`ToolContext.
+    patch_customer` writes outside the declaration are refused at run time.
+    """
+
     timeout_s: float = Field(default=15.0, gt=0)
     async_: bool = False
     """Long-running: the ``tool`` node suspends ``waiting_async_tool`` and the call completes
@@ -155,6 +170,26 @@ class Tool(BaseModel):
                 raise ValueError(msg)
         elif self.confirm_exempt_reason:
             msg = f"tool {self.name!r} gives a confirm_exempt_reason but is not confirm_exempt"
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _context_writes_are_declarable(self) -> "Tool":
+        if not self.patches_context:
+            return self
+        if self.risk is Risk.READ:
+            msg = (
+                f"tool {self.name!r} is read risk and declares patches_context; a read tool has "
+                f"no side effects, and the conversation context is one (DESIGN.md section 8.1)"
+            )
+            raise ValueError(msg)
+        unknown = sorted(self.patches_context - set(CustomerContext.model_fields))
+        if unknown:
+            known = ", ".join(sorted(CustomerContext.model_fields))
+            msg = (
+                f"tool {self.name!r} declares patches_context {unknown}, which "
+                f"CustomerContext does not have; it has {known}"
+            )
             raise ValueError(msg)
         return self
 

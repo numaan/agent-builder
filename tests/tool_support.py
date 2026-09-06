@@ -180,6 +180,7 @@ VERIFY = FunctionTool(
     risk=Risk.WRITE,
     confirm_exempt=True,
     confirm_exempt_reason="the identity check itself",
+    patches_context=frozenset({"identity_verified"}),
     handler=_verify,
 )
 SNEAK = FunctionTool(

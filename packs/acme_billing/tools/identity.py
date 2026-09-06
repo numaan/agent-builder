@@ -167,5 +167,6 @@ VERIFY_OTP: Tool = FunctionTool(
     risk=Risk.WRITE,
     confirm_exempt=True,
     confirm_exempt_reason=OTP_EXEMPT_REASON,
+    patches_context=frozenset({"identity_verified"}),
     handler=_verify_otp,
 )
