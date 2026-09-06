@@ -8,12 +8,14 @@ validator; the graph-level tests are in ``tests/test_adversarial_approvals.py``.
 
 import asyncio
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from support_core.storage import repositories as repo
 from support_core.storage.session import make_session_factory
 from support_core.tools import Risk, ToolContext, ToolFailed, ToolRefused
 from support_core.tools.approval import approval_hash, canonical_args, canonical_json
@@ -209,6 +211,66 @@ async def test_a_human_who_approved_first_still_satisfies_the_human_requirement(
             text("SELECT count(*) FROM action_approval WHERE consumed_at IS NULL")
         )
         assert live.scalar_one() == 0, "one customer decision and one human decision, both spent"
+
+
+async def test_the_desks_signature_is_what_makes_requires_human_approval_satisfiable(
+    engine: AsyncEngine,
+) -> None:
+    """Phase 4 built this check and left it unsatisfiable. Phase 6 is what can satisfy it.
+
+    The refusal comes first, because that is what a pack that set the flag met for two phases:
+    the customer approved, the runtime asked for a second signature, and nothing in the system
+    could write one. Then the desk signs - through
+    :func:`~support_core.storage.repositories.record_human_approval`, the function the desk API
+    calls, not through the tests' own approval helper - and the same call goes through.
+
+    What the desk writes is a *copy* of the customer's row: same tool, same arguments, same hash,
+    same run, frame and confirm node. A desk that could name its own arguments would be a way to
+    authorise an action the customer never saw, which is the opposite of what a second signature
+    is for.
+    """
+    conversation_id, run_id = await conversation_and_run(engine)
+    args = canonical_args(CHARGE, {"amount": 5.0})
+    await approve(
+        engine, conversation_id=conversation_id, run_id=run_id, tool="human_only", args=args
+    )
+    with pytest.raises(ToolRefused, match="no human has approved"):
+        await runtime(engine).invoke(
+            tool_name="human_only",
+            args={"amount": 5.0},
+            site=site(conversation_id, run_id),
+            caller="tool_node",
+            requires_approval="confirm_it",
+        )
+
+    sessions = make_session_factory(engine)
+    async with sessions() as session, session.begin():
+        live = await repo.live_approvals(session, conversation_id)
+        customer = next(row for row in live if row.approved_by == "customer")
+        await repo.record_human_approval(session, template=customer, now=datetime.now(UTC))
+
+    result = await runtime(engine).invoke(
+        tool_name="human_only",
+        args={"amount": 5.0},
+        site=site(conversation_id, run_id),
+        caller="tool_node",
+        requires_approval="confirm_it",
+    )
+
+    assert result.output_json["total"] == 5.0
+    async with engine.connect() as connection:
+        rows = await connection.execute(
+            text(
+                "SELECT approved_by, tool, args_hash, node_id, frame_seq FROM action_approval "
+                "WHERE conversation_id = :c ORDER BY approved_at, id"
+            ),
+            {"c": conversation_id},
+        )
+        signatures = [dict(row) for row in rows.mappings()]
+    assert [row["approved_by"] for row in signatures] == ["customer", "human"]
+    assert signatures[0]["args_hash"] == signatures[1]["args_hash"]
+    assert signatures[0]["node_id"] == signatures[1]["node_id"]
+    assert signatures[0]["frame_seq"] == signatures[1]["frame_seq"]
 
 
 async def test_re_recording_a_confirm_step_does_not_leave_args_and_hash_disagreeing(

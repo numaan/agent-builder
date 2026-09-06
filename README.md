@@ -162,18 +162,45 @@ SUPPORT_APP_CONFIG=demo/acme_web_chat.json python -m uvicorn app:app --port 8000
 Then open <http://127.0.0.1:8000/>. On Windows use `.venv/Scripts/python.exe` in place of
 `python` (Git Bash accepts the `VAR=value command` prefix); on Linux or macOS use `.venv/bin/python`.
 
-The page offers the four messages of the recorded conversation as buttons. Send them in order:
+The page offers the recorded messages as buttons. Send the first four in order:
 
 1. *I got charged twice for the Pro Plan this month; can I have one of them back?*
-2. *The code is 581139.*  (the passcode the pack's fake sends to `me@example.com`)
+2. *The code is 581139. Also, can you change my address while we are at it?*
 3. *Yes please, go ahead and refund it.*
-4. *No, that is all. Thanks!*
+4. *Yes please - it is 4 Elm Row, Edinburgh, EH7 4AH, United Kingdom.*
 
-What to watch for: the workflow verifies the customer's identity **before** it looks at the
-account; the proposed refund appears in a bordered panel that names the tool it is asking to run
-(`issue_refund`) and quotes the exact proposal the approval is bound to; nothing happens until
-you answer it. Reload the page mid-conversation and the transcript comes back and the
-conversation carries on - it is identified by a session key, not by the connection.
+What to watch for:
+
+- **The identity check comes first.** The workflow verifies the customer **before** it looks at
+  the account, because that is a gate in the graph rather than an instruction in a prompt.
+- **The topic change is not lost.** Message two answers the passcode question *and* asks for
+  something else. Identity verification is in the pack's `interrupts.blocked_in`, so the agent
+  finishes it, says it has made a note, and comes back to the address change afterwards - which
+  is what it does at message four, without being asked again (DESIGN.md section 6.6).
+- **Nothing moves until you say so.** The proposed refund appears in a bordered panel naming the
+  tool it would run (`issue_refund`) and quoting the exact proposal the approval is bound to.
+- **A reload changes nothing.** The transcript comes back and the conversation carries on: it is
+  identified by a session key, not by the connection.
+
+Send the fifth message - *Why was I charged 40 dollars on the 3rd?* - in a fresh conversation to
+see the other half of phase 6. This pack has no workflow for looking up a charge, so it hands the
+conversation to a person: the agent says so, the run parks, and a packet lands on the
+`billing-tier-1` queue. Read it, answer the customer, and give the workflow back:
+
+```sh
+curl localhost:8000/desk/handoffs                                   # the queue
+curl localhost:8000/desk/handoffs/<id>                              # the whole packet
+curl -X POST localhost:8000/desk/handoffs/<id>/reply \
+     -H 'content-type: application/json' \
+     -d '{"text": "That was the annual renewal."}'
+curl -X POST localhost:8000/desk/handoffs/<id>/resume -H 'content-type: application/json' -d '{}'
+```
+
+The reply appears in the customer's open browser tab, attributed to a person rather than to the
+agent. The packet carries the reason, an LLM-written summary, whether identity was verified,
+where the conversation stopped, its state, every WRITE and HIGH tool call the conversation made,
+any pending action, suggested next steps and a transcript link. The desk has **no
+authentication** - see `support_core/api/desk.py`; that is phase 7's first job on this surface.
 
 Two things worth knowing:
 

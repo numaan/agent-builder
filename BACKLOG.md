@@ -12,7 +12,7 @@ Each phase follows the five-step workflow in [PLAN.md](PLAN.md). Design referenc
 | 4 | Tool runtime and safety nodes | done | reviews/phase-4.md |
 | W | Web chat slice (pulled forward from 7) | in-review | reviews/phase-w.md |
 | 5 | Knowledge layer and citations | todo | reviews/phase-5.md |
-| 6 | Interrupts, root graph, handoff | todo | reviews/phase-6.md |
+| 6 | Interrupts, root graph, handoff | self-critique | reviews/phase-6.md |
 | 7 | Channels, observability, replay | todo | reviews/phase-7.md |
 | 8 | Evaluation harness | todo | reviews/phase-8.md |
 | 9 | Knowledge graph, customer memory, cost controls, packaging | todo | reviews/phase-9.md |
@@ -169,18 +169,18 @@ Exit criterion: the wrong-answer-to-source-version trace test passes.
 
 Design: sections 6.5, 6.6, 13, 7.3.
 
-- [ ] Interrupt check as a structured LLM call producing `continue`, `new_intent`, `cancel`, `unclear`; honours `interrupts.allowed_from` and `blocked_in`; records secondary intents.
-- [ ] Return-to-interrupted-workflow prompt after the interrupting workflow ends.
-- [ ] Root graph pattern in the sample pack with `refund`, `update_address`, `small_talk`, `unknown`, `handoff`.
-- [ ] `HandoffPacket` builder using the escalation model; `handoff` node; `HandoffSink` protocol with webhook and Postgres queue sinks.
-- [ ] Desk API: list handoffs, reply, resume with state patch, close.
-- [ ] All failure paths from section 7.3 route to handoff with the right reason.
-- [ ] Revisit the confirm-coverage control-flow graph for interrupts: model the interrupt push and the return-and-resume, and make `graph.subgraph_cycle` check the cycle path rather than the whole graph (phase 1 deferred finding N3).
-- [ ] Report the *arguments* a `confirm_exempt` tool's nodes pass it in `graph.confirm_exempt`, so a reviewer sees a model-written address differently from `ctx.customer.email` (phase 4 resolution). Needs the cross-graph model above, because a gate redirect can reach such a node from another graph.
-- [ ] An `on_error` edge that returns to its own `tool` node repeats the call under a fresh idempotency key. Harmless for a tool with an approval (spent) and bounded for a non-idempotent one, but a `confirm_exempt` WRITE tool repeats its side effect once per failure and the validator says nothing (phase 4 resolution, the shape behind finding R1). Decide whether it is a load-time finding, a per-node attempt cap, or both, while rebuilding the failure routing of DESIGN.md 7.3.
-- [ ] `update_address.yaml` graph in the sample pack.
+- [x] Interrupt check as a structured LLM call producing `continue`, `new_intent`, `cancel`, `unclear`; honours `interrupts.allowed_from` and `blocked_in`; records secondary intents.
+- [x] Return-to-interrupted-workflow prompt after the interrupting workflow ends.
+- [x] Root graph pattern in the sample pack with `refund`, `update_address`, `small_talk`, `unknown`, `handoff`.
+- [x] `HandoffPacket` builder using the escalation model; `handoff` node; `HandoffSink` protocol with webhook and Postgres queue sinks.
+- [x] Desk API: list handoffs, reply, resume with state patch, close. Plus `approve`, which is what makes phase 4's `requires_human_approval` satisfiable, and a transcript endpoint, so `packet.transcript_url` is a real link rather than a plausible one.
+- [x] All failure paths from section 7.3 route to handoff with the right reason.
+- [x] Revisit the confirm-coverage control-flow graph for interrupts: model the interrupt push and the return-and-resume, and make `graph.subgraph_cycle` check the cycle path rather than the whole graph (phase 1 deferred finding N3).
+- [x] Report the *arguments* a `confirm_exempt` tool's nodes pass it in `graph.confirm_exempt`, so a reviewer sees a model-written address differently from `ctx.customer.email` (phase 4 resolution). Needs the cross-graph model above, because a gate redirect can reach such a node from another graph.
+- [x] An `on_error` edge that returns to its own `tool` node repeats the call under a fresh idempotency key. Harmless for a tool with an approval (spent) and bounded for a non-idempotent one, but a `confirm_exempt` WRITE tool repeats its side effect once per failure and the validator says nothing (phase 4 resolution, the shape behind finding R1). Decide whether it is a load-time finding, a per-node attempt cap, or both, while rebuilding the failure routing of DESIGN.md 7.3. **Both**: `graph.on_error_repeats_side_effect` (WARNING, because re-sending a passcode is this shape and is right) and `limits.max_node_errors`, counted per node per frame so it survives a crash and leaves ordinary loops alone.
+- [x] `update_address.yaml` graph in the sample pack. (Landed with the address workflow before this phase; the interrupt paths that make it demonstrable are phase 6's.)
 
-Exit criterion: the section 19 worked example runs end to end with the fake provider as an integration test, including the interrupt at step 7 and the secondary intent at step 15.
+Exit criterion: the section 19 worked example runs end to end with the fake provider as an integration test, including the interrupt at step 7 and the secondary intent at step 15. **Met**: `tests/cassettes/scenarios.py::ACME_INTERRUPT_DEFERRED`, replayed by `tests/test_golden_conversation.py`, is that conversation - the interrupt is refused by `verify_identity` and recorded, and four turns later the root graph's classifier is shown it and chooses `update_address`.
 
 ## Phase 7: Channels, observability, replay
 
@@ -349,7 +349,7 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
 - ~~[phase 0] N1: `action_approval` has no single-use marker or expiry, so one approval row could satisfy two tool calls with the same args hash, nit (a design gap: DESIGN 8.2 does not demand single use), deferred to phase 4.~~ **Closed in phase 4**: `consumed_at`/`consumed_by_tool_call_id`, taken by an atomic update that is also the claim, so two racing callers cannot both win. The approval is bound to the run, the frame and the confirm node besides.
 - [phase 0] N2 (downgrade half): the initial migration's downgrade drops the `vector` extension, which fails or removes a shared extension if an administrator pre-installed it, nit, deferred to phase 5 which owns pgvector; editing the initial migration for a shared-instance concern is not a risk-free few lines. The superuser requirement is documented in README.
 - [phase 0] N9: two concurrent `pytest` processes against one database corrupt each other's fixtures (reviewer measured 47 passed, 8 errors); README warns but nothing enforces it, nit, deferred because a session-long advisory lock needs a connection that outlives the per-test event loops, which the fixture design avoids on purpose. The dedicated `support_test` database (F2) removes the developer-database half of the risk.
-- [phase 1] N3: `graph.subgraph_cycle` fires only when *no* graph in the cycle contains a suspending node anywhere, not one on the cycle path, so mutual recursion through a graph with an unrelated `ask` on an untaken branch is missed (reviewer's hostile case T, reproduced after resolution), nit, deferred to phase 6, which owns interrupts and has to rebuild the cross-graph control-flow model for the push and resume edges anyway; a path-sensitive cross-graph cycle check is not a few safe lines (checklist line added there).
+- ~~[phase 1] N3: `graph.subgraph_cycle` fires only when *no* graph in the cycle contains a suspending node anywhere, not one on the cycle path, so mutual recursion through a graph with an unrelated `ask` on an untaken branch is missed (reviewer's hostile case T, reproduced after resolution), nit, deferred to phase 6.~~ **Closed in phase 6**: each leg of a cycle is judged on its own path - can this graph reach the call that continues the cycle from its start without passing a suspending node? - and the cycle is refused only when every leg can. Hostile case T is now an error. The interprocedural CFG also gained the interrupt push and return edges of DESIGN.md 6.6, which can only shrink the confirm-coverage sets and makes the phase-1 self-critique's item 4 honest.
 - ~~[phase 1] H: the approval-argument comparison is textual, so a `tool` node that rewrites a field the approved arguments read, between the confirm and the call, passes `graph.approval_mismatch` (reviewer's hostile case H), should-fix, deferred to phase 4.~~ **Closed in phase 4**, both halves: `graph.approval_args_mutated` refuses it at load, and the run-time hash check refuses it at execution even in a pack that never met the validator.
 - ~~[phase 1] I: risk tiers come from the pack-authored `tools/tools.yaml`, so declaring `issue_refund` as `read` removes every confirm check and makes it callable from an `llm` loop (reviewer's hostile case I), should-fix, deferred to phase 4.~~ **Closed in phase 4**: nothing at run time reads that file. The registry built from the imported `TOOLS` is what the validator type-checks against and what the runtime enforces, and a declared tier that disagrees is `tools.registry_drift` (ERROR).
 - ~~[phase 1] J: a WRITE tool marked `confirm_exempt` is reported as INFO only, which does not fail `--strict` and forces no human to look (reviewer's hostile case J), nit, deferred to phase 4.~~ **Closed in phase 4**: `confirm_exempt_reason` is required, and `graph.confirm_exempt` is a WARNING quoting it.
@@ -364,12 +364,65 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
 - [phase 0] N12: `doc_chunk.embedding` is dimensionless, so no HNSW index is possible and mixed-dimension rows fail only at query time, nit (admitted by the implementer, measured by the reviewer), deferred to phase 5 which picks the embedding model (checklist line added there).
 - [phase 4] R8: `refund.yaml`'s `state.charge: Charge` names a model the pack's tools export, which core cannot resolve, so it is typed `Any` and `state.charge.amount` is unchecked in both the confirm action and the tool args (`graph.state_type_unresolved`), nit, deferred to phase 9. No money risk - the two expressions are identical, `graph.approval_args_mutated` covers the path between them, and the hash is taken over arguments coerced through the tool's input model at both ends. Both fixes are bigger than a resolution pass should carry: flattening the state rewrites the arguments of the one HIGH-risk call in the pack, and letting a graph name a pack-exported model is loader work that belongs with phase 9's core/pack split (checklist line added there).
 - [phase 4] R9: the per-turn tool budget counts only model-loop calls, so a graph that walks five `tool` nodes spends none of `max_tool_calls_per_turn` and only `max_nodes_per_turn` bounds it, nit, deferred to phase 9 on the reviewer's own recommendation: widening the counter changes what an existing manifest key means, which is a compatibility decision rather than a fix, and phase 9 owns the cost caps (checklist line added there).
-- [phase 4] The `graph.confirm_exempt` warning names the tool but not the *arguments* the pack's nodes pass it, so a reviewer cannot see `send_otp(email: state.email)` - a model-written address - differently from `send_otp(email: ctx.customer.email)`. Raised by the review's closing recommendation and by the self-critique's own attack 7; not a numbered finding. Nit, deferred to phase 6: the report is only honest once the cross-graph control-flow model exists (a gate redirect can reach a `confirm_exempt` tool node from another graph), which is finding N3's work (checklist line added there).
-- [phase 4] An `on_error` edge that returns to its own `tool` node re-enters at the next attempt, claims a fresh idempotency key, and calls the tool again. For a tool that needs an approval the second attempt is refused (the approval was spent by the first), and for a non-idempotent tool the at-most-once rule applies within one key - but a `confirm_exempt` WRITE tool with such an edge repeats its side effect once per failure, and nothing at load says so. Found while fixing R1, which is one instance of it; the async instance is closed, the shape is not. Should-fix, deferred to phase 6, which owns DESIGN.md 7.3's failure routing and the `handoff` node that a self-returning `on_error` is usually standing in for (checklist line added there).
+- ~~[phase 4] The `graph.confirm_exempt` warning names the tool but not the *arguments* the pack's nodes pass it ... Nit, deferred to phase 6.~~ **Closed in phase 6**: the warning lists every call site of the exempt tool, across every graph, with the argument expression each one passes - so `verify_identity.send_code(email: 'ctx.customer.email')` reads differently from a node passing `state.email`.
+- ~~[phase 4] An `on_error` edge that returns to its own `tool` node re-enters at the next attempt, claims a fresh idempotency key, and calls the tool again ... Should-fix, deferred to phase 6.~~ **Closed in phase 6, both ways**: `graph.on_error_repeats_side_effect` reports it at load (a WARNING, because re-sending a one-time passcode is this exact shape and is right), and `limits.max_node_errors` bounds it at run time - consecutive failures per node, counted in the frame so a crash does not reset them and an ordinary loop does not trip them, and a handoff with reason `limit_exceeded` when the bound is reached.
 
 ---
 
 ## Decisions log
+
+- 2026-09-06: **the root frame is never parked by an interrupt.** DESIGN.md 6.6 step 4 pushes a
+  workflow over a suspended frame and offers the old one back afterwards; when the suspended
+  frame is the *root* frame, that would mean asking "shall we go back to: is there anything
+  else?". Section 6.5 already gives the root graph an intent classifier it "loops back to after
+  each sub-graph returns", and that classifier knows every edge the root declares while the
+  interrupt check knows only the ones leading to a workflow - so a topic change there is the
+  root graph's own business and no check is run at all. `interrupts.allowed_from` may still list
+  the root graph, as DESIGN.md 5.1's example does; it is inert.
+
+- 2026-09-06: **`interrupts.allowed_from` is an allow-list, not a default.** A graph in neither
+  list is treated exactly as one in `blocked_in`: the request is recorded and offered back rather
+  than acted on. DESIGN.md 6.6 says "if the current graph allows interrupts", and the safe
+  reading of *allows* is *says so* - a pack that wants a workflow interrupted writes one line,
+  which is a decision somebody made rather than one a default made for them. `cancel` is the
+  exception and is honoured from every graph including a blocked one: refusing to let a customer
+  stop is worse than any workflow it interrupts, and unlike an interrupt it reaches nothing new.
+
+- 2026-09-06: **core writes the four sentences an interrupt needs**, and the deferral is one of
+  them. DESIGN.md 19 step 8 has the *node* say "I'll come back to the address change once the
+  refund is sorted", but the two node types that suspend into `waiting_customer` are `ask` and
+  `confirm` and neither speaks on resume, so leaving it to the pack would mean every pack that
+  wanted a working interrupt writing the same four messages into every graph. The *hint* reaches
+  the model as well - it is on the `ResumeEvent` and in the `SlotRequest`, which is what stops an
+  extractor reading "and change my address" as a passcode - but the sentence the customer sees is
+  core's, and each one is a promise the engine keeps.
+
+- 2026-09-06: **the return offer is a core step on the parked frame**, written to the trace under
+  the reserved node id `__interrupt_return__`. No graph declares it and no pack should have to; a
+  pack node id must match `^[a-z][a-z0-9_]*$`, so the name cannot collide. It advances its
+  attempt counter on every checkpoint like any other node, so the offer, the answer and a
+  re-offer after an unreadable reply are three steps rather than one id written three times.
+
+- 2026-09-06: **a handoff packet is delivered before the checkpoint that parks the run**, and
+  delivery is idempotent under `(run_id, step_id)`. The other order has a window in which the run
+  says a human is needed and no human has been told - and nothing sweeps for that, because a
+  suspended run is not a stalled one. This way a crash in the window re-executes the node, which
+  delivers again, which the unique index makes a no-op. The same device an `ActionApproval` uses
+  against a re-executed `confirm`.
+
+- 2026-09-06: **`HandoffNode` gains an optional `message` and `next_steps`**, and
+  `pack.yaml` gains `limits.max_node_errors`. DESIGN.md 6.2 gives the handoff node a `reason` and
+  two edges and no way to say anything, and a node that parks a customer in silence is worse than
+  one that does not exist; `next_steps` lets a pack override core's reason-keyed checklist in
+  section 13's packet, because a pack knows its own desk. `max_node_errors` is the bound
+  DESIGN.md 7.3's retry story needs and section 5.1 has nowhere to put - same precedent as phase
+  2's `timeouts:` and phase 3's `memory:`.
+
+- 2026-09-06: **DESIGN.md 7.3's middle failure tier - "otherwise the frame's `on_error` graph" -
+  is still not implemented**, for the third phase running. Phase 2 recorded it as a divergence
+  and phase 2's reviewer endorsed the omission; nothing phase 6 adds can raise a frame-level
+  error that a node-level edge could not catch, and the fall-through now reaches a real packet on
+  a real queue rather than a bare `waiting_human` status. Recorded again rather than invented.
 
 - 2026-09-06: DSPy folded into phase 12's pack tool rather than kept as its own phase, at the
   user's suggestion. It is the same job: the tool that drafts a workflow's instructions is the one

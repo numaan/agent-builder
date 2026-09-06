@@ -29,7 +29,7 @@ from tests.app_support import (
     reset_acme_backend,
     serving,
 )
-from tests.cassettes.scenarios import ACME_REFUND
+from tests.cassettes.scenarios import ACME_REFUND, SCENARIOS
 
 QUEUE_PACK = TEST_PACKS / "queue_pack"
 
@@ -241,15 +241,22 @@ async def test_a_message_posted_by_webhook_reaches_the_open_socket(engine: Async
 # -- the demo configuration is the recorded conversation -----------------------------------
 
 
-def test_the_demo_configuration_matches_the_recorded_conversation() -> None:
-    """The demo replays a recording, so its configuration is part of the recording.
+def test_the_demo_configuration_matches_the_recorded_conversations() -> None:
+    """The demo replays recordings, so its configuration is part of them.
 
-    The customer the conversation starts as, and the phrases the page offers, have to be the
-    ones the cassette was recorded with: a different email address means a different passcode
-    and a different prompt, and a different prompt is a cassette miss. If a future phase
-    re-records the refund scenario, this test is what says the demo has to move with it.
+    The customer the conversation starts as, and every phrase the page offers, have to be lines
+    some cassette was recorded with: a different email address means a different passcode and a
+    different prompt, and a different prompt is a cassette miss. If a future phase re-records a
+    scenario, this test is what says the demo has to move with it.
+
+    Phase 6 made the demo's suggestions span three conversations rather than one - the refund,
+    the interrupt that defers an address change into it, and the account question that goes to a
+    person - because those are the three things there are now to show.
     """
     config = AppConfig.from_file(DEMO_CONFIG)
     assert config.new_conversation_context == ACME_REFUND.context
-    assert config.suggestions == list(ACME_REFUND.turns)
     assert config.provider == "auto"
+    recorded = {turn for scenario in SCENARIOS for turn in scenario.turns}
+    unrecorded = [line for line in config.suggestions if line not in recorded]
+    assert not unrecorded, f"the demo offers lines no cassette records: {unrecorded}"
+    assert config.suggestions[0] == ACME_REFUND.turns[0]

@@ -762,6 +762,157 @@ nodes:
     assert "graph.subgraph_cycle" in rules(pack_dir, {"main": a, "other": b})
 
 
+def test_a_call_cycle_is_judged_on_the_path_the_cycle_takes(pack_dir: Path) -> None:
+    """Phase-1 deferred finding N3, and the reviewer's hostile case T.
+
+    The rule used to ask whether any graph in the cycle contained a suspending node *anywhere*,
+    which two graphs recursing through each other walked straight past by putting an ``ask`` on
+    a branch the cycle never takes: the loop waits for nobody and nothing reported it. What
+    matters is whether the loop can be travelled without waiting, so each leg is judged on its
+    own path from that graph's start to the call that continues the cycle.
+    """
+    spinning = """
+id: main
+state: { charge_id: str | None }
+start: pick
+nodes:
+  pick:
+    type: router
+    edges: { "state.charge_id == null": call }
+    default: ask_first
+  ask_first:
+    type: ask
+    slots: [charge_id]
+    prompt: "which charge?"
+    next: finish
+  call: { type: subgraph, graph: other, next: finish }
+  finish: { type: end }
+"""
+    other = """
+id: other
+state: { charge_id: str | None }
+start: call
+nodes:
+  call: { type: subgraph, graph: main, next: finish }
+  finish: { type: end }
+"""
+    assert "graph.subgraph_cycle" in rules(pack_dir, {"main": spinning, "other": other})
+
+
+def test_a_call_cycle_that_has_to_wait_on_every_pass_is_not_a_spin(pack_dir: Path) -> None:
+    """The other half of N3: the ``ask`` is *on* the path, so the loop is a conversation."""
+    waiting = """
+id: main
+state: { charge_id: str | None }
+start: ask_first
+nodes:
+  ask_first:
+    type: ask
+    slots: [charge_id]
+    prompt: "which charge?"
+    next: call
+  call: { type: subgraph, graph: other, next: finish }
+  finish: { type: end }
+"""
+    other = """
+id: other
+state: { charge_id: str | None }
+start: call
+nodes:
+  call: { type: subgraph, graph: main, next: finish }
+  finish: { type: end }
+"""
+    assert "graph.subgraph_cycle" not in rules(pack_dir, {"main": waiting, "other": other})
+
+
+def test_a_retry_that_repeats_a_side_effect_is_reported(pack_dir: Path) -> None:
+    """The load-time half of the shape phase 4's resolution left open.
+
+    A ``tool`` node whose ``on_error`` edge leads back to it runs its tool again on every
+    failure, under a fresh idempotency key. For a tool that needs an approval the second attempt
+    is refused, and ``graph.approval_reused`` refuses the loop at load; this is the case neither
+    covers - a WRITE tool marked ``confirm_exempt``, where nothing stands between the failure
+    and the repeat.
+
+    A warning, not an error: re-sending a one-time passcode after a failure is exactly this
+    shape and is exactly right. What the author has to do is decide.
+    """
+    graph = """
+id: main
+state: { charge_id: str | None, sent: bool | None }
+start: send
+nodes:
+  send:
+    type: tool
+    tool: exempt_tool
+    args: { charge_id: state.charge_id }
+    into: { sent: result.sent }
+    on_error: ask_again
+    next: finish
+  ask_again:
+    type: ask
+    slots: [charge_id]
+    prompt: "that failed - try again?"
+    next: send
+  finish: { type: end }
+"""
+    assert "graph.on_error_repeats_side_effect" in rules(pack_dir, {"main": graph})
+
+
+def test_an_on_error_edge_that_does_not_come_back_is_not_reported(pack_dir: Path) -> None:
+    """The sample pack's own shape: a failure that gives up rather than retrying."""
+    graph = """
+id: main
+state: { charge_id: str | None, sent: bool | None }
+start: send
+nodes:
+  send:
+    type: tool
+    tool: exempt_tool
+    args: { charge_id: state.charge_id }
+    into: { sent: result.sent }
+    on_error: give_up
+    next: finish
+  give_up:
+    type: say
+    message: "I could not send it."
+    next: finish
+  finish: { type: end }
+"""
+    assert "graph.on_error_repeats_side_effect" not in rules(pack_dir, {"main": graph})
+
+
+def test_the_confirm_exemption_report_names_the_arguments_each_call_site_passes(
+    pack_dir: Path,
+) -> None:
+    """Phase 4's closing recommendation, and its self-critique's attack 7.
+
+    The warning named the tool and not the call, so a reviewer could not tell a model-written
+    address from the customer's own record - and the exemption is the reason nothing else is
+    between them. Now the call sites and their arguments are in the message.
+    """
+    graph = """
+id: main
+state: { charge_id: str | None, sent: bool | None }
+start: send
+nodes:
+  send:
+    type: tool
+    tool: exempt_tool
+    args: { charge_id: state.charge_id }
+    into: { sent: result.sent }
+    next: finish
+  finish: { type: end }
+"""
+    findings = [
+        f
+        for f in check(pack_dir, {"main": graph})
+        if f.rule == "graph.confirm_exempt" and "exempt_tool" in f.message
+    ]
+    assert findings, "the exemption was not reported at all"
+    assert "main.send(charge_id: 'state.charge_id')" in findings[0].message
+
+
 # --------------------------------------------------------------------------------------
 # The confirm rule (DESIGN.md 5.2 and 8.2): the point of the phase.
 # --------------------------------------------------------------------------------------
