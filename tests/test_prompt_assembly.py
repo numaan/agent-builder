@@ -16,7 +16,9 @@ import pytest
 from support_core.llm.prompt import (
     _RESERVED_LINE,
     CORE_SYSTEM_PROMPT,
+    DATA_BEGIN,
     DATA_END,
+    KEY_SECTION,
     Decision,
     Layer,
     Passage,
@@ -27,6 +29,7 @@ from support_core.llm.prompt import (
     TranscriptMessage,
     assemble,
     estimate_tokens,
+    fold,
     neutralise,
 )
 
@@ -52,23 +55,39 @@ ESCAPES = [
 ]
 
 
-def assert_only_core_wrote_structure(body: str) -> None:
+def assert_only_core_wrote_structure(body: str, nonce: str) -> None:
     """The invariant the whole layering rests on.
 
     Every line that *reads as* prompt structure - a section marker or a data fence - must be one
-    the assembler wrote. A neutralised line no longer matches the pattern at all, because the
-    marker is no longer at the start of the line, which is the only position structure is ever
-    written in.
+    the assembler wrote. Two mechanisms make that true: a genuine fence carries this rendering's
+    delimiter token, which whoever wrote the data cannot know (review finding V1), and a line
+    that merely looks like structure is neutralised, so its marker is no longer at the start of
+    a line.
+
+    The independent - and deliberately looser - judge of "reads as structure" lives in
+    ``tests/test_prompt_injection_matrix.py``, which crosses 28 hostile payloads with all
+    fifteen untrusted slots. This helper uses the module's own matcher, because what it checks
+    is the rendering rather than the matcher.
     """
     for line in body.splitlines():
-        if not _RESERVED_LINE.match(line):
+        if not _RESERVED_LINE.match(fold(line)):
             continue
         legitimate = (
-            line == DATA_END
-            or (line.startswith("-----BEGIN UNTRUSTED DATA (") and line.endswith(")-----"))
+            line == data_end(nonce)
+            or (line.startswith(data_begin_head(nonce)) and line.endswith(")-----"))
             or bool(SECTION_RE.match(line))
+            or line == KEY_SECTION
         )
         assert legitimate, f"a caller forged prompt structure: {line!r}"
+
+
+def data_end(nonce: str) -> str:
+    return DATA_END.format(nonce=nonce)
+
+
+def data_begin_head(nonce: str) -> str:
+    """Everything in a ``BEGIN`` marker up to the label."""
+    return DATA_BEGIN.format(nonce=nonce, label="\x00").split("\x00")[0]
 
 
 def layers_of(text: str) -> dict[int, str]:
@@ -157,7 +176,7 @@ def test_a_hostile_pack_author_cannot_escape_their_layer(
     # The attempt is visible, in the pack's own layer, and defused.
     body = rendered[layer.value]
     assert payload.splitlines()[-1] in body
-    assert_only_core_wrote_structure(text)
+    assert_only_core_wrote_structure(text, prompt.nonce)
     # No layer marker was forged: one marker per rendered layer, and no more.
     assert len(SECTION_RE.findall(text)) == len([lay for lay in Layer if rendered.get(lay.value)])
     # Nothing the pack wrote reached the core layer.
@@ -180,11 +199,12 @@ def test_a_hostile_customer_message_stays_inside_its_data_block(payload: str) ->
     conversation = layers_of(text)[Layer.CONVERSATION.value]
 
     assert payload.splitlines()[-1] in conversation
-    assert_only_core_wrote_structure(text)
+    assert_only_core_wrote_structure(text, prompt.nonce)
     # Two messages, two fences, and every fence was opened and closed by the assembler.
     lines = conversation.splitlines()
-    assert lines.count(DATA_END) == 2
-    assert sum(1 for line in lines if line.startswith("-----BEGIN UNTRUSTED DATA (message")) == 2
+    assert lines.count(data_end(prompt.nonce)) == 2
+    head = data_begin_head(prompt.nonce) + "message"
+    assert sum(1 for line in lines if line.startswith(head)) == 2
 
 
 @pytest.mark.parametrize("payload", ESCAPES)
@@ -202,10 +222,10 @@ def test_state_tool_results_and_passages_are_data_too(payload: str) -> None:
     )
     text = prompt.text()
     rendered = layers_of(text)
-    assert_only_core_wrote_structure(text)
+    assert_only_core_wrote_structure(text, prompt.nonce)
     for layer in (Layer.STATE, Layer.KNOWLEDGE, Layer.TOOL_RESULTS, Layer.CONVERSATION):
         body = rendered[layer.value]
-        assert body.splitlines().count(DATA_END) >= 1, layer
+        assert body.splitlines().count(data_end(prompt.nonce)) >= 1, layer
         assert payload.splitlines()[-1] in body, layer
 
 
@@ -218,8 +238,9 @@ def test_a_fence_label_cannot_be_forged_through_a_passage_id() -> None:
         )
     )
     text = prompt.text()
-    assert_only_core_wrote_structure(text)
-    assert layers_of(text)[Layer.KNOWLEDGE.value].splitlines().count(DATA_END) == 1
+    assert_only_core_wrote_structure(text, prompt.nonce)
+    knowledge = layers_of(text)[Layer.KNOWLEDGE.value]
+    assert knowledge.splitlines().count(data_end(prompt.nonce)) == 1
 
 
 def test_neutralise_never_deletes_the_attempt() -> None:

@@ -219,10 +219,14 @@ class LlmService:
                 output = await self._answer(request, schema, spec, correction, state)
             except StructuredOutputError as exc:
                 last = exc
+                # `exc.summary` and not `exc`: the detailed message names the offending *field*,
+                # and for an extra field that name is the model's own string, which would put
+                # model-controlled text into layer 5 - a trusted, unfenced layer (review finding
+                # V5). The summary is drawn from a fixed vocabulary; the detail stays in the
+                # exception, where it reaches the trace and the handoff and not the prompt.
                 correction = (
-                    "Your previous answer was rejected: "
-                    f"{exc}. Answer again, using only the labels listed above and the exact "
-                    "shape you were given."
+                    f"Your previous answer was rejected: {exc.summary}. Answer again, using only "
+                    "the labels listed above and the exact shape you were given."
                 )
                 continue
             return NodeDecision(
@@ -265,7 +269,9 @@ class LlmService:
         gateway = request.gateway
         tools = await gateway.specs() if gateway is not None and gateway.declared else []
         messages = list(prompt.messages)
-        for _ in range(max(1, request.max_tool_iterations + 1)):
+        # `max_tool_iterations` iterations, not one more (review finding V6): each pass through
+        # this loop is one provider call, so a declared bound of five used to buy six.
+        for _ in range(max(1, request.max_tool_iterations)):
             req = CompletionRequest(
                 model="",  # filled per rung by _complete
                 system=prompt.system,
@@ -280,13 +286,15 @@ class LlmService:
                 return _validate(schema, response.structured, spec.name)
             if not response.tool_calls:
                 msg = "the model answered without choosing a decision"
-                raise StructuredOutputError(msg)
+                raise StructuredOutputError(msg, summary="you answered without choosing a decision")
             if gateway is None or not tools:
                 msg = (
                     f"the model asked for tools ({[c.name for c in response.tool_calls]}) that "
                     f"this node does not offer"
                 )
-                raise StructuredOutputError(msg)
+                raise StructuredOutputError(
+                    msg, summary="you asked for a tool this step does not offer"
+                )
             messages.append(response.assistant_message())
             results: list[ToolResultPart] = []
             for call in response.tool_calls:
@@ -294,7 +302,14 @@ class LlmService:
                 results.append(
                     ToolResultPart(
                         tool_use_id=call.id,
-                        content=data_block(f"tool result from {call.name}", outcome.content),
+                        # The label is the *resolved* tool's name, never the model's string
+                        # (review finding V10): a refused call has no resolved tool, and echoing
+                        # what was asked for would put an unresolved name in a fence marker.
+                        content=data_block(
+                            f"tool result from {gateway.label_for(call)}",
+                            outcome.content,
+                            nonce=prompt.nonce,
+                        ),
                         is_error=outcome.is_error,
                     )
                 )
@@ -303,7 +318,7 @@ class LlmService:
             f"the model kept asking for tools and never decided "
             f"({request.max_tool_iterations} iterations)"
         )
-        raise StructuredOutputError(msg)
+        raise StructuredOutputError(msg, summary="you used every tool iteration without deciding")
 
     # -- the ask node --------------------------------------------------------------------
 
@@ -432,6 +447,31 @@ def _add(left: Usage, right: Usage) -> Usage:
     )
 
 
+SAFE_REASONS: dict[str, str] = {
+    "literal_error": "the decision was not one of the labels listed above",
+    "enum": "the decision was not one of the labels listed above",
+    "extra_forbidden": "it contained fields outside the schema you were given",
+    "missing": "a required field was missing",
+    "greater_than_equal": "a number was outside its allowed range",
+    "less_than_equal": "a number was outside its allowed range",
+}
+"""Review finding V5: what the model is told about its own mistake, drawn from a fixed
+vocabulary. Nothing here interpolates a string the model wrote, because the correction is
+rendered into layer 5 - trusted and unfenced - and pydantic's ``loc`` for an extra field *is*
+the model's own key name."""
+
+DEFAULT_SAFE_REASON = "a value was of the wrong type or shape"
+
+
+def _safe_summary(exc: ValidationError) -> str:
+    reasons: list[str] = []
+    for err in exc.errors():
+        reason = SAFE_REASONS.get(str(err.get("type", "")), DEFAULT_SAFE_REASON)
+        if reason not in reasons:
+            reasons.append(reason)
+    return "; ".join(reasons) or DEFAULT_SAFE_REASON
+
+
 def _validate[ModelT: BaseModel](
     schema: type[ModelT], payload: Mapping[str, Any], tool: str
 ) -> ModelT:
@@ -443,4 +483,4 @@ def _validate[ModelT: BaseModel](
             for err in exc.errors()
         )
         msg = f"the {tool!r} answer does not fit the required shape: {problems}"
-        raise StructuredOutputError(msg) from exc
+        raise StructuredOutputError(msg, summary=_safe_summary(exc)) from exc

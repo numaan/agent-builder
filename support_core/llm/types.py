@@ -44,7 +44,17 @@ class StructuredOutputError(LLMError):
     with backoff and then downgraded to the escalation model, while a model that returns an
     undeclared edge or a malformed payload is retried *once* and then handed off (DESIGN.md
     sections 11.3 and 7.3). Confusing the two would retry a deterministic failure six times.
+
+    ``summary`` is the *safe* half of the message: a phrase drawn from a fixed vocabulary, with
+    nothing the model wrote in it. It is the only part that may be told back to the model on the
+    retry, because that correction is rendered into layer 5, which is trusted and unfenced
+    (review finding V5). ``str(exc)`` keeps the detail - the field names, pydantic's own words -
+    for the trace, the log and the handoff packet, none of which are a prompt.
     """
+
+    def __init__(self, message: str, *, summary: str | None = None) -> None:
+        super().__init__(message)
+        self.summary = summary or "it did not fit the shape you were given"
 
 
 class Usage(BaseModel):

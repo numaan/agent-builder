@@ -141,6 +141,16 @@ class ReadOnlyToolGateway:
             call.name, call.arguments, call_id=call.id, step_id=self.step_id
         )
 
+    def label_for(self, call: ToolCall) -> str:
+        """The name to put in a fence label for this call's result.
+
+        The *resolved* spec's name, or ``unknown tool`` when nothing resolved - which is every
+        refusal. ``call.name`` comes from the model, and a fence label is core-written text
+        (review finding V10).
+        """
+        spec = (self._specs or {}).get(call.name)
+        return spec.name if spec is not None else "unknown tool"
+
     def _refuse(self, name: str, reason: str) -> ToolOutcome:
         self.refusals.append(name)
         self.calls.append(name)

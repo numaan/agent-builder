@@ -10,6 +10,7 @@ Two things have to be true, and the second one matters more than the first:
 """
 
 import dataclasses
+import re
 import uuid
 from typing import Any
 
@@ -145,7 +146,7 @@ async def test_the_summary_reaches_the_next_prompt_as_fenced_data(
     from support_core.llm.fake import render_request
 
     last = render_request([call for call in provider.calls if call.purpose == "node"][-1])
-    assert "-----BEGIN UNTRUSTED DATA (conversation summary so far)-----" in last
+    assert re.search(r"BEGIN UNTRUSTED DATA [0-9a-f]{32} \(conversation summary so far\)", last)
     assert "The customer said hello twice." in last
 
 
