@@ -16,6 +16,8 @@ Each phase follows the five-step workflow in [PLAN.md](PLAN.md). Design referenc
 | 7 | Channels, observability, replay | todo | reviews/phase-7.md |
 | 8 | Evaluation harness | todo | reviews/phase-8.md |
 | 9 | Knowledge graph, customer memory, cost controls, packaging | todo | reviews/phase-9.md |
+| 10 | Evaluate mem0 for customer memory (after 8) | todo | reviews/phase-10.md |
+| 11 | Evaluate DSPy for per-node prompt tuning (after 8) | todo | reviews/phase-11.md |
 | F | Final integration review | todo | reviews/final.md |
 
 ---
@@ -219,6 +221,67 @@ Design: sections 9.1 (knowledge graph), 10, 20, 4.1.
 
 Exit criterion: the sample pack builds as its own image, starts, and answers "what does my plan include" with a knowledge-graph citation.
 
+## Phase 10: Evaluate mem0 for customer memory
+
+Depends on Phase 9 (which builds customer memory by hand) and on Phase 8 (which gives a way to
+tell whether a change helped). Added 2026-09-06 at the user's request.
+
+**Only the fourth memory layer is in scope.** DESIGN.md section 10 has four: the verbatim turn
+window, the rolling summary, typed frame state, and durable per-customer notes. The first three
+are not candidates and must not be handed to a library. Frame state in particular is what the
+audit trail, the replay endpoint and the crash recovery are built on, and phase 2's review found
+two message-loss bugs caused by state living outside durable storage; a second store with its own
+idea of conversation state would reintroduce exactly that class of bug.
+
+- [ ] Establish the baseline first: hand-built `customer_memory` from phase 9, scored on the phase
+      8 golden conversations. Without a number, "mem0 is better" is unfalsifiable.
+- [ ] Check the durability constraint before anything else. DESIGN.md 7.1 requires the frame stack
+      and the trace step to be written in ONE transaction, and resume to be derived entirely from
+      durable state. If per-customer notes cannot be read and written inside that transaction, or
+      an outage of the memory service can wedge a turn, that is a rejection on its own.
+- [ ] Check data residency and retention. DESIGN.md 20 makes retention configurable per pack and
+      requires PII redaction; a hosted memory store moves customer data out of the deployment's
+      own Postgres, which section 4.1 assumes is the only stateful dependency.
+- [ ] Decide what recall would actually improve. The candidate wins are a preferred name, a
+      recurring issue, and a channel preference. If the wins are only those, a table is enough.
+- [ ] Behind the existing WRITE-tier internal tool either way, so a memory write stays subject to
+      the same risk policy and the same trace as any other side effect.
+- [ ] Nothing in customer memory may ever set `identity_verified`; that is only ever set by the
+      `verify_identity` sub-graph via a tool (DESIGN.md section 10).
+
+Exit criterion: a written recommendation with the baseline and the measured comparison, and either
+an implementation behind the memory tool or a recorded decision not to adopt, with reasons.
+
+## Phase 11: Evaluate DSPy for per-node prompt tuning
+
+Depends on Phase 8. Added 2026-09-06 at the user's request. It cannot come earlier: optimisation
+needs a scoring function and a training set, and until the golden conversations and node evals of
+section 16 exist there is nothing to optimise against and a tuner would fit to noise.
+
+**Scope is the node's own instruction text and nothing else.** DESIGN.md 11.2 fixes nine prompt
+layers in an order packs cannot change, and layers 1 to 3 - the core system prompt, the persona
+and the policies - are a compliance surface. An optimiser that rewrites a policy line to improve a
+score has broken the thing the design exists to protect.
+
+- [ ] Freeze layers 1 to 3 against any optimiser, structurally, not by convention. The assembly
+      already refuses to let a pack reorder or reach past its own layer; extend that so a tuning
+      run physically cannot alter them, and test it.
+- [ ] Baseline every `llm` node on the phase 8 suite before tuning, per node, not per pack.
+- [ ] Tune `instructions` only, per node, and diff the result a human reviews. A prompt nobody
+      read is a prompt nobody owns.
+- [ ] Re-run the adversarial suite after tuning. A prompt optimised for task accuracy can quietly
+      lose refusal behaviour, and phase 3's review showed injection resistance is not something to
+      take on trust.
+- [ ] Keep the decision constraint out of scope: an undeclared edge is refused by the engine
+      against the graph's own labels (DESIGN.md 3, principle 2), not by prompt wording, and tuning
+      must not become a reason to soften that.
+- [ ] Record tuned prompts as pack data, versioned and reviewable like any other pack change, not
+      as an artefact regenerated at deploy time.
+
+Exit criterion: a measured before-and-after on the phase 8 suite per node, the adversarial suite
+still green, and either tuned instructions committed as reviewed pack data or a recorded decision
+not to adopt.
+
 ## Phase F: Final integration review
 
 - [ ] A fresh agent reviews the whole repository against DESIGN.md sections 3 and 14: every guiding principle and every structural guardrail must be traceable to code and a test.
@@ -257,6 +320,13 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
 ---
 
 ## Decisions log
+
+- 2026-09-06: mem0 and DSPy added to the roadmap as phases 10 and 11, both sequenced after phase 8
+  and both scoped narrowly. Neither is used today. The reason for the ordering is the same in both
+  cases: phase 8 is what produces a score, and adopting either without one is a change nobody can
+  tell the sign of. The scope limits differ - mem0 may only touch per-customer notes, never frame
+  state, because durability depends on one transaction; DSPy may only touch node instructions,
+  never the persona or policy layers, because those are a compliance surface.
 
 - 2026-09-06: GLM added as a second model provider, outside the phase structure, because the
   deployment needs it. Z.ai serves GLM through an Anthropic-compatible endpoint, so it is the
