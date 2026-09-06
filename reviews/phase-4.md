@@ -693,3 +693,194 @@ review. That belongs in the README's pack section and in DESIGN.md 4.1.
   does not prove. Its attacks 2 (the approval covers the arguments, not the sentence) and 4 (a
   gate redirect between confirmation and call is not statically analysed) are both real and both
   correctly scoped to later phases; I have nothing to add to either.
+
+## Resolution
+
+Resolver: a fresh agent that wrote none of the phase-4 code, 2026-09-06 (PLAN.md step 5). The
+must-fix is fixed, with a regression test confirmed to fail against the code as reviewed. Every
+should-fix is fixed. Both nits are deferred with a reason and a home. The review itself was
+committed first as `c27345f`, as in phases 0 to 3.
+
+### R1: the fix, not the refusal
+
+The instructions offered two acceptable answers - repair the identity mismatch, or make an async
+tool refuse to load at all and move the feature to a later phase. **The repair**, for three
+reasons.
+
+The bug is not in the feature; it is one string computed in the wrong place. The dispatching pass
+knows the key it claimed - it is on the `ToolCallResult` it already has - and the suspension
+detail is already the channel by which a suspending node tells the resuming pass what it knew:
+the `confirm` node has been carrying its `args_hash` there since the first commit of this phase,
+for the same reason and against the same hazard (the state has moved on; what the customer
+answered is not what would now happen). The async node needed to carry one more field down a road
+that was already built and already tested. Refusing at load would have been the honest answer to
+a hole in the design; this is a hole in five lines of wiring.
+
+Second, refusing at load costs more than it saves. `waiting_async_tool` is one of DESIGN.md 7.2's
+four suspension statuses, migration `0006` and the `run` row already carry it, phase 2's
+suspend-and-resume matrix already exercises it, and `Executor.resume_async_tool` is the endpoint
+phase 7 is going to authenticate. A load-time refusal would leave all of that in place with no
+way to reach it, and the phase that eventually implemented the feature would be re-deriving what
+is now three lines of `ToolRunner`.
+
+Third - and this is the part that decided it - the reviewer's instruction was not to lean on the
+approval as the defence for this path, and the fix does not. The approval is spent at dispatch
+whatever happens; what stops the second side effect now is that the callback lands on the call it
+belongs to, so there is no failure, so there is no `on_error` re-entry. The residual - an
+`on_error` edge that returns to its own `tool` node, which repeats a `confirm_exempt` WRITE tool
+once per failure whether it is async or not - is a *different* shape that R1 happened to expose,
+and it is written down as a deferred finding against phase 6 rather than smoothed over here.
+Nothing in the async path now depends on an approval being spent.
+
+**Confirmed failing first.** `tests/test_async_tool_flow.py` was written before the fix and run
+against the reviewed code, where both of its tests fail:
+`test_a_callback_does_not_make_the_tool_node_dispatch_a_second_time` reproduces the review's exact
+measurement - `LEDGER.executed` holds **two** `dispatch_async` entries for one customer message
+and one callback, and the run is back in `waiting_async_tool` with two `awaiting_callback` rows.
+After the fix: one handler invocation, one row, `succeeded`, the run `done`.
+
+The key is checked rather than trusted. It arrives from durable state the executor wrote, but
+`complete_async` still requires the row it names to belong to this run, this node and this tool,
+so carrying a key on a suspension is not a way to complete somebody else's call
+(`test_a_callback_cannot_complete_a_call_another_node_dispatched`).
+
+### R2 and R3
+
+**R2, the allow-list.** `RegistryToolRunner` now carries the list the executor read from the
+validated graph (`_model_tools(node)`: an `llm` node's `tools:`, and the empty tuple for every
+other node type) and passes it as `allowed=`. Two checks in two layers from two reads of the same
+declaration, which is the standard the tier already met: removing the gateway's `_refuse_reason`
+leaves the runtime refusing, and removing the runtime's leaves the gateway refusing. The
+reviewer's own probe - call the runner directly for a tool the node never declared - is
+`test_the_model_loop_runner_refuses_a_tool_its_node_did_not_declare`, and the constructor
+argument is required, so a runner that does not know what its node declared cannot be built at
+all.
+
+**R3, the passcode.** Three wrong guesses per conversation, counted in `OtpStore`, surviving a
+re-send, reported as `locked` on `verify_otp`'s output, and routed by `verified_router` to a new
+`too_many_attempts` node and on to the `not_verified` end the graph already had. The count lives
+in the tool rather than in the graph because the expression language has no arithmetic, so a
+counter a graph can increment does not exist; the *decision* is still the graph's, which is where
+a pack author will look for it. The re-send half is the half that matters and has its own test:
+a limit the customer resets by asking for another code is not a limit. The module docstring now
+says what a real pack has to do instead - per account, per address, over a window, with a lockout
+that outlives the conversation - because three guesses per conversation is still three guesses
+per *conversation*.
+
+### The rest
+
+| id | severity | action | commit |
+|----|----------|--------|--------|
+| R1 | must-fix | **Fixed.** The dispatch's idempotency key travels on the suspension detail and `complete_async` takes it explicitly, checked against the row's run, node and tool. `tests/test_async_tool_flow.py` drives dispatch and callback through the executor on a graph whose `on_error` returns to the tool node. **Confirmed failing first**: two side effects from one intent and one callback, exactly as measured. | `7174d6a` |
+| R2 | should-fix | **Fixed.** `RegistryToolRunner(runtime, site, allowed=...)`, built from the node's own `tools:` by the executor and passed to `ToolRuntime.invoke`. Either layer alone still refuses. | `f2011ed` |
+| R3 | should-fix | **Fixed.** `MAX_OTP_ATTEMPTS = 3`, counted per conversation, not reset by a re-send; `verified_router` routes `locked` to `too_many_attempts` and `not_verified`. The `acme_refund` cassette is re-recorded because the ask node's state block gained a field; the four others are byte-identical. | `dbdbd5a` |
+| R4 | should-fix | **Fixed, as the reviewer judged it.** `Tool.patches_context: frozenset[str]`, empty by default; `_settle` refuses a patch outside it; a read-tier tool may not declare one, and a field `CustomerContext` does not have is a load error rather than a patch that silently never lands. `verify_otp` declares `identity_verified`; nothing else in either pack declares anything. Recorded in the Decisions log because it adds a field DESIGN.md 8.1's class does not have. | `f634885` |
+| R5 | should-fix | **Fixed, as `DO NOTHING`** rather than by widening the update - spelled as a no-op `DO UPDATE` so `RETURNING` still yields the row. A confirm step re-executed under the same `(run_id, step_id)` computes the same proposal from the same checkpointed state, so there is nothing to update; and if it somehow did not, the row written when the customer was actually asked is the honest one. | `db491da` |
+| R6 | should-fix | **Fixed.** A refusal of a side-effecting tool writes a `refused` row under `<step_id>#refused:<random>`, in its own transaction, with the arguments, the risk and the message. The claim is still rolled back, so the real key stays unclaimed and the properly approved call can still be made under it - asserted in the same test. A refused READ call writes nothing: the gateway already counts it, and this table is for side effects. | `db491da` |
+| R7 | should-fix | **Fixed.** The first consume is `('customer',)`, so the two queries cannot compete for one row. The new test approves as a human *first* and then as the customer, which is the ordering that failed before. | `db491da` |
+| R8 | nit | **Deferred to phase 9**, with a checklist line there and an entry in "Deferred findings". Both available fixes are bigger than a resolution pass should carry: flattening `state.charge` rewrites the arguments of the one HIGH-risk call in the pack (and its confirm, and the cassette, and an adversarial test's internals), and letting a graph name a pack-exported model is loader work that needs the registry in both the loader and the validator - the same plumbing phase 9's registry scoping needs. No money risk, for the reasons the reviewer gives. | - |
+| R9 | nit | **Deferred to phase 9**, on the reviewer's own recommendation, with the compatibility question attached: widening `max_tool_calls_per_turn` to count `tool` nodes changes what an existing manifest key means. | - |
+
+Two things were found while doing the above, and are recorded rather than smoothed over.
+
+**Two callers racing one step id lost with an `IntegrityError`.** Writing the double-payment
+matrix as a test turned up the loser of a claim race raising a raw SQLAlchemy exception rather
+than a `ToolError` - a dead turn instead of a routed failure. The money was safe (one side
+effect, measured), which is why the review recorded row 5 as safe. The loser now refuses, and
+deliberately does not re-enter: a `running` row left by a *dead* process may be repeated when the
+tool declares itself idempotent, but a `running` row held by a caller who is still executing it
+is a different thing wearing the same clothes, and losing the insert is the one moment the two
+are distinguishable. `test_05_two_callers_racing_one_step_id` fails both ways round - against the
+reviewed code (an unrouted exception) and against a version that re-enters (two side effects from
+an idempotent tool).
+
+**The residual `on_error` shape.** R1's second half - a graph whose `on_error` returns to its own
+tool node - is not specific to async tools, and closing R1 does not close it. Deferred to phase 6
+with a checklist line; the note says what it costs (a `confirm_exempt` WRITE tool repeats once
+per failure) and what it does not (a tool holding an approval is refused on the second attempt,
+because the approval is spent).
+
+The review's closing recommendation about `confirm_exempt` is also written down rather than done:
+reporting the *arguments* a `confirm_exempt` tool's nodes pass it needs the cross-graph
+control-flow model phase 6 has to build anyway, because a gate redirect can reach such a node
+from another graph. The other closing recommendation - that a pack author is inside the trust
+boundary, so a pack review is a security review - is now a paragraph in the README's pack
+section, where the reviewer asked for it.
+
+### The two attack matrices, before and after
+
+Both are now test files that a plain `pytest` run collects, in the review's own order, with its
+verdicts as the assertions - including the three that correctly execute, because turning those
+into refusals would be a regression in the other direction. The before-column was measured by
+checking the reviewed source back out (`git checkout e4a9e08 -- support_core packs`) and running
+the new files against it.
+
+| matrix | reviewed code | after the resolution |
+|--------|---------------|----------------------|
+| Approval bypass, 25 scenarios (`tests/test_approval_bypass_matrix.py` carries 24; scenario 22 needs a whole executor and stays in `tests/test_adversarial_approvals.py`) | **24 of 24 as the review recorded them** - 21 held, 3 executed and correct | **24 of 24**, unchanged |
+| Double payment, 10 rows (`tests/test_double_payment_matrix.py` carries 9 in-process; rows 3 and 5's real `os._exit` cases stay in `tests/test_tool_crash_recovery.py`) | **7 of 9** - row 5 lost with an unrouted `IntegrityError`, rows 9 and 10 produced two side effects from one intent and one callback | **9 of 9** |
+
+Nothing that held before fails now. The approval binding was as strong as the review said: all
+twenty-four held against the reviewed code too, which is exactly why they are worth keeping -
+they are a regression harness now rather than a discovery exercise.
+
+### Which enforcements are load-bearing
+
+The implementer's exercise, repeated over every check this phase has - the four it gained in this
+resolution included. Each enforcement was switched off in the source, the suite that is supposed
+to catch it was run, and the source was restored. The suite is
+`test_adversarial_approvals.py`, `test_tool_runtime.py`, `test_approval_bypass_matrix.py`,
+`test_double_payment_matrix.py`, `test_async_tool_flow.py`, `test_refund_flow.py`,
+`test_tool_loop.py` and `test_identity_attempts.py` - 114 tests.
+
+**All fourteen are load-bearing.** Nothing was switched off without a test noticing.
+
+| enforcement removed | tests that fail | the ones that matter |
+|---|---|---|
+| the approval check entirely (`_authorise` returns `None`) | 32 | hash mismatch; no confirm named; one approval one call; the whole bypass matrix |
+| the runtime's model-loop tier check | 2 | a WRITE tool from a model loop holding a valid approval - still the only test of the second lock |
+| **the runtime's allow-list check (R2)** | 4 | the runner called directly for a tool its node never declared, and three matrix rows |
+| at-most-once for a non-idempotent call | 2 | the in-process one and the cross-process one that counts side effects in a file |
+| **the claim-race refusal** | 1 | two callers racing one step id run an idempotent tool twice |
+| **`patches_context` (R4)** | 1 | a WRITE tool patching a customer field it did not declare |
+| the confirm's shown-versus-about-to-approve comparison | 1 | the amount changed under the customer's answer |
+| **the dispatch key on the suspension (R1)** | 2 | both async round-trip tests; the second one measures the two side effects again |
+| single use (`consumed_at IS NULL`) | 4 | one approval cannot authorise a second call |
+| the run/frame/node binding | 40 | an approval from another frame, another confirm node, another run or another tool |
+| **the customer-only first consume (R7)** | 1 | a human who approved before the customer |
+| only a `confirm` node may record an approval | 1 | a pack-registered node type forging one |
+| only a `tool` node may change `ctx.customer` | 1 | a node type declaring the customer verified |
+| only a `tool` node may invoke | 20 | and the approval check still refuses underneath, which is the depth working |
+
+What this still does not prove is that the *set* of enforcements is complete - only that each one
+is checked. The four new rows are the ones worth noting: R2, R4 and R7 were all cases where the
+code did the right thing in some orderings and the wrong thing in others, and none of them had a
+test until now.
+
+### Everything re-run at the end
+
+From the repository root with `.venv/Scripts/python.exe`; Postgres 16 in
+`customer-support-agent-db-1`, database `support_test`, `ANTHROPIC_API_KEY` unset.
+
+| Command | Result |
+|---------|--------|
+| `python -m ruff check .` | `All checks passed!` (exit 0) |
+| `python -m ruff format --check .` | `129 files already formatted` (exit 0) |
+| `python -m mypy` (strict) | `Success: no issues found in 129 source files` |
+| `python -m pytest -q` | `1186 passed, 2 deselected in 341.71s` |
+| `python -m pytest -q -m live` | `2 skipped, 1186 deselected` - skips on the missing key rather than failing |
+| `python -m pytest -q tests/verify_phase_2_resolution.py` | `39 passed in 147.17s` - phase 2's proof harness still holds |
+| `support pack validate packs/acme_billing` | `acme-billing: well-formed (9 warning(s))`, exit 0 - the same nine, since R8 is deferred and R3 added no new one |
+| `python -m alembic downgrade base`, `upgrade head`, `alembic check` | all six revisions down and up cleanly; `No new upgrade operations detected.` |
+| `python -m tests.cassettes.build_cassettes` | five cassettes; the committed files are what the builder produces |
+| the mutation exercise above (14 enforcements) | 14 caught, 0 missed |
+
+The test count is the reviewed 1138 plus 48: the async round trip through the executor,
+the passcode limit, the two attack matrices, and one regression test each for R2, R4, R5, R6, R7
+and the claim race.
+
+### Status
+
+Phase 4 is **done** in BACKLOG.md. The must-fix is fixed rather than refused, with a regression
+test confirmed to fail against the reviewed code; every should-fix is fixed; both nits are
+deferred with a home and a checklist line; and every command above is green.
