@@ -258,6 +258,17 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
 
 ## Decisions log
 
+- 2026-09-06: GLM added as a second model provider, outside the phase structure, because the
+  deployment needs it. Z.ai serves GLM through an Anthropic-compatible endpoint, so it is the
+  same provider with a different base URL and two optional fields (prompt caching, `strict` tool
+  schemas) turned off; neither is load-bearing. `AppConfig` gained a `models` override so a pack
+  that names Claude model ids can serve a different vendor without being edited. Commit d9eb09e.
+- 2026-09-06: First live model run of the project, against GLM. Two defects found and fixed, both
+  the same shape: GLM spells absent and nested values as text rather than as JSON. A nested
+  object arriving as a JSON string is now parsed and then validated exactly as before (5711ac2);
+  a message whose whole text is the word "null" is read as no message (04b8a4f). Neither relaxes
+  review finding V2. Recorded here because a third instance of the same family should be expected.
+
 - 2026-09-06: the approval hash is taken over arguments **coerced through the tool's own input
   model**, and the approval is bound to more than DESIGN.md 8.2 asks for. The design says
   `sha256(tool_name + canonical_json(args))` and does not say which `args`; coercing first means
