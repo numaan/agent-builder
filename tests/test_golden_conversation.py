@@ -27,7 +27,7 @@ async def test_the_scenario_replays_against_the_recorded_responses(
     conversation_id, _ = await play(scenario, engine, provider)
 
     row = await run_row(engine, conversation_id)
-    assert row["status"] == "done"
+    assert row["status"] == scenario.expected_status
     assert len(provider.calls) == len(cassette.interactions)
 
     if cassette.recorded_with == "scripted":
@@ -36,12 +36,7 @@ async def test_the_scenario_replays_against_the_recorded_responses(
         assert await path(engine, row["id"]) == list(scenario.expected_path)
 
     transcript = await messages(engine, conversation_id)
-    assert [row["author"] for row in transcript] == [
-        "customer",
-        "agent",
-        "agent",
-        "customer",
-    ]
+    assert [row["author"] for row in transcript] == list(scenario.expected_authors)
     assert all(row["status"] in {"sent", "received"} for row in transcript)
 
 

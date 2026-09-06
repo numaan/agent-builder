@@ -12,6 +12,11 @@ llm:
   escalation_model: claude-opus-5     # used for handoff summaries and hard reasoning nodes
   confidence_threshold: 0.45          # below this, `classify` takes its `unclear` edge (11.3)
   max_tool_iterations: 5              # DESIGN.md 8.4's bounded read-only loop
+  retries: 2                          # attempts per model before the escalation rung (7.3)
+  prompt_budget:                      # per-layer token budgets (DESIGN.md 10); the rest default
+    persona: 600
+    policies: 1200
+    conversation: 3000
 interrupts:
   allowed_from: [root, refund, update_address]
   blocked_in: [verify_identity, payment_capture]

@@ -64,6 +64,11 @@ class Scenario:
     take another path - that is what asking a real model means - so the golden test only asserts
     this when the cassette says it was recorded offline."""
 
+    expected_authors: Sequence[str] = ()
+    """The transcript, by author, in order: who said what and how many times."""
+
+    expected_status: str = "done"
+
     @property
     def cassette_path(self) -> Path:
         return CASSETTE_DIR / f"{self.name}.json"
@@ -103,9 +108,83 @@ ACME_SMALL_TALK = Scenario(
         "classify",
         "done_finished",
     ),
+    expected_authors=("customer", "agent", "agent", "customer"),
 )
 
-SCENARIOS: tuple[Scenario, ...] = (ACME_SMALL_TALK,)
+# The three remaining edges of the exit criterion's classify node (review finding V7: the node
+# declares four and one golden conversation drove one of them, so `escalate`, `puzzled` and
+# `done_finished`-from-the-first-turn were never executed by a golden conversation). Each is
+# keyed on the *customer's own words* rather than on the node's instructions, so the scripted
+# rules have to tell the four messages apart the way a classifier would.
+ACCOUNT_QUESTION = "Why was I charged 40 dollars on the 3rd?"
+NONSENSE = "sdfkj lkj ??"
+DONE_AT_ONCE = "Nothing needed, just closing the loop. Bye."
+
+ACME_ACCOUNT_QUESTION = Scenario(
+    name="acme_account_question",
+    pack_path=ACME,
+    turns=[ACCOUNT_QUESTION],
+    rules=(
+        Rule(
+            when=ACCOUNT_QUESTION,
+            respond=answer("account_question", updates={"intent": "account_question"}),
+            purpose="node",
+        ),
+    ),
+    expected_path=("classify", "escalate", "done_escalated"),
+    expected_authors=("customer", "agent"),
+)
+
+ACME_UNCLEAR = Scenario(
+    name="acme_unclear",
+    pack_path=ACME,
+    turns=[NONSENSE, "Actually nothing, thanks."],
+    rules=(
+        Rule(
+            when=NONSENSE,
+            respond=answer("unclear", updates={"intent": "unclear"}, confidence=0.8),
+            purpose="node",
+            uses=1,
+        ),
+        Rule(
+            when=EXTRACT,
+            respond={"slots": {"anything_else": "nothing"}, "unfilled": [], "confidence": 0.9},
+        ),
+        Rule(when=CLASSIFY, respond=answer("finished", updates={"intent": "finished"})),
+        Rule(when=SUMMARY, respond={"summary": "The customer's first message was unreadable."}),
+    ),
+    expected_path=(
+        "classify",
+        "puzzled",
+        "anything_else",
+        "anything_else",
+        "classify",
+        "done_finished",
+    ),
+    expected_authors=("customer", "agent", "agent", "customer"),
+)
+
+ACME_FINISHED_AT_ONCE = Scenario(
+    name="acme_finished_at_once",
+    pack_path=ACME,
+    turns=[DONE_AT_ONCE],
+    rules=(
+        Rule(
+            when=DONE_AT_ONCE,
+            respond=answer("finished", updates={"intent": "finished"}),
+            purpose="node",
+        ),
+    ),
+    expected_path=("classify", "done_finished"),
+    expected_authors=("customer",),
+)
+
+SCENARIOS: tuple[Scenario, ...] = (
+    ACME_SMALL_TALK,
+    ACME_ACCOUNT_QUESTION,
+    ACME_UNCLEAR,
+    ACME_FINISHED_AT_ONCE,
+)
 
 
 async def play(
