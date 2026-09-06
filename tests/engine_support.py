@@ -138,7 +138,7 @@ async def messages(engine: AsyncEngine, conversation_id: uuid.UUID) -> list[dict
     async with engine.connect() as connection:
         result = await connection.execute(
             text(
-                "SELECT direction, author, text, status FROM message "
+                "SELECT direction, author, text, status, queue_seq FROM message "
                 "WHERE conversation_id = :c ORDER BY created_at, ordinal, id"
             ),
             {"c": conversation_id},

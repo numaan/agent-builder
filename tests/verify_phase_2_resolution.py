@@ -46,12 +46,22 @@ def _echoes(outbound: list[str]) -> list[str]:
 
 
 def _expected_echoes(inbound: list[dict[str, Any]]) -> list[str]:
-    """``queue_pack`` echoes every second message, in arrival order.
+    """``queue_pack`` echoes every second message, in queue order.
 
     Its root graph is ask-then-echo, so a message that arrives with the run idle or done starts
     a fresh root frame and is consumed by the ``ask``; the next one resumes it and is echoed.
+
+    *Queue order* is read from ``message.queue_seq``, which is the number the row claimed from
+    ``conversation.inbound_seq`` when it was written. It used to be read from ``created_at``,
+    because that was also what the pending queue was ordered by - and phase W's review broke
+    exactly that (finding W4): ``created_at`` is the transaction *start* timestamp, so two
+    callers who arrive together share it and the tie fell to a random UUID, and the reviewer
+    reversed a pair and dead-ended a conversation. The property this file asserts is unchanged -
+    every message answered exactly once, in the order the queue decided, nothing lost - and it is
+    now read from the column that decides it rather than from a clock that approximated it.
     """
-    return [f"You said {row['text']}." for row in inbound[1::2]]
+    ordered = sorted(inbound, key=lambda row: row["queue_seq"] or 0)
+    return [f"You said {row['text']}." for row in ordered[1::2]]
 
 
 @pytest.fixture(scope="module")
