@@ -662,3 +662,40 @@ async def _unverify(engine: AsyncEngine, conversation_id: uuid.UUID) -> None:
             ),
             {"c": conversation_id},
         )
+
+
+async def test_a_crash_while_the_return_offer_is_being_made_does_not_lose_the_offer(
+    engine: AsyncEngine,
+) -> None:
+    """The other place phase 6 moves the stack while a message is in flight.
+
+    Phase 2's two must-fix bugs were both in the seam where "an event is still pending" meets
+    "the stack has changed", and the return offer is a new instance of it: the interrupt frame
+    pops, the parked frame comes back to the top, and a core step suspends on it. Killed inside
+    that checkpoint, the transaction rolls back and the whole thing is re-derived from durable
+    state - the frame is still parked, the offer is made once, and the customer is not asked
+    twice.
+    """
+    check = Check(InterruptDecision(kind="new_intent", graph="beta", label="beta"))
+    offer = Offer("yes")
+    executor, conversation_id = await _classified(engine, "alpha", check=check, offer=offer)
+    await executor.on_inbound(conversation_id, "actually, do beta")
+    _slots(executor, {"answer": "beta's answer"})
+
+    recorder = Recorder(crash_at="checkpoint_before_commit", crash_after=1)
+    executor.hooks.probe = recorder.hooks().probe
+    with pytest.raises(RuntimeError):
+        await executor.on_inbound(conversation_id, "beta's answer")
+    crashed = await run_row(engine, conversation_id)
+    assert crashed["status"] == "running"
+
+    executor.hooks.probe = Recorder().hooks().probe
+    await executor.drain(conversation_id)
+
+    row = await run_row(engine, conversation_id)
+    said = await outbound_texts(engine, conversation_id)
+    assert said.count("That is done. Shall we go back to alpha?") == 1
+    assert row["frames"][1]["offer_return"] is True
+    assert row["awaiting"]["node"] == INTERRUPT_RETURN_NODE
+    steps = await path(engine, row["id"])
+    assert steps.count(INTERRUPT_RETURN_NODE) == 1

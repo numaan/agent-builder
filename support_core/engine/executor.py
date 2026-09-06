@@ -40,7 +40,12 @@ from support_core.engine.errors import (
     IncompatiblePackError,
     NodeError,
 )
-from support_core.engine.hooks import EngineHooks, HandoffRequest, InterruptRequest
+from support_core.engine.hooks import (
+    ConfirmDecision,
+    EngineHooks,
+    HandoffRequest,
+    InterruptRequest,
+)
 from support_core.engine.hooks import ResumeOfferRequest as ResumeOfferHookRequest
 from support_core.engine.hooks import SummaryRequest as SummaryHookRequest
 from support_core.engine.interrupts import (
@@ -1273,15 +1278,24 @@ class Executor:
 
         assert event is not None
         turn.pending_event = None
-        decision = await self.hooks.resume_offer(
-            ResumeOfferHookRequest(
-                workflow=frame.graph_id,
-                offer=str(event.detail.get("prompt") or offer),
-                reply=event.text or "",
-                ctx=ctx,
-                window=[(m.author, m.text) for m in await self._history(turn.conversation_id)],
+        try:
+            decision = await self.hooks.resume_offer(
+                ResumeOfferHookRequest(
+                    workflow=frame.graph_id,
+                    offer=str(event.detail.get("prompt") or offer),
+                    reply=event.text or "",
+                    ctx=ctx,
+                    window=[(m.author, m.text) for m in await self._history(turn.conversation_id)],
+                )
             )
-        )
+        except Exception:
+            # This is not a node, so a failure here has no ``on_error`` edge and would otherwise
+            # take the turn down - which for a *reading of a yes-or-no answer* is the worst
+            # available outcome, because asking again costs one message. Unreadable is the answer
+            # this reader gives when it cannot read something, and a reader that fell over could
+            # not read it either. The structured implementation already catches its own provider
+            # failures; this is for everything else.
+            decision = ConfirmDecision(answer="unclear")
         if decision.answer == "unclear":
             # The same answer a confirmation gives an unreadable reply, for the same reason: the
             # cost of asking again is one message and the cost of guessing is a workflow either
