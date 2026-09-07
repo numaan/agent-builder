@@ -11,7 +11,7 @@ Each phase follows the five-step workflow in [PLAN.md](PLAN.md). Design referenc
 | 3 | LLM layer and prompted nodes | done | reviews/phase-3.md |
 | 4 | Tool runtime and safety nodes | done | reviews/phase-4.md |
 | W | Web chat slice (pulled forward from 7) | done | reviews/phase-w.md |
-| 5 | Knowledge layer and citations | todo | reviews/phase-5.md |
+| 5 | Knowledge layer and citations | self-critique | reviews/phase-5.md |
 | 6 | Interrupts, root graph, handoff | done | reviews/phase-6.md |
 | 7 | Channels, observability, replay | todo | reviews/phase-7.md |
 | 8 | Evaluation harness | todo | reviews/phase-8.md |
@@ -165,31 +165,40 @@ Resolution recorded in reviews/phase-w.md.
 
 Design: sections 9.1 to 9.3, 14 (citation guardrail).
 
-- [ ] `Passage`, `Retriever` protocol, `CompositeRetriever`.
-- [ ] `DocumentRetriever`: chunking by headings, embeddings via provider abstraction (fake embedder in tests), pgvector plus tsvector hybrid search, optional model reranking.
-- [ ] **`ColbertRetriever` as a second `Retriever` implementation** (added 2026-09-06 at the user's request). Late interaction: one vector per token, scored by MaxSim, rather than one vector per chunk. Two reasons it belongs here rather than later. It runs locally, so it removes this phase's worst limitation - there is no embedding API in this deployment (no Anthropic key; the GLM endpoint is Anthropic-compatible and serves no embeddings), so without it the dense path ships with its retrieval quality unmeasured against a stand-in embedder. And late interaction is strongest on exactly this corpus shape: short policy passages where the answer turns on a phrase.
-  - [ ] **Host it in Qdrant** (decided 2026-09-06 after the user raised it). Qdrant stores multivectors and scores MaxSim natively, so late interaction becomes an ordinary query against an ordinary service instead of a PLAID/FAISS index directory the deployment has to build, ship, version and back up by itself. The two alternatives were considered and rejected: ColBERT's own index makes the corpus a second artefact with none of a database's operational affordances, and MaxSim in SQL over pgvector is honest but too slow for a 4-second p95 turn.
-  - [ ] Note what this does *not* break. DESIGN.md 7.1's rule is that the frame stack and the trace step are written in one transaction and resume derives from durable state; retrieval is a read outside that transaction, so a second store here cannot cost a checkpoint or a resume. That is the distinction from phase 10's mem0 question, where per-customer notes would sit in the write path.
-  - [ ] Split the two halves deliberately: Qdrant owns the vector side (dense and ColBERT multivector), Postgres full-text owns the lexical side. `CompositeRetriever` merges them. This buys graceful degradation - with Qdrant unavailable the lexical half still answers, and a total retrieval failure already routes to handoff through the citation guardrail rather than to a guess.
-  - [ ] Version by collection, not in place: a sync builds `<source>_v<n>` and flips an alias. Old and new genuinely coexist, which is what makes the exit criterion's "an old trace still names the old version" true rather than approximately true.
-  - [ ] Add Qdrant to `docker-compose.yml` beside Postgres, and to CI. Accept the operational cost explicitly: one deployment per domain (Q12) means one Qdrant per domain, so this is a container, a backup and an upgrade path multiplied by the number of domains served.
-  - [ ] `source_version` must survive it. The exit criterion is that a wrong answer names the revision that caused it, so the index is versioned with the corpus and a re-sync builds a new one rather than mutating in place.
-  - [ ] Keep it behind the same `Retriever` protocol and the same `CompositeRetriever`, so a pack picks its backend in `sources.yaml` and neither the engine nor a graph knows which is in use.
-  - [ ] Measure it against the pgvector path on the same corpus before making it the default. Two retrievers with no comparison between them is worse than one.
-  - [ ] Passages still pass through phase 3's per-render delimiter token. A ColBERT passage is untrusted text like any other.
-- [ ] Migration fixing `doc_chunk.embedding` to `vector(N)` for the chosen embedding model (while the table is empty) and adding the HNSW index; decide whether downgrade should keep the `vector` extension (phase 0 deferred findings N12, N2).
-- [ ] `LiveLookupRetriever` routing to READ tools.
-- [ ] Thread a retriever through `handoff/builder.py`'s `gather()` and `HandoffSummaryRequest`
+- [x] `Passage`, `Retriever` protocol, `CompositeRetriever`.
+- [x] `DocumentRetriever`: chunking by headings, embeddings via provider abstraction (a deterministic local encoder, not a fake - it is what this deployment runs), pgvector plus tsvector hybrid search. Model reranking is **not** built: section 9.1 offers it as an option and an extra model call per retrieval is a straight charge against section 20's p95 that nothing here can measure the benefit of.
+- [x] **`ColbertRetriever` as a second `Retriever` implementation** (added 2026-09-06 at the user's request). Late interaction: one vector per token, scored by MaxSim, rather than one vector per chunk. Two reasons it belongs here rather than later. It runs locally, so it removes this phase's worst limitation - there is no embedding API in this deployment (no Anthropic key; the GLM endpoint is Anthropic-compatible and serves no embeddings), so without it the dense path ships with its retrieval quality unmeasured against a stand-in embedder. And late interaction is strongest on exactly this corpus shape: short policy passages where the answer turns on a phrase.
+  - [x] **Host it in Qdrant** (decided 2026-09-06 after the user raised it). Qdrant stores multivectors and scores MaxSim natively, so late interaction becomes an ordinary query against an ordinary service instead of a PLAID/FAISS index directory the deployment has to build, ship, version and back up by itself. The two alternatives were considered and rejected: ColBERT's own index makes the corpus a second artefact with none of a database's operational affordances, and MaxSim in SQL over pgvector is honest but too slow for a 4-second p95 turn.
+  - [x] Note what this does *not* break. DESIGN.md 7.1's rule is that the frame stack and the trace step are written in one transaction and resume derives from durable state; retrieval is a read outside that transaction, so a second store here cannot cost a checkpoint or a resume. That is the distinction from phase 10's mem0 question, where per-customer notes would sit in the write path.
+  - [x] Split the two halves deliberately: Qdrant owns the vector side (dense and ColBERT multivector), Postgres full-text owns the lexical side. `CompositeRetriever` merges them. This buys graceful degradation - with Qdrant unavailable the lexical half still answers, and a total retrieval failure already routes to handoff through the citation guardrail rather than to a guess.
+  - [x] Version by collection, not in place: a sync builds `<source>_v<n>` and flips an alias. Old and new genuinely coexist, which is what makes the exit criterion's "an old trace still names the old version" true rather than approximately true.
+  - [x] Add Qdrant to `docker-compose.yml` beside Postgres, and to CI. Accept the operational cost explicitly: one deployment per domain (Q12) means one Qdrant per domain, so this is a container, a backup and an upgrade path multiplied by the number of domains served.
+  - [x] `source_version` must survive it. The exit criterion is that a wrong answer names the revision that caused it, so the index is versioned with the corpus and a re-sync builds a new one rather than mutating in place.
+  - [x] Keep it behind the same `Retriever` protocol and the same `CompositeRetriever`, so a pack picks its backend in `sources.yaml` and neither the engine nor a graph knows which is in use.
+  - [x] Measure it against the pgvector path on the same corpus before making it the default. Two retrievers with no comparison between them is worse than one.
+  - [x] Passages still pass through phase 3's per-render delimiter token. A ColBERT passage is untrusted text like any other.
+- [x] Migration fixing `doc_chunk.embedding` to `vector(N)` for the chosen embedding model (while the table is empty) and adding the HNSW index; decide whether downgrade should keep the `vector` extension (phase 0 deferred findings N12, N2).
+- [x] `LiveLookupRetriever` routing to READ tools. **Narrowed**: a pack declares the tool, its trigger words and arguments drawn from `ctx`; the model-driven extraction of arguments *from the question* is not built, and is recorded in the self-critique rather than faked.
+- [x] Thread a retriever through `handoff/builder.py`'s `gather()` and `HandoffSummaryRequest`
       so a handoff summary can be grounded and `HandoffPacket.citations` stops being empty.
       The shape is already there - `citations` is on the packet and `Passage` is defined - and
       naming it now stops phase 5 inventing a second one (phase 6 review, forward compatibility).
-- [ ] Ingestion CLI `support pack knowledge sync` for `markdown_dir` and `html_crawl` sources, with `source_version` and stale-chunk marking.
-- [ ] `knowledge:` block on llm nodes; passages inserted as delimited data with ids.
-- [ ] Outbound citation guardrail: factual-claim classifier (rule-based first), re-prompt once, then handoff.
-- [ ] Sample pack knowledge: refund policy and processing-time documents.
-- [ ] Test: change a policy document, re-sync, and show the trace of a new answer cites the new `source_version` while an old trace still names the old one.
+- [x] Ingestion CLI `support pack knowledge sync` for `markdown_dir` and `html_crawl` sources, with `source_version` and stale-chunk marking.
+- [x] `knowledge:` block on llm nodes; passages inserted as delimited data with ids.
+- [x] Outbound citation guardrail: factual-claim classifier (rule-based first), re-prompt once, then handoff.
+- [x] Sample pack knowledge: refund policy and processing-time documents.
+- [x] Test: change a policy document, re-sync, and show the trace of a new answer cites the new `source_version` while an old trace still names the old one.
 
-Exit criterion: the wrong-answer-to-source-version trace test passes.
+Exit criterion: the wrong-answer-to-source-version trace test passes. **Met**:
+`tests/test_source_version_trace.py` checks the strong reading of it - the old trace names version
+A and the new one names B; the text A names is still readable and still says what it said; the
+*same* long-lived executor picks B up on its next retrieval with no restart; and the Qdrant
+collection that produced the old answer still exists and still contains only A. The phase-3
+injection matrix was re-run with the injection point in the *corpus*, ingested and retrieved by
+the real pipeline: 28 payloads, **0 forged lines**. Retrieval quality is measured across all four
+paths on a labelled set and what that measurement is and is not worth is written out in
+reviews/phase-5.md's self-critique - the encoder is a local deterministic stand-in, not a language
+model, and the real ColBERT weights cannot be downloaded from this network.
 
 ## Phase 6: Interrupts, root graph, handoff
 
@@ -235,7 +244,18 @@ Design: sections 12, 15, 4.1.
       reserved node id `__interrupt_return__` (phase 6's return offer, with the core-only edges
       `offer`, `resumed` and `abandoned`), which no graph declares, rather than discovering it
       against a graph that has no such node (phase 6 review finding P10).
-- [ ] Replay an LLM call from the trace when a step re-executes (DESIGN.md 7.3: "LLM calls replay from the trace if the step already completed"). `trace_step.llm_response` is written and never read back, so a crash between the model answering and the checkpoint committing pays for the question again and may get a different answer. The step id on `NodeRuntime` is the documented cache key (phase 3 self-critique fragility item 1, endorsed by the phase-3 review).
+- [ ] Replay an LLM call from the trace when a step re-executes (DESIGN.md 7.3: "LLM calls replay from the trace if the step already completed"). `trace_step.llm_response` is written and never read back, so a crash between the model answering and the checkpoint committing pays for the question again and may get a different answer. The step id on `NodeRuntime` is the documented cache key (phase 3 self-critique fragility item 1, endorsed by the phase-3 review). **Retrieval is the same shape**: a re-executed step retrieves again and may see a different corpus if a sync landed in between, so `trace_step.llm_response["retrieval"]` is the cache for the same key (phase 5 deferred finding).
+- [ ] A scheduler for `support pack knowledge sync`, and the two things it needs to be safe (phase
+      5 deferred findings). A transaction-level advisory lock keyed on the source id, because two
+      concurrent syncs of one source currently write the same `source_version` twice and duplicate
+      every passage in the live version with nothing to detect it; and a sweep for the window
+      where Postgres holds revision *n+1* and the Qdrant alias still names *n*, which a crash
+      between the chunk commit and the alias flip leaves behind. `sources.yaml` already declares
+      `refresh: hourly | daily | weekly` and nothing reads it.
+- [ ] Say so when a guardrail cannot run. The outbound citation check's patterns and sentence
+      splitter are English, so a pack with a non-English `language:` gets no citation guardrail
+      and is not told (phase 5 deferred finding). The same load-time warning covers the rest of
+      section 14's outbound checks this phase adds.
 - [ ] Inbound guardrails: PII tagging and redaction in traces, injection flag, language detection.
 - [ ] Authentication and abuse control on the **customer** channel surface: the web chat session key is still the whole of the access control, and there is no WebSocket origin check, no CSRF defence on the webhook, no rate limit and no webhook signature verification (phase W self-critique, sharpened by its review's attempts A2 and A11). The desk half of this is **closed**: phase W's resolution turned `serve_desk` off by default and put every `/desk` route behind a bearer token, because phase 6 had mounted that API on the customer's own listener, on by default and open (finding W1). What is left here is the customer's own key and the abuse controls, plus per-operator desk identity and rotation, which one shared token is not.
 - [ ] Take the desk off the customer's listener, once live delivery can cross a process. Phase W's resolution kept it on the same application deliberately: DESIGN.md 4.1 says one service, 12 says the same API surface, and a desk `reply` reaches a customer's open socket only from the process that holds that socket, so a separate desk process would silently stop delivering a human's reply until the fan-out below exists. With the fan-out, a `create_desk_app` on its own port costs nothing and matches what section 12 means by "not a customer channel".
@@ -414,6 +434,33 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
 - [phase 4] R9: the per-turn tool budget counts only model-loop calls, so a graph that walks five `tool` nodes spends none of `max_tool_calls_per_turn` and only `max_nodes_per_turn` bounds it, nit, deferred to phase 9 on the reviewer's own recommendation: widening the counter changes what an existing manifest key means, which is a compatibility decision rather than a fix, and phase 9 owns the cost caps (checklist line added there).
 - ~~[phase 4] The `graph.confirm_exempt` warning names the tool but not the *arguments* the pack's nodes pass it ... Nit, deferred to phase 6.~~ **Closed in phase 6**: the warning lists every call site of the exempt tool, across every graph, with the argument expression each one passes - so `verify_identity.send_code(email: 'ctx.customer.email')` reads differently from a node passing `state.email`.
 - ~~[phase 4] An `on_error` edge that returns to its own `tool` node re-enters at the next attempt, claims a fresh idempotency key, and calls the tool again ... Should-fix, deferred to phase 6.~~ **Closed in phase 6, both ways**: `graph.on_error_repeats_side_effect` reports it at load (a WARNING, because re-sending a one-time passcode is this exact shape and is right), and `limits.max_node_errors` bounds it at run time - consecutive failures per node, counted in the frame so a crash does not reset them and an ordinary loop does not trip them, and a handoff with reason `limit_exceeded` when the bound is reached.
+
+- [phase 5] Two concurrent syncs of one source duplicate the corpus. `Ingestor.sync_source` reads
+  `doc_source.revision` in one transaction and writes the chunks in another with nothing held
+  between them, so two syncs started together both compute revision *n+1*, compute the same
+  content-addressed `source_version`, and both insert a full set of chunks under it - which
+  `mark_stale` then keeps, because both match `keep_version`. Every passage is duplicated in the
+  live version, a `k` of 3 carries two facts instead of three, and nothing detects it. Should-fix,
+  deferred to phase 7, which owns the scheduler that would run this job: the fix is a
+  transaction-level advisory lock keyed on the source id - the same device the engine already uses
+  per conversation - and it deserves its own test rather than a hurried one at the end of a phase
+  (checklist line added there).
+- [phase 5] A crash between the chunk commit and the Qdrant alias flip leaves the two stores on
+  different versions: Postgres has *n+1* live, the alias still names *n*, and a retrieval merges
+  passages carrying two `source_version` values. Nit - it is not silent (the trace records both,
+  which is what the trace is for) and the next sync repairs it - deferred to phase 7 with the
+  scheduler, because making it impossible would need the vector index inside the same transaction
+  as the rows, which is not available across two stores; what is worth having is a sweep that
+  notices the disagreement rather than waiting for the next scheduled sync.
+- [phase 5] The citation guardrail is English-only and says so nowhere. The claim patterns and the
+  sentence splitter are English, so a pack with `language: pt-BR` gets no outbound citation check
+  and is not told. Nit, deferred to phase 7, which owns the rest of section 14's outbound
+  guardrails and would add the same load-time warning for all of them (checklist line added there).
+- [phase 5] Retrieval is not replayed from the trace, the exact analogue of phase 3's deferred
+  finding about LLM calls: a step re-executed after a crash retrieves again and may get different
+  passages if a sync landed in between. The trace records what *was* used, so an investigation is
+  not harmed and no answer changes retrospectively; what is not true is that a replay is
+  byte-identical. Nit, deferred to phase 7, which owns replay (checklist line added there).
 
 - [phase 6] P2 (durable half): a handoff no sink would take is visible only in
   `HandoffService.failures`, a per-process list nothing sweeps, so a second replica cannot see it

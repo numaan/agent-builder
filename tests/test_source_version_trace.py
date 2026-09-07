@@ -307,3 +307,66 @@ async def test_a_version_named_by_a_trace_can_be_read_back_by_version(
     assert live == 1
     assert stale == 1
     assert any("60 days" in chunk for chunk in await text_of_version(engine, first.version))
+
+
+async def test_retrieval_happens_outside_the_checkpoint_transaction(
+    engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """The property the whole second-store decision rests on, asserted rather than assumed.
+
+        Retrieval is a read outside that transaction, so a second store here cannot cost a
+        checkpoint or a resume. - BACKLOG.md, the 2026-09-06 Qdrant decision
+
+    DESIGN.md 7.1 requires the frame stack and the trace step to be written in one transaction,
+    and 4.1's "Postgres is the single stateful dependency" was relaxed on the strength of
+    retrieval being outside it. If a later change moved retrieval inside the checkpoint, a Qdrant
+    timeout would start costing conversations their durability, and it would do so silently.
+
+    The probe is the engine's own ``before_node`` / ``checkpoint`` hooks: the retriever records
+    when it was called, and the assertion is that no retrieval happened between the checkpoint
+    transaction opening and closing. It is done by *counting* rather than by inspecting a session,
+    because what matters is the ordering the engine enforces, not which object holds a connection.
+    """
+    write_corpus(tmp_path, {"policy.md": WRONG})
+    await ingestor(engine, tmp_path).sync_source(markdown_source())
+
+    executor = build(engine, "Within 60 days.")
+    order: list[str] = []
+    inner = executor.retriever
+    assert inner is not None
+
+    class Watched:
+        name = "watched"
+
+        async def gather(self, req: Any) -> Any:
+            order.append("retrieve")
+            return await inner.gather(req)
+
+        async def retrieve(self, req: Any) -> Any:
+            return (await self.gather(req)).passages
+
+    executor.retriever = Watched()  # type: ignore[assignment]
+
+    original = executor._checkpoint
+
+    async def watched_checkpoint(*args: Any, **kwargs: Any) -> Any:
+        order.append("checkpoint:start")
+        try:
+            return await original(*args, **kwargs)
+        finally:
+            order.append("checkpoint:end")
+
+    executor._checkpoint = watched_checkpoint  # type: ignore[method-assign]
+
+    conversation = await executor.start_conversation()
+    await executor.on_inbound(conversation, "how long?")
+
+    assert "retrieve" in order, "the node did not retrieve, so nothing was tested"
+    depth = 0
+    for event in order:
+        if event == "checkpoint:start":
+            depth += 1
+        elif event == "checkpoint:end":
+            depth -= 1
+        elif event == "retrieve":
+            assert depth == 0, f"retrieval ran inside a checkpoint transaction: {order}"

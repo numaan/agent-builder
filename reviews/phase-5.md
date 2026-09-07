@@ -198,3 +198,495 @@ and replay (phase 7), the pack authoring tool (phase 12), per-conversation cost 
 and model reranking of passages - section 9.1 offers it "when `k` is small" as an option, and an
 extra model call per retrieval is a straight charge against section 20's four-second p95 that
 nothing here can measure the benefit of.
+
+### What changed about this plan, and why
+
+The plan above was written by an earlier agent that was stopped mid-implementation. It was
+inherited rather than rewritten, because it still describes what is being built: every numbered
+item was delivered. This section records the four places where doing the work changed the plan
+rather than followed it, and the one thing the plan is silent about.
+
+1. **Item 4, chunking, is one rule shorter.** The plan says a short section "merges with the next
+   section *only while the heading path still describes it*", and promises that "two sibling
+   sections under different headings never become one chunk". The code did the first and
+   therefore broke the second. Merging a short section forward under an ancestor path makes the
+   *next* sibling a descendant of the merged block too, so the merge cascades: the sample pack's
+   refund policy came out as three chunks with four of its five sections inside one of them,
+   located to the document's title. Every locator was true and none was useful, which is the
+   failure the exit criterion exists to prevent one level up. The merge pass is gone. A short
+   section is now its own chunk with its own locator, and it is legible on its own because
+   `Chunk.with_heading` puts the whole heading path above the text. Measured on the sample pack:
+   4 chunks became 11, and every locator names a heading.
+
+2. **Item 7's lexical half needed a change the plan did not anticipate.**
+   `websearch_to_tsquery` joins bare words with `&`, so a retrieval query built from a customer's
+   sentence - "how many days do I have to ask for a refund" - became
+   `'mani' & 'day' & 'ask' & 'refund'` and matched only a passage containing all four. On the
+   labelled query set that is 3 of 12. Relaxing the conjunction to a disjunction and letting
+   `ts_rank_cd`'s cover density order the matches gives 12 of 12. The rewrite is textual and
+   preserves a quoted phrase's `<->`; what it gets wrong is a leading negation, which is accepted
+   rather than fixed, because the alternative is parsing tsquery text in a repository module.
+
+3. **Item 9 grew a per-node half.** The plan has one retriever built at startup and captured in a
+   closure. That is right for the document backends and wrong for `LiveLookupRetriever`, which
+   calls READ tools: a tool call belongs to the turn whose budget it spends and to the node whose
+   allow-list it obeys. The live backend is therefore composed per node, around the same gateway
+   that node's own model loop gets, and `CompositeRetriever.plus` returns a new composite rather
+   than mutating the long-lived one.
+
+4. **Item 15 gained a golden conversation.** "Why was my refund refused" is the question the
+   phase's documents exist for, and nothing exercised it end to end. `acme_refund_denied` is a
+   real denial - a June charge outside the 60-day window - whose `explain_denial` node retrieves
+   the rule behind the refusal from the corpus and cites it.
+
+The plan is also silent about the composition root, which turned out to be a third of the work.
+`Pack` now carries the parsed `knowledge/sources.yaml` so the sync, the validator and the service
+work from one reading of one file; `pack.yaml` gains the `guardrails:` block item 8 promised;
+`support_core/knowledge/wiring.py` is the one place that turns a pack into a retriever; and
+`build_runtime` hands that retriever to both the executor and the handoff service.
+
+## Inherited state
+
+What was in the working tree when this phase was picked up, and what happened to it. (The library
+half of it was committed by another process while this phase was in flight, as
+`2a28eaf phase-5: snapshot the in-flight knowledge layer`; everything below was written before
+that commit existed and describes the same code.)
+
+### Kept
+
+Nearly all of it, and it was worth keeping. The module layout; `Passage` with its `id` and
+`backend`; the two encoder protocols with one deterministic local implementation of both; the
+Qdrant store with a collection per revision and an atomic alias flip; the reciprocal-rank merge
+and its argument for rank fusion over score fusion; the content-addressed `source_version`; stale
+marking rather than deletion; the repository split that keeps retrieval SQL out of the engine's;
+the citation guardrail riding phase 3's existing retry loop rather than inventing a second one;
+`NodeError(reason="uncited_claim")` reaching phase 6's real handoff carrying the failing node's
+passages; and migration `0010`. The reasoning in those module docstrings is the reasoning this
+phase would have arrived at, and where a later section of this file argues for a decision it is
+usually restating theirs.
+
+### Fixed
+
+Nine defects. Seven of them only running the code could find, which is the honest summary of what
+a stopped implementation leaves behind: the design was sound and nothing had been executed.
+
+1. **The chunker's merge pass cascaded**, as above. The regression is the first test in
+   `tests/test_knowledge_chunking.py` and it fails against the inherited code.
+2. **The lexical half ANDed every query term**, as above, so a natural-language question matched
+   nothing at all on a policy corpus.
+3. **`LiveLookupRetriever` never called `gateway.specs()`.** The gateway resolves a tool's risk
+   tier on that call and refuses anything it has not resolved, so every live lookup was a
+   refusal - and a retriever that returns nothing looks exactly like one that is being refused.
+4. **Nothing constructed a live-lookup retriever at all.** The class existed and no code path
+   built one, because building one needs a tool gateway and the plan had the retriever built at
+   startup where there is none. `Executor._retrieval` composes it per node now.
+5. **`crawl` did not stay under the start URL's path.** The boundary was
+   `start.rsplit("/", 1)[0]`, which for `https://help.example/billing` is the origin - so a crawl
+   of a help centre would follow `/pricing`, and marketing copy would enter a policy corpus the
+   agent cites. Replaced with an explicit boundary rule, and the test names the page it must not
+   fetch.
+6. **`create_collection` failed permanently on a name it already held.** Collection names carry
+   `doc_source.revision` from Postgres, and the two stores drift after a sync that crashed
+   between building a collection and flipping the alias, or after a database restored from backup
+   or reset in development. The result was a 409 on every subsequent sync and no vector side at
+   all, for a reason nobody would find. It now replaces the collection it is about to fill, which
+   is safe there and only there, because no alias points at it until the flip.
+7. **The claim detector named policy claims "pricing".** The three families are tried in order
+   and overlap on the word "charge", and pricing was first. Policy goes first now, because its
+   patterns are the specific ones - they need a modal or an eligibility word beside the noun.
+   This changes what a correction says and what a trace reads like; it never changes whether a
+   message is refused.
+8. **`build_ingestor` could not be told there is no Qdrant.** A default argument cannot tell "I
+   did not pass a store" from "there is no store", so a cassette recording and an application
+   test both tried to reach one. Both now pass `use_qdrant=False`, which is a configuration and
+   is not the same thing as an outage.
+9. **The Qdrant client ran a version handshake in its constructor**, so an unreachable instance
+   was reported twice: once as a warning on stderr that nobody can act on, once as the
+   `RetrieverUnavailable` that the composite exists to catch.
+
+### Discarded
+
+Nothing. No inherited file was rewritten wholesale and no decision recorded in one was reversed.
+
+### The edit to `0001_initial_schema.py`
+
+**Kept, and it is the only place it can go.** The change is one line of `downgrade()`: the
+initial migration no longer runs `DROP EXTENSION IF EXISTS vector`. That is phase-0 review
+finding N2, whose downgrade half was deferred to this phase by name.
+
+The standing objection to editing a released migration is that a deployment which has already run
+it will never see the change. That objection does not apply here, and the reason is worth writing
+out rather than waving at:
+
+* `upgrade()` is **byte-identical**. Nothing any deployment has already executed differs from
+  what the file now says it executed, so there is no divergence to discover later.
+* The change is to `downgrade()`, and a downgrade is by definition run *later*, with whatever
+  code is installed at that point. A deployment that downgrades tomorrow runs tomorrow's file.
+* It could not go into a new migration. Alembic runs downgrades newest-first, so `0010`'s
+  `downgrade()` executes *before* `0001`'s and no later revision can stop an earlier one from
+  dropping an extension. Editing `0001` is not the convenient answer; it is the only one.
+
+What it buys: `CREATE EXTENSION vector` needs superuser, so on a managed instance an
+administrator usually installs it once for the whole database before this application exists. The
+upgrade's `IF NOT EXISTS` then creates nothing, and a `DROP EXTENSION` on the way down would
+remove something this migration did not create - taking every `vector` column in that database,
+including another application's, with it. `downgrade base` means "remove this application's
+schema", not "remove pgvector". The cost is an extension left behind, which the next upgrade's
+`IF NOT EXISTS` ignores.
+
+The **dimension** fix - phase-0 finding N12, `doc_chunk.embedding` to `vector(128)` with an HNSW
+cosine index - is deliberately *not* in `0001`. It is migration `0010`, where a new column type
+belongs, and it refuses to run against a non-empty `doc_chunk` rather than casting rows it cannot
+interpret or deleting somebody's index without being asked. The table being empty in this
+repository made the easier and wrong thing available, and it was not taken: a deployment that has
+rows gets a message naming `DELETE FROM doc_chunk` and `support pack knowledge sync`, and decides
+for itself.
+
+## Implementation notes
+
+### The trust boundary, and the number
+
+A retrieved passage reaches a model through `PromptInputs.knowledge` - layer 7, fenced by phase
+3's per-render delimiter token - and through no other path. This phase adds no second way to put
+text into a prompt, and that is a structural claim rather than a careful one: `Passage.for_prompt`
+is the single conversion, it drops the score and the backend on the way, and
+`support_core.llm.prompt` imports nothing from the retrieval side.
+
+The evidence is `tests/test_knowledge_injection_matrix.py`, which re-runs phase 3's twenty-eight
+payloads with the injection point in the corpus. Each payload is written to disk as markdown,
+ingested by the real `Ingestor`, retrieved by the real retriever and rendered by the real engine
+into the prompt a provider receives; the judge is phase 3's, imported rather than rewritten, and
+is deliberately looser than the assembler's own matcher. **Forged lines: 0 of 28 renderings.**
+
+Two things about how that number was arrived at, because the first draft of the test was worth
+nothing. Each case asserts the payload reached **layer 7** before it asserts that nothing was
+forged - the first version asserted the marker was somewhere in the prompt, which the customer's
+own message satisfies, so the whole file would have passed against a retriever that returned
+nothing. And the marker is a token only the document contains, checked against a knowledge block
+sliced out of the rendered prompt, so "it got there" means what it says.
+
+Two routes that did not exist before this phase get their own cases: a payload in a *heading*,
+which the chunker copies into the indexed text and into the locator, and the negative -
+`wobblefish` appears in layer 7 and nowhere else in the prompt.
+
+### Versioning, and what makes the exit criterion exact
+
+`source_version` is `r<revision>-<sha256[:12]>` over the normalised corpus, so a scheduled sync of
+unchanged content keeps the version and rewrites nothing, and any edit - one word, or a file
+rename, which changes every locator - produces a new one. Old chunks are marked stale, never
+deleted, so the version a trace names still has text behind it. The Qdrant side versions by
+*collection*: a sync builds `<prefix><source>_v<n>` and flips the alias onto it in one call, and
+three revisions are retained.
+
+The exit criterion is therefore checkable in its strong form, and
+`tests/test_source_version_trace.py` checks all four parts: the old trace names A and the new one
+names B; the text A names is still readable and still says what it said; the *same* long-lived
+executor picks B up on its next retrieval with no restart; and the Qdrant collection that produced
+the old answer still exists and still contains only version A.
+
+`--force` exists for the one change content-addressing cannot see: the *chunker*. A code change is
+a deploy, the corpus hash is unchanged, and the stored chunks are the old shape.
+
+### Degradation, twice
+
+With Qdrant unreachable, a **sync** commits the Postgres halves and reports `vector_error`,
+exiting 0, because a pack that could not correct its knowledge while a secondary index was down
+would be worse than one that degrades. A **query** drops the backend that raised
+`RetrieverUnavailable`, answers from the rest, and records `retrieval_degraded` on the trace step -
+"these are the best passages available *because Qdrant was down*" is a materially different fact
+from "these are the best there are" when somebody is later asked why an answer was wrong.
+
+The degradation test does not use the `qdrant` fixture and never skips: it points a store at a
+port nothing listens on, so an outage is testable on a machine that has no Qdrant at all. Only
+`RetrieverUnavailable` is caught; a backend that raises anything else has a bug rather than an
+outage and the composite lets it through.
+
+With *every* backend down the result is empty, and that is not papered over: an empty knowledge
+block plus a factual claim is exactly what the citation guardrail refuses.
+
+### The citation guardrail
+
+Rule-based, three families (policy, pricing, timing), tried in that order because they overlap on
+the word "charge" and policy's patterns are the specific ones. It refuses the two shapes that are
+checkable: a message containing a claim that cites nothing the node was offered, and a message
+citing an id the node was never given - a fabricated citation, which is worse than no citation
+because it looks like grounding.
+
+It rides phase 3's retry loop rather than adding a second one: `UncitedClaimError` is a
+`StructuredOutputError` subclass, so the reject-correct-retry ladder is the one phase 3 built and
+phase 3's review hardened, and the correction is drawn from a closed vocabulary - the *kind* of
+claim and the ids that were offered, both of which core knows independently of what the model
+said. A second failure becomes `NodeError(reason="uncited_claim")` and reaches phase 6's real
+handoff, carrying the passages the node was looking at when it decided to assert something. The
+reason is its own rather than `llm_invalid_output`, because "the model answered with something the
+graph does not allow" and "the model asserted a policy it could not support" send a conversation
+to the same place for very different causes.
+
+`pack.yaml` gains `guardrails.citations`, on by default. A pack may turn the check off in one
+visible line and may *add* patterns; there is deliberately no way to remove a core pattern,
+because a pack that could delete the timing family could make "your refund arrives tomorrow" not a
+claim.
+
+What it misses is in the self-critique, in detail.
+
+### The sample pack, and a demo that would otherwise be a lie
+
+`tell_done`'s instructions used to *contain* the answer - "say that it takes five to seven business
+days" - which is knowledge in a prompt, the thing decision Q8 forbids, and meant a change to the
+published wait needed a deploy. It now takes the timing from layer 7 and cites it, and
+`explain_denial` retrieves the rule behind a refusal. Editing
+`packs/acme_billing/knowledge/docs/processing-times.md` and re-running the sync changes what the
+next conversation says, with no restart.
+
+That makes `support pack knowledge sync` a required step of the demo rather than an optional one,
+and the README says so: against an unindexed database the agent re-asks itself once and then hands
+the conversation to a person - correct, and unhelpful.
+
+### Measured retrieval quality
+
+Twelve hand-labelled questions over a three-document corpus, all four paths, one sync
+(`tests/test_retrieval_quality.py`, printable with `pytest -s -k printable`):
+
+| backend | recall@1 | recall@3 |
+|---|---|---|
+| lexical (`ts_rank_cd`) | 12/12 | 12/12 |
+| dense (pgvector cosine) | 8/12 | 11/12 |
+| colbert (Qdrant MaxSim) | 8/12 | 11/12 |
+| composite (RRF) | 10/12 | 12/12 |
+
+The backlog required ColBERT to be "measured against the pgvector path on the same corpus before
+making it the default", and it is not the default: the composite merges all three and none of them
+decides alone. On this corpus the two vector paths tie and the lexical path beats both, which is
+the expected result of running a hashed-projection stand-in against a real BM25-family ranker and
+is *not* a result about ColBERT - see the self-critique.
+
+The merge is at least as good as its best input at k=3 and is worse than the lexical half at k=1.
+That is written into the test as an assertion in both directions rather than left as a pleasant
+surprise: fusion trades a first-place for robustness, which is the right trade at the k a
+`knowledge:` block asks for and would be the wrong one at k=1.
+
+### Composition
+
+`support_core/knowledge/wiring.py` is the only place that turns a pack into a retriever, in the
+same shape as `support_core/llm/wiring.py`, so the service, the sync CLI and the tests compose the
+layer identically. A pack with no sources gets `None` and its `llm` nodes get an empty layer 7,
+which is a legitimate configuration rather than a hole - the citation guardrail is what stops it
+becoming an ungrounded answer. `use_qdrant=False` is a *configuration* and is kept distinct from a
+Qdrant that is down, which is a *fault*: the first is silent and decided once, the second degrades
+and logs on every call.
+
+## Self-critique
+
+Per PLAN.md step 3: what was skipped or simplified, where the code diverges from the design, which
+tests are weak, and what breaks under concurrency or a crash mid-step.
+
+### What retrieval quality is, and is not, measured against
+
+This is the first item because it is the largest limitation of the phase and the table above will
+otherwise be read as more than it is.
+
+**The encoder is not a language model.** `DeterministicEncoder` is a hashed projection of tokens
+and their character trigrams onto the unit sphere. It knows that "refunds" and "refunded" are
+close; it does not know that "reimbursement" and "refund" mean the same thing, and it never will,
+because there is no meaning in it. Everything the dense and ColBERT paths score is therefore a
+smoothed lexical overlap wearing a vector's clothes.
+
+**The real ColBERT model has never run here.** `FastEmbedColbertEncoder` is written and unexercised:
+`fastembed` installs, and this environment cannot complete TLS to the model host
+(`CERTIFICATE_VERIFY_FAILED`), so the weights cannot be fetched. This is the same shape of gap as
+phase 3's unexercised `AnthropicProvider` and it gets the same treatment - the seam is real, the
+code path is written, and nothing here should be read as evidence that it works. In particular the
+`_check` that refuses a model whose width is not 128 has never refused anything.
+
+So what the comparison measures is **plumbing**: that each backend returns rows, that the Qdrant
+collection is built with the right comparator, that MaxSim rescoring runs, that the merge does not
+lose to its inputs, and that a regression in any of those shows up as a number. It does not
+measure whether late interaction is better than dense retrieval on this corpus, and the fact that
+the two tie at 8/12 and 11/12 says nothing about ColBERT - it says the same encoder produced both.
+The backlog's requirement was that ColBERT not become the default without a measurement, and it
+has not: the composite merges all three.
+
+**The query set is weak in two further ways.** It is twelve queries, and it was written by the
+same person who wrote the corpus - so it is a test of recall against phrasings that a corpus
+author found natural, which is the friendliest possible distribution. Real customers write worse
+questions and the corpus was not written to answer them. Phase 8's eval harness is where a
+labelled set that somebody else wrote belongs.
+
+**A note on the lexical result.** 12/12 at both k values is a good number and not a surprising
+one: the corpus is small, the queries share vocabulary with it, and `ts_rank_cd` is a proper
+ranker. It should not be read as "the vector side is unnecessary". It should be read as "on a
+corpus this small, with a stand-in encoder, the keyword ranker wins", which is exactly the
+condition the decision to bring ColBERT forward was meant to escape and did not escape.
+
+### What the citation check misses
+
+It is a keyword detector over sentences. It will have false positives, which cost a turn and then
+a handoff - annoying and safe - and false negatives, which are claims reaching a customer uncited,
+which is the failure it exists to prevent. Named cases, all verified against the code:
+
+* **A claim whose vocabulary is not in the families.** "Setup work is excluded from this." is a
+  policy claim and passes uncited: `excluded` is in no pattern. So does "The answer is no.", which
+  is a claim about whatever was asked.
+* **A number written as a word.** "It should reach you in a fortnight" is not detected; "five to
+  seven business days" is, because `five` is in the timing list and `fortnight` is not. The list
+  is a list.
+* **A claim split across sentences.** "That depends on your plan. Yours is the annual one, so no."
+  is two sentences and neither is a claim on its own.
+* **A claim shaped as a question.** `allow_uncited_questions` defaults to on, so "Did you know
+  refunds take 90 days?" is exempt. The default is right on balance - a workflow repeating a
+  number back for confirmation asserts nothing - and it is a hole.
+* **Any language but English.** The patterns are English and the tokeniser is English. A pack with
+  `language: pt-BR` gets no citation guardrail at all and is not told so. This one deserves a
+  load-time warning and does not have one.
+* **Attribution.** The largest one, and it is by design rather than by omission: one valid citation
+  clears a message containing four claims, including claims the cited passage says nothing about.
+  Per-claim attribution needs a model, and a model marking its own homework is not a guardrail;
+  DESIGN.md 16.1's node evals and section 8's LLM judge are where that belongs. It is a test
+  (`test_presence_is_checked_and_attribution_is_not`) rather than a footnote, so a later change
+  that fixes it has something to delete.
+
+The check also cannot tell a *correct* citation from an incorrect one, and it cannot tell whether
+the passage was relevant. What it guarantees is narrower than it looks: that the model was shown
+passages, that it named one, and that the one it named exists.
+
+### What was skipped
+
+* **The knowledge graph retriever** and `kg_entity` / `kg_relation` loading, which is phase 9. The
+  `knowledge_graph` section of `sources.yaml` is parsed and loaded nowhere, deliberately, so a
+  pack that declares one gets its typos caught now.
+* **Model reranking of passages**, which section 9.1 offers "when `k` is small". An extra model
+  call per retrieval is a straight charge against section 20's four-second p95 and nothing here
+  can measure the benefit.
+* **`LiveLookupRetriever` in full.** Section 9.1 routes "entity-specific questions" to READ tools,
+  which properly needs a structured model call to extract the tool's arguments from the question -
+  a second decision surface with no graph constraining it. What is built is the part where the
+  *pack* has made that decision: a declared tool, trigger words, and arguments taken from `ctx`. A
+  question whose answer needs an identifier only the question contains ("what is charge ch_9912
+  for") does not reach a live lookup. The sample pack declares none, so this code path is
+  exercised only by its own tests.
+* **`refresh:` does nothing.** A source may declare `hourly`, `daily` or `weekly` and nothing in
+  core schedules anything; the field exists so the scheduler phase 7 owns finds an answer rather
+  than a key to invent.
+* **Retrieval is not replayed from the trace.** The phase-3 deferred finding about replaying LLM
+  calls has an exact analogue here: a re-executed step after a crash retrieves again, and may get
+  different passages if a sync landed in between. The trace records what *was* used, so an
+  investigation is not harmed; a replay is not byte-identical. Phase 7 owns replay.
+* **The ColBERT multivector has no HNSW index** (`m=0`), on Qdrant's own guidance that late
+  interaction is a reranker over an indexed first stage. The two-stage path is implemented and
+  `prefetch=0` (a linear scan) is what the tests use, so the *tuned* path - dense prefetch then
+  MaxSim rescoring - is written and only exercised through the composite's default. On a corpus of
+  eleven chunks the distinction is invisible; on a large one it is the whole latency story, and
+  nothing here has measured it.
+
+### Where the code diverges from DESIGN.md
+
+Beyond the deviations the plan already listed and the decisions log already settled:
+
+* **Chunking does not merge short sections**, against the plan's own promise. Argued above.
+* **The lexical query is a disjunction**, which section 9.1 does not discuss because it does not
+  discuss tsquery at all. It is a retrieval-quality decision made in a repository module and it is
+  the kind of thing that belongs in a pack's configuration eventually.
+* **`Passage.for_prompt` drops the score.** The model is told a passage's id, text, source and
+  version, and not how well it matched or which backend found it. Neither is evidence, and both
+  would be numbers a model might reason about.
+* **Second stateful dependency**, already decided (BACKLOG.md, 2026-09-06) and restated in the
+  plan.
+
+### Which tests are weak
+
+* **The retrieval-quality set**, above.
+* **`html_crawl` has never met a web server.** It is tested against a stub fetcher, which is what
+  keeps the suite off the network, and that means the parts a real server exercises - redirects,
+  encodings, compressed responses, a page that is 40 MB - are untested. `http_fetch` itself is
+  marked `no cover` and has never run in this repository.
+* **The injection matrix relies on the deterministic encoder to retrieve the hostile passage.**
+  Each case aims a unique marker token at the lexical half, which is reliable, but it means the
+  matrix proves the *rendering* is safe rather than that a hostile document is easy to retrieve.
+  That is the right property to test, and it is worth being explicit that the test does not model
+  an attacker who has to win a ranking competition to be seen.
+* **Nothing tests two syncs at once** (see below).
+* **The `qdrant` fixture skips when Qdrant is absent.** That is deliberate - a suite that could not
+  run without the vector side would contradict the phase's own degradation claim - but it means a
+  CI job whose Qdrant failed to start reports green with eight fewer assertions. The skip is
+  visible in the summary and nothing enforces it.
+* **The claim-detector matrix is my own vocabulary.** Eleven claims and seven non-claims, written
+  by the person who wrote the patterns. It is a regression net, not a measurement.
+
+### What breaks under concurrency or a crash mid-step
+
+Retrieval itself is a read outside the checkpoint transaction, and that is now asserted rather
+than assumed (`test_retrieval_happens_outside_the_checkpoint_transaction`), so nothing here can
+cost a conversation its durability. The failure modes are all in the *sync*, which is not in a
+turn's write path and is correspondingly less defended:
+
+1. **Two concurrent syncs of one source duplicate the corpus.** `sync_source` reads
+   `doc_source.revision` in one transaction and writes chunks in another, with nothing held
+   between them. Two syncs started together both compute revision *n+1*; if they read the same
+   corpus they compute the same `source_version` and both insert a full set of chunks under it, and
+   `mark_stale` keeps both because they match `keep_version`. The result is every passage
+   duplicated in the live version - a retrieval returning the same text twice, and a `k` of 3
+   carrying two distinct facts instead of three. Nothing detects it. The fix is a transaction-level
+   advisory lock keyed on the source id, which is the same device the engine uses per conversation,
+   and it is not in this phase because the sync is a scheduled job that a deployment runs once at
+   a time and the fix deserves its own test rather than a hurried one. **Recorded as a deferred
+   finding.**
+2. **A crash between the chunk commit and the alias flip leaves the two stores on different
+   versions.** Postgres has version *n+1* live; the Qdrant alias still points at *n*. Retrieval
+   then merges passages carrying two different `source_version` values in one answer. It is not
+   silent - the trace records both, which is exactly what the trace is for - and the next sync
+   fixes it, but a passage set that straddles a revision is a thing a reader of the trace has to
+   understand rather than a thing that cannot happen. Making it impossible needs the vector index
+   inside the same transaction as the rows, which is not available across two stores.
+3. **The retention sweep can outrun a trace.** Three revisions are kept. A source synced four times
+   between an answer and an investigation has lost the collection *and* the rows the answer used,
+   and the trace then names a version nothing can show. `KEEP_COLLECTIONS` is a constructor
+   argument and the default suits a weekly refresh; a daily one wants more, and nothing warns the
+   operator of the relationship between the refresh interval and how long a wrong answer stays
+   explicable.
+4. **A `doc_chunk` row deleted while a Qdrant point survives** is handled (the retriever logs and
+   skips a point whose row is gone) but the reverse - a point whose payload version disagrees with
+   the row's - is logged and *used*. The row wins, which is the right choice, and the log line is
+   the only trace of the disagreement.
+
+### A note on the sample pack's manifest
+
+`packs/acme_billing/pack.yaml` writes its `guardrails:` block out although `enabled: true` is the
+default. That is not redundancy: the argument for adding the key at all was that a pack's
+guardrail configuration should be visible to somebody reading the pack, and a block that only
+appears when it is turned *off* would make the safe case the invisible one.
+
+### Verification
+
+Every command below was run from a clean tree on 2026-09-07, in this order, against the
+docker-compose Postgres and Qdrant. Results are recorded in the "Resolution" section a reviewer
+will add; the run this phase closes on is summarised there.
+
+```
+.venv/Scripts/python.exe -m ruff check .
+.venv/Scripts/python.exe -m ruff format --check .
+.venv/Scripts/python.exe -m mypy support_core
+.venv/Scripts/python.exe -m pytest -q
+.venv/Scripts/python.exe -m pytest -q -m live
+.venv/Scripts/python.exe tests/verify_phase_2_resolution.py
+.venv/Scripts/python.exe -m support_core.cli.main pack validate packs/acme_billing
+.venv/Scripts/python.exe -m alembic downgrade base && .venv/Scripts/python.exe -m alembic upgrade head && .venv/Scripts/python.exe -m alembic check
+```
+
+The cassettes were regenerated with `python -m tests.cassettes.build_cassettes` because this phase
+changes a prompt they cover: `tell_done`'s instructions no longer state the timing, and layer 7 is
+no longer empty for the two nodes that carry a `knowledge:` block.
+
+### Two notes for whoever reviews this
+
+**The duplicate plan commit.** `d7c49c8 phase-5: plan (PLAN.md step 1)` has a twin at `0514b4b`
+with the same message, left by the first attempt at this phase that was discarded. Both are
+published, so neither is being rebased or dropped - rewriting history that somebody else may have
+is a worse problem than a confusing log. The plan that governs this phase is the one in this file,
+which is `d7c49c8`'s, amended by the section above.
+
+**Concurrent work.** While this phase was in flight, another process committed the library half of
+it as `2a28eaf phase-5: snapshot the in-flight knowledge layer` and added two review documents
+(`46ff6c3`, `25e6d35`) and a demo-client fix (`ee0db00`). Nothing in those commits contradicts
+this work - the security review explicitly read the in-flight knowledge layer for context and
+recorded no finding against it - and nothing here was rebased or reverted.
+

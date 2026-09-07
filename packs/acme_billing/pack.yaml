@@ -39,3 +39,10 @@ memory:
   summarize_every_turns: 2            # DESIGN.md 10's rolling summary, every K turns
   window_messages: 10
   max_summary_chars: 600
+guardrails:
+  # DESIGN.md 14's "pack-supplied configuration". Written out although `enabled: true` is the
+  # default, because the point of the key is that a reader of the pack can see which guardrails
+  # are running: `explain_denial` and `tell_done` both make claims a customer will act on, and
+  # both are refused and re-prompted if they cite nothing.
+  citations:
+    enabled: true
