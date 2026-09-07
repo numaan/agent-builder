@@ -40,7 +40,7 @@ or spell out `.venv/Scripts/python.exe` / `.venv/bin/python`).
 
 ## Database
 
-Start Postgres 16 with pgvector and wait until it accepts connections:
+Start Postgres 16 with pgvector and Qdrant, and wait until both accept connections:
 
 ```sh
 sh scripts/db-up.sh        # or: make db-up
@@ -49,7 +49,18 @@ sh scripts/db-up.sh        # or: make db-up
 The `scripts/*.sh` files are the canonical way to do things; the `Makefile` only wraps them for
 convenience and needs GNU make, which Git Bash on Windows does not ship.
 
-The container listens on `localhost:5432` with user and password `support` and two databases:
+There are two containers, and DESIGN.md 4.1 says there is one stateful dependency. The
+relaxation is deliberate and recorded in BACKLOG.md's decisions log (2026-09-06): Qdrant holds
+the ColBERT multivectors of DESIGN.md 9.1 and scores MaxSim natively, and retrieval is a read
+*outside* the checkpoint transaction, so a second store cannot cost a checkpoint or a resume -
+which is the property 4.1 existed to protect. Postgres keeps the lexical half, so retrieval
+degrades rather than fails when Qdrant is down. Qdrant listens on `localhost:6333`:
+
+```sh
+export SUPPORT_QDRANT_URL=http://localhost:6333   # the default
+```
+
+The Postgres container listens on `localhost:5432` with user and password `support` and two databases:
 `support` for development and `support_test`, which only the test suite uses. Every component
 reads the connection string from one place:
 
@@ -145,19 +156,48 @@ misstate governs nothing (DESIGN.md 8.3); an import that raises is a finding, no
 adds, the two `confirm_exempt` passcode tools with the reason each gave, and five notes about
 optional values and a state field typed as a pack model.
 
-`support pack knowledge sync`, `support pack eval` and `support replay` exist but exit with
-status 3 and name the phase that delivers them.
+```sh
+support pack knowledge sync packs/acme_billing
+```
+
+Fetch, chunk by heading, embed, index and mark stale (DESIGN.md 9.3). One line per source:
+
+```
+policy-docs: r2-1f4c8a90bb21, 2 document(s), 11 chunk(s), 4 marked stale, 11 vector(s) in kb_policy_docs_v2
+```
+
+The version is content-addressed - `r<revision>-<sha256[:12]>` over the normalised corpus - so
+re-running it on a corpus nobody edited prints `unchanged at r2-...` and rewrites nothing, which
+is what a daily schedule needs. Editing one word produces a new version, writes new chunks, marks
+the old ones stale (they are kept, so an older trace can still be shown what it was reading), and
+builds a new Qdrant collection whose alias is flipped at the end. `--force` re-indexes anyway,
+which is how you rebuild after a change to the *chunker* - a code change the corpus hash cannot
+see. `--source <id>` syncs one source.
+
+Exit status is 0 when every source synced and 1 when a source could not be read. A Qdrant that is
+not answering is **not** a failure: the command says so, indexes the Postgres halves and exits 0,
+because a pack that could not correct its knowledge while a secondary index was down would be
+worse than one that degrades.
+
+`support pack eval` and `support replay` exist but exit with status 3 and name the phase that
+delivers them.
 
 ## Running the demo
 
 A browser, a conversation, and a refund that stops for your approval before it moves any money.
-Three commands from a clean checkout, run from the repository root:
+Four commands from a clean checkout, run from the repository root:
 
 ```sh
-sh scripts/db-up.sh                                       # Postgres 16 + pgvector on 5432
+sh scripts/db-up.sh                                       # Postgres + pgvector on 5432, Qdrant on 6333
 python -m alembic upgrade head                            # create the schema
+support pack knowledge sync packs/acme_billing            # index the pack's policy documents
 SUPPORT_APP_CONFIG=demo/acme_web_chat.json python -m uvicorn app:app --port 8000
 ```
+
+The sync is not optional. Two of the refund workflow's steps answer from the pack's knowledge
+documents, and the outbound citation guardrail (DESIGN.md 9.2) refuses a claim about policy,
+pricing or timing that cites nothing - so against an unindexed database the agent re-asks itself
+once and then hands the conversation to a person, correctly and unhelpfully.
 
 Then open <http://127.0.0.1:8000/>. On Windows use `.venv/Scripts/python.exe` in place of
 `python` (Git Bash accepts the `VAR=value command` prefix); on Linux or macOS use `.venv/bin/python`.
@@ -177,6 +217,10 @@ What to watch for:
   something else. Identity verification is in the pack's `interrupts.blocked_in`, so the agent
   finishes it, says it has made a note, and comes back to the address change afterwards - which
   is what it does at message four, without being asked again (DESIGN.md section 6.6).
+- **The timing comes from a document, not from a prompt.** The closing message says five to seven
+  business days because `knowledge/docs/processing-times.md` says so and the model cited the
+  passage. Edit that file, re-run `support pack knowledge sync`, and the next conversation says
+  the new number with no restart and no deploy (DESIGN.md 9.2, principle 6).
 - **Nothing moves until you say so.** The proposed refund appears in a bordered panel naming the
   tool it would run (`issue_refund`) and quoting the exact proposal the approval is bound to.
 - **A reload changes nothing.** The transcript comes back and the conversation carries on: it is
