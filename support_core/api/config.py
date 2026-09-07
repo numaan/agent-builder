@@ -27,6 +27,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from support_core.storage.config import DEFAULT_MAX_CONCURRENT_TURNS
+
 ProviderChoice = Literal["auto", "replay", "anthropic", "glm", "none"]
 """What answers an ``llm`` node.
 
@@ -43,6 +45,11 @@ ENV_API_KEY = "ANTHROPIC_API_KEY"
 ENV_MODEL = "SUPPORT_MODEL"
 ENV_ESCALATION_MODEL = "SUPPORT_ESCALATION_MODEL"
 ENV_DESK_TOKEN = "SUPPORT_DESK_TOKEN"
+ENV_MAX_CONCURRENT_TURNS = "SUPPORT_MAX_CONCURRENT_TURNS"
+"""How many turns this replica runs at once. A variable as well as a config-file field because
+it is the one setting an operator changes in response to load, and DESIGN.md section 20 says a
+container is configured with variables."""
+
 ENV_QDRANT_URL = "SUPPORT_QDRANT_URL"
 """The same variable :mod:`support_core.knowledge.config` reads, so the CLI's sync and the
 service's retriever cannot end up pointed at two different instances."""
@@ -98,6 +105,20 @@ class AppConfig(BaseModel):
     return - is the default for exactly the reason phase 2's review finding R7 gives: a handler
     that waits holds a connection per waiter, and with turns that take seconds, N+1 messages on
     one conversation is a stall. The drain worker is what makes zero safe."""
+
+    max_concurrent_turns: int = Field(default=DEFAULT_MAX_CONCURRENT_TURNS, ge=1, le=256)
+    """Turns this replica runs at once, and therefore how big its connection pool is.
+
+    Security review finding S2: a turn holds up to three database connections, one of them for
+    the turn's whole length, and nothing bounded how many turns ran at once or sized the pool
+    against them - so ten concurrent customers exhausted SQLAlchemy's default pool and every
+    later request, ``/healthz`` included, blocked for thirty seconds and then raised.
+
+    Raising this raises the pool with it (:func:`~support_core.storage.config.pool_settings`), so
+    the two cannot drift apart. A message that arrives over the bound is not refused and not made
+    to wait: it is durable and ``pending`` before the bound is consulted, the caller is told
+    ``queued``, and the drain worker runs it - the same answer, and the same machinery, as a
+    message that arrived while another turn held its conversation's lock."""
 
     drain_workers: int = Field(default=4, ge=1, le=64)
     drain_budget_seconds: float = Field(default=60.0, gt=0.0)
@@ -204,6 +225,8 @@ class AppConfig(BaseModel):
             values["desk_token"] = source[ENV_DESK_TOKEN]
         if source.get(ENV_QDRANT_URL):
             values["qdrant_url"] = source[ENV_QDRANT_URL]
+        if source.get(ENV_MAX_CONCURRENT_TURNS):
+            values["max_concurrent_turns"] = source[ENV_MAX_CONCURRENT_TURNS]
         try:
             return cls.model_validate(values)
         except ValidationError as exc:

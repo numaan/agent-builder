@@ -25,6 +25,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from sqlalchemy import text as sql_text
+from sqlalchemy.exc import TimeoutError as SQLTimeoutError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from support_core.api.config import AppConfig, ConfigError
@@ -59,7 +61,13 @@ from support_core.llm.wiring import (
 )
 from support_core.memory import LlmSummarizer
 from support_core.storage import repositories as repo
-from support_core.storage.session import make_engine, make_session_factory
+from support_core.storage.config import pool_settings
+from support_core.storage.session import (
+    connections_in_use,
+    make_engine,
+    make_session_factory,
+    pool_capacity,
+)
 
 SEND_FAILURES_KEPT = 50
 """How many delivery failures :attr:`AppRuntime.send_failures` remembers."""
@@ -209,6 +217,46 @@ class AppRuntime:
         if self.owns_engine:
             await self.engine.dispose()
 
+    def pool_pressure(self) -> tuple[int, int]:
+        """Connections checked out, and the most this process will ever hold.
+
+        A capacity of ``0`` means this engine does not pool at all - ``NullPool``, which the test
+        fixtures use - and there is nothing to be full of.
+        """
+        return connections_in_use(self.engine), pool_capacity(self.engine)
+
+    async def database_health(self) -> str:
+        """``"ok"``, or a short phrase saying what is wrong. Never raises, never queues.
+
+        Security review finding S2 measured this endpoint at **28.5 seconds** during a flood,
+        because it asked the same exhausted pool the turns had taken for a connection and then
+        waited out the checkout timeout. An orchestrator reads a health check that slow as a dead
+        instance and restarts it, which loses every turn in flight and adds the restarted
+        replica's reconnects to the load - so a health check that hangs is worse than one that
+        says "degraded".
+
+        Two things stop it now. The pool is sized with a reserve the turns cannot reach
+        (:data:`~support_core.storage.config.RESERVE_CONNECTIONS`), because they are bounded by
+        :class:`~support_core.engine.executor.TurnSlots`; and if the pool is full anyway - some
+        other caller, or a database that has stopped answering and is holding every connection
+        open - this asks the pool how many connections are out **before** asking for one, and
+        answers from that instead of joining the queue. Counting is free; queueing is what took
+        28.5 seconds.
+        """
+        in_use, capacity = self.pool_pressure()
+        if capacity and in_use >= capacity:
+            return f"saturated: {in_use} of {capacity} connections are in use"
+        try:
+            async with self.engine.connect() as connection:
+                await connection.execute(sql_text("SELECT 1"))
+        except SQLTimeoutError:
+            # Lost the race between the count above and the checkout. Bounded by
+            # `pool_timeout`, which is five seconds rather than SQLAlchemy's thirty.
+            return "saturated: no connection was free"
+        except Exception as exc:  # a health endpoint reports the failure, it does not raise
+            return f"unavailable: {type(exc).__name__}"
+        return "ok"
+
     def adapter(self, channel: str) -> ChannelAdapter:
         return self.hub.adapter(channel)
 
@@ -333,6 +381,7 @@ def build_runtime(
     context = _check_context(config.new_conversation_context)
     config = config.model_copy(update={"new_conversation_context": context})
 
+    turn_limit = config.max_concurrent_turns
     resolved = config.resolve_provider(env)
     model_provider = provider if provider is not None else build_provider(config, resolved)
     if provider is not None:
@@ -363,13 +412,17 @@ def build_runtime(
         engine_hooks.resume_offer = StructuredResumeOffer(service)
 
     owns_engine = engine is None
-    db = engine if engine is not None else make_engine()
+    # The pool is sized from the turn bound rather than left at SQLAlchemy's default, and the
+    # two are chosen together here so they cannot drift apart (security review finding S2).
+    # `pool_settings` shows the arithmetic; `TurnSlots` is what keeps the turns inside it.
+    db = engine if engine is not None else make_engine(pool=pool_settings(turn_limit))
     sessions = make_session_factory(db)
     executor = Executor(
         pack,
         db,
         hooks=engine_hooks,
         lock_wait_seconds=config.lock_wait_seconds,
+        max_concurrent_turns=turn_limit,
         llm=service,
         # DESIGN.md section 9.1, from the pack's own `knowledge/sources.yaml`. `None` for a pack
         # that declares nothing, which is a real configuration and not a failure: layer 7 is then

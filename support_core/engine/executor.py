@@ -25,8 +25,8 @@ inside the checkpoint transaction, or after it - resumes by re-reading the row.
 """
 
 import uuid
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import suppress
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Literal
@@ -113,6 +113,7 @@ from support_core.llm.tool_loop import (
     ReadOnlyToolGateway,
 )
 from support_core.storage import repositories as repo
+from support_core.storage.config import DEFAULT_MAX_CONCURRENT_TURNS
 from support_core.storage.models import Conversation, Run
 from support_core.storage.repositories import ApprovalWrite, RunUpdate, StepWrite
 from support_core.storage.session import make_session_factory
@@ -176,6 +177,68 @@ One name so far, and it is the one that matters: DESIGN.md section 10 says
 ``identity_verified`` is set by the ``verify_identity`` sub-graph alone, through a tool.
 ``AppConfig`` is held to the same rule for a new conversation's starting context; this is that
 rule on the other unauthenticated surface (review finding P1)."""
+
+
+@dataclass(slots=True)
+class TurnSlots:
+    """How many turns this process runs at once (security review finding S2).
+
+    A turn holds :data:`~support_core.storage.config.CONNECTIONS_PER_TURN` database connections
+    at its peak, one of them for the turn's whole length, so an unbounded number of concurrent
+    turns is an unbounded demand on a bounded pool. Ten concurrent customers exhausted it; every
+    request after that - including ``/healthz`` and the desk - queued for the full checkout
+    timeout and then raised.
+
+    **Taking a slot is never a wait.** Over the bound, the caller is told exactly what it is told
+    when another turn holds the conversation's advisory lock: ``queued``. That answer is already
+    correct and already safe, because
+    :meth:`~support_core.engine.executor.Executor.on_inbound` writes the customer's message
+    ``pending`` *before* it asks for either the slot or the lock, and the drain worker picks the
+    conversation up afterwards. A queued message is still answered; a 503 is not, and blocking
+    is what the finding is about.
+
+    Per process, not per deployment, because the thing being protected is this process's pool.
+    Nothing durable depends on it: two replicas each run their own bound against their own pool,
+    which is what DESIGN.md section 4.1's "horizontal scaling is safe" already means.
+
+    **What is bounded, and what is not.** The two customer entry points -
+    :meth:`~support_core.engine.executor.Executor.on_inbound` and
+    :meth:`~support_core.engine.executor.Executor.drain` - are, because they are the
+    unauthenticated ones and because a refused customer message has somewhere safe to go. A desk
+    ``resume`` is not: there is no pending row for a human's action, so "queued" would mean
+    "lost", and the desk is behind a bearer token and is not where a flood comes from. The
+    scheduler's sweeps are not either, for the same reason. Those live inside
+    :data:`~support_core.storage.config.RESERVE_CONNECTIONS`, which is sized for them.
+
+    ``limit <= 0`` means unbounded, which is the engine's own tests and any caller that supplies
+    its own connection strategy.
+    """
+
+    limit: int = DEFAULT_MAX_CONCURRENT_TURNS
+    in_use: int = 0
+    refused: int = 0
+    """Turns that found no slot and were queued instead. For tests and phase 7's metrics."""
+
+    @property
+    def full(self) -> bool:
+        return self.limit > 0 and self.in_use >= self.limit
+
+    @asynccontextmanager
+    async def hold(self) -> AsyncIterator[bool]:
+        """Yield whether a slot was taken; release it on the way out.
+
+        There is no ``await`` between the test and the increment, and the event loop is
+        single-threaded, so the count cannot be raced past the bound.
+        """
+        if self.full:
+            self.refused += 1
+            yield False
+            return
+        self.in_use += 1
+        try:
+            yield True
+        finally:
+            self.in_use -= 1
 
 
 @dataclass(slots=True)
@@ -331,12 +394,17 @@ class Executor:
         tool_runner: ModelToolRunner | None = None,
         tools: ToolRuntime | None = None,
         retriever: CompositeRetriever | None = None,
+        max_concurrent_turns: int = DEFAULT_MAX_CONCURRENT_TURNS,
     ) -> None:
         self.pack = pack
         self.engine = engine
         self.hooks = hooks or EngineHooks()
         self.lock_wait_seconds = lock_wait_seconds
         self.sessions = make_session_factory(engine)
+        self.turn_slots = TurnSlots(max_concurrent_turns)
+        """How many turns this process runs at once (security review finding S2). A customer
+        message over the bound is queued rather than made to wait, the same way a message that
+        cannot get its conversation's lock is. See :class:`TurnSlots`."""
         self._runners: dict[tuple[str, str], Any] = {}
         self.llm = llm
         """The LLM layer (DESIGN.md section 11). ``None`` is a legitimate configuration - the
@@ -414,7 +482,10 @@ class Executor:
 
         The message row is written *before* the lock is attempted, always with
         ``status = pending``: that is what makes it durable regardless of which process ends up
-        processing it, and what gives the pending queue its order (DESIGN.md section 17).
+        processing it, and what gives the pending queue its order (DESIGN.md section 17). It is
+        written before the *turn slot* is asked for too, and for the same reason - a bound that
+        refused the customer's text before it was durable would be a way of losing it, which is
+        not what "degrade honestly" means (security review finding S2).
         """
         async with self.sessions() as session, session.begin():
             conversation = await repo.get_conversation(session, conversation_id)
@@ -423,12 +494,7 @@ class Executor:
                 raise EngineError(msg)
             await repo.enqueue_inbound(session, conversation_id=conversation_id, text_=text)
 
-        async with conversation_lock(
-            self.engine, conversation_id, wait_seconds=self.lock_wait_seconds
-        ) as acquired:
-            if not acquired:
-                return TurnOutcome(conversation_id=conversation_id, queued=True)
-            return await self._drain(conversation_id)
+        return await self._locked_drain(conversation_id)
 
     async def drain(self, conversation_id: uuid.UUID) -> TurnOutcome:
         """Process whatever the conversation has queued, under its lock.
@@ -436,12 +502,26 @@ class Executor:
         The same body ``on_inbound`` runs after storing its message. A poller, a recovery
         worker, or a caller that put a message back on the queue uses this to pick it up.
         """
-        async with conversation_lock(
-            self.engine, conversation_id, wait_seconds=self.lock_wait_seconds
-        ) as acquired:
-            if not acquired:
+        return await self._locked_drain(conversation_id)
+
+    async def _locked_drain(self, conversation_id: uuid.UUID) -> TurnOutcome:
+        """A turn slot, then the conversation's lock, then the queue - or ``queued``.
+
+        The two refusals are deliberately the same answer. "Somebody else is running this
+        conversation" and "this process is already running as many turns as its connection pool
+        can carry" are both "not now, and the message is safe where it is": the row is durable
+        and ``pending``, it keeps its place in the queue, and whoever calls
+        :meth:`drain` next runs it in order.
+        """
+        async with self.turn_slots.hold() as slot:
+            if not slot:
                 return TurnOutcome(conversation_id=conversation_id, queued=True)
-            return await self._drain(conversation_id)
+            async with conversation_lock(
+                self.engine, conversation_id, wait_seconds=self.lock_wait_seconds
+            ) as acquired:
+                if not acquired:
+                    return TurnOutcome(conversation_id=conversation_id, queued=True)
+                return await self._drain(conversation_id)
 
     async def resume_human(
         self,

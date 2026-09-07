@@ -57,7 +57,7 @@ from typing import Any
 from fastapi import APIRouter, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import text as sql_text
+from sqlalchemy.exc import TimeoutError as SQLTimeoutError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from support_core.api.config import AppConfig
@@ -86,6 +86,39 @@ HELLO_TIMEOUT = 15.0
 
 The key arrives in a frame rather than in the URL (finding W9), so a client that connects and
 says nothing would otherwise hold a socket for ever for free."""
+
+
+RETRY_AFTER_SECONDS = 5
+"""What a caller refused for want of a database connection is told to wait.
+
+Seconds rather than minutes because the thing it is waiting for is a turn finishing, and a turn
+is seconds long."""
+
+OVERLOADED_DETAIL = (
+    "this service has no free database connection; the message was not accepted, please retry"
+)
+"""Said to a caller whose request could not get a connection.
+
+Honest in both halves. "Not accepted" is true: a pool timeout at the top of the handler happens
+before or while the inbound row is written, so unlike a ``queued`` answer there is nothing
+durable holding the customer's words, and telling them to retry is the only correct instruction.
+It names no exception, no pool and no SQL - security review's "no error path puts internal state
+into an outbound message" applies to a 503 as much as to a turn."""
+
+
+def overloaded() -> JSONResponse:
+    """The answer to a request that could not get a database connection.
+
+    Security review finding S2: this used to be an unhandled
+    ``sqlalchemy.exc.TimeoutError`` - a 500 with a full traceback, after a thirty-second wait,
+    from an anonymous endpoint. A 503 with a ``Retry-After`` is what a caller can act on and what
+    a load balancer already understands.
+    """
+    return JSONResponse(
+        {"error": OVERLOADED_DETAIL},
+        status_code=503,
+        headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+    )
 
 
 def new_session_key() -> str:
@@ -159,6 +192,19 @@ def create_app(
         openapi_url=None,
     )
     app.state.runtime = runtime
+
+    async def on_pool_timeout(request: Request, exc: Exception) -> JSONResponse:
+        """Every route's answer to "no database connection was free" (finding S2).
+
+        On the application rather than in each handler, so that the desk endpoints and anything
+        phase 7 mounts are covered by construction - the same reason the desk's bearer dependency
+        is on the router rather than on each route. The webhook catches it itself as well,
+        because it has a more specific thing to say and because a handler should not rely on a
+        backstop for its own ordinary failure.
+        """
+        return overloaded()
+
+    app.add_exception_handler(SQLTimeoutError, on_pool_timeout)
     app.include_router(_routes(runtime))
     if desk_token is not None:
         # DESIGN.md section 12: the human desk "is not a customer channel but uses the same API
@@ -176,15 +222,24 @@ def _routes(runtime: AppRuntime) -> APIRouter:
 
     @router.get("/healthz")
     async def healthz() -> JSONResponse:
-        """What is running here, and whether it can reach its database."""
-        database = "ok"
-        try:
-            async with runtime.engine.connect() as connection:
-                await connection.execute(sql_text("SELECT 1"))
-        except Exception as exc:  # a health endpoint reports the failure, it does not raise
-            database = f"unavailable: {type(exc).__name__}"
+        """What is running here, and whether it can reach its database.
+
+        Answers in milliseconds whatever the load is doing, which is the half of security review
+        finding S2 that mattered most: this endpoint took 28.5 seconds during a flood and an
+        orchestrator reads that as an instance to restart.
+        :meth:`~support_core.api.runtime.AppRuntime.database_health` says how it stays fast.
+
+        A saturated pool is reported as ``degraded`` with **200**, not 503. The process is alive
+        and Postgres is reachable; what is full is a queue that empties by itself in seconds, and
+        503 here is what takes the replica out of rotation - or restarts it - at the exact moment
+        its in-flight turns would be lost. 503 stays where it was: a database this service cannot
+        reach at all.
+        """
+        database = await runtime.database_health()
+        in_use, capacity = runtime.pool_pressure()
         body = {
             "status": "ok" if database == "ok" else "degraded",
+            "pool": {"in_use": in_use, "capacity": capacity},
             "pack": {
                 "id": runtime.pack.manifest.id,
                 "version": runtime.pack.manifest.version,
@@ -195,7 +250,7 @@ def _routes(runtime: AppRuntime) -> APIRouter:
             "channels": sorted(runtime.hub.adapters),
             "database": database,
         }
-        return JSONResponse(body, status_code=200 if database == "ok" else 503)
+        return JSONResponse(body, status_code=503 if database.startswith("unavailable") else 200)
 
     @router.post("/channels/web_chat/messages")
     async def web_chat_message(request: Request) -> JSONResponse:
@@ -214,6 +269,8 @@ def _routes(runtime: AppRuntime) -> APIRouter:
             accepted = await runtime.accept(payload, channel=WEB_CHAT)
         except InboundRejected as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
+        except SQLTimeoutError:
+            return overloaded()
         return JSONResponse(
             {
                 "conversation_id": str(accepted.conversation_id),
@@ -350,6 +407,12 @@ async def _serve_socket(runtime: AppRuntime, socket: WebSocket) -> None:
             await _handle_frame(session, raw)
     except WebSocketDisconnect:
         return
+    except SQLTimeoutError:
+        # The opening handshake reads the transcript, and that read is on the same pool as the
+        # turns (finding S2). Say so and close, rather than raising out of the ASGI handler.
+        await connection.push({"type": "error", "detail": OVERLOADED_DETAIL, "fatal": True})
+        await socket.close(code=1013)  # 1013: try again later
+        return
     finally:
         session.release()
 
@@ -405,7 +468,13 @@ async def _handle_frame(session: _Session, raw: str) -> None:
         return
     # `deliver_inbound` creates the conversation if this is the first message on this key, and
     # attaches every connection waiting on the key - this one included - before the turn runs.
-    accepted = await runtime.deliver_inbound(inbound)
+    try:
+        accepted = await runtime.deliver_inbound(inbound)
+    except SQLTimeoutError:
+        # The socket's version of the webhook's 503 (finding S2). Not fatal: the connection is
+        # fine, this message was not accepted, and the customer can send it again.
+        await connection.push({"type": "error", "detail": OVERLOADED_DETAIL})
+        return
     session.conversation = accepted.conversation_id
     if accepted.queued:
         # Per-caller, so it is not part of the ``turn`` frame the whole conversation is told

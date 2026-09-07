@@ -77,7 +77,14 @@ async def test_a_lock_held_elsewhere_is_retried_until_it_is_free() -> None:
 
 async def test_a_lock_nobody_ever_releases_is_given_up_on_rather_than_retried_for_ever() -> None:
     """Giving up is safe - the message is durable and ``pending``, and whoever holds the lock
-    drains the queue in order - and retrying for ever is not."""
+    drains the queue in order - and retrying for ever is not.
+
+    It takes ``rounds`` budgets to get there, not one (security review finding S2): a
+    conversation the worker could not drain is come back to, because "somebody else has the
+    lock" and "this process is at its turn bound" both stop being true. What is bounded is how
+    many times, and the last one is counted as ``abandoned`` so that a message only phase 7's
+    scheduled sweep will now pick up is a number and not a silence.
+    """
     executor = FakeExecutor(queued_times=10_000)
     queue = queue_for(executor, budget_seconds=0.05)
     await queue.start()
@@ -87,7 +94,9 @@ async def test_a_lock_nobody_ever_releases_is_given_up_on_rather_than_retried_fo
     finally:
         await queue.aclose()
 
-    assert queue.stats.gave_up == 1
+    assert queue.stats.gave_up == queue.rounds
+    assert queue.stats.requeued == queue.rounds - 1
+    assert queue.stats.abandoned == 1
     assert queue.stats.drained == 0
 
 
@@ -136,7 +145,34 @@ async def test_a_conversation_that_raises_does_not_take_the_worker_down() -> Non
 
     assert seen == ["the database went away"]
     assert queue.stats.failed == 1
-    assert queue.stats.drained == 1
+    # And it is not *dropped* either: the failure is retried inside the same budget, so both
+    # conversations end up drained (security review finding S2). A drain that raises is most
+    # often a pool timeout, which is transient by definition; before this, the message it was
+    # carrying stayed `pending` and nothing ever came back for it.
+    assert queue.stats.drained == 2
+
+
+async def test_a_conversation_whose_drain_always_raises_is_retried_and_then_counted() -> None:
+    """The bound on the other side of the same fix.
+
+    A failure that never clears must not be retried for ever either. It gets
+    ``errors_per_round`` attempts in each of ``rounds`` budgets, and then the worker stops and
+    says so - which is what ``abandoned`` is for, and what phase 7's scheduled ``recover_stalled``
+    is the durable answer to.
+    """
+    executor = FakeExecutor(fail_times=10_000)
+    queue = queue_for(executor, budget_seconds=5.0, errors_per_round=2, rounds=2)
+    await queue.start()
+    try:
+        queue.submit(uuid.uuid4())
+        assert await queue.wait_until_idle(timeout=10.0)
+    finally:
+        await queue.aclose()
+
+    assert len(executor.calls) == 4, "two attempts in each of two rounds"
+    assert queue.stats.failed == 4
+    assert queue.stats.abandoned == 1
+    assert queue.stats.drained == 0
 
 
 async def test_a_drained_conversation_is_announced() -> None:
