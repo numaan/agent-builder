@@ -226,14 +226,14 @@ async def test_the_report_is_printable(engine: AsyncEngine, tmp_path: Path, qdra
     measurement. ``pytest -s -k printable`` shows it.
     """
     results = await backends(engine, tmp_path, qdrant)
-    print()  # noqa: T201 - this test exists to print
-    print(f"{'backend':<12}{'recall@1':>10}{'recall@3':>10}")  # noqa: T201
+    print()
+    print(f"{'backend':<12}{'recall@1':>10}{'recall@3':>10}")
     for name, result in results.items():
-        print(  # noqa: T201
+        print(
             f"{name:<12}{result['at_1']:>7}/{result['total']:<2}{result['at_k']:>7}/"
             f"{result['total']:<2}"
         )
     for name, result in results.items():
         if result["missed"]:
-            print(f"  {name} missed: {result['missed']}")  # noqa: T201
+            print(f"  {name} missed: {result['missed']}")
     assert set(results) == {"lexical", "dense", "colbert", "composite"}

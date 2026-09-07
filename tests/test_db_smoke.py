@@ -126,9 +126,7 @@ async def test_doc_chunk_embedding_and_tsvector(db_session: AsyncSession) -> Non
     nearest = (
         (
             await db_session.execute(
-                select(DocChunk.chunk_index).order_by(
-                    DocChunk.embedding.l2_distance(PROBE)
-                )
+                select(DocChunk.chunk_index).order_by(DocChunk.embedding.l2_distance(PROBE))
             )
         )
         .scalars()

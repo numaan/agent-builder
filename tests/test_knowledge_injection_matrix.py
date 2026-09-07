@@ -92,9 +92,7 @@ def knowledge_block(text: str) -> str:
     parts = text.split(LAYER_SEVEN, 1)
     if len(parts) != 2:
         return ""
-    return re.split(
-        r"^### support-core layer \d+: ", parts[1], maxsplit=1, flags=re.MULTILINE
-    )[0]
+    return re.split(r"^### support-core layer \d+: ", parts[1], maxsplit=1, flags=re.MULTILINE)[0]
 
 
 async def _no_sleep(seconds: float) -> None: ...
@@ -170,9 +168,7 @@ async def test_a_poisoned_document_cannot_forge_prompt_structure(
     assert not forged, f"{payload_id} forged structure from the corpus: {forged!r}"
 
 
-async def test_the_whole_hostile_corpus_forges_nothing(
-    engine: AsyncEngine, tmp_path: Path
-) -> None:
+async def test_the_whole_hostile_corpus_forges_nothing(engine: AsyncEngine, tmp_path: Path) -> None:
     """The number, as one assertion: twenty-eight payloads, zero forged lines.
 
     This is the phase's own version of what phase 3's review reported as "81 of 420 renderings".

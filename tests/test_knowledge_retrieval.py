@@ -180,7 +180,9 @@ async def test_retention_drops_the_oldest_collection_and_keeps_the_rest(
         edited = dict(CORPUS)
         edited["refunds.md"] = CORPUS["refunds.md"].replace("60 days", f"{marker} days")
         await synced(engine, tmp_path, edited, store=qdrant)
-    assert not await qdrant.collection_exists(collection_name("policy-docs", 1, prefix=qdrant.prefix))
+    assert not await qdrant.collection_exists(
+        collection_name("policy-docs", 1, prefix=qdrant.prefix)
+    )
     for revision in (2, 3, 4):
         assert await qdrant.collection_exists(
             collection_name("policy-docs", revision, prefix=qdrant.prefix)
@@ -226,8 +228,9 @@ async def test_with_every_backend_down_the_result_is_empty_and_says_so() -> None
     assert len(retrieval.errors) == 2
 
 
-async def test_a_backend_that_raises_something_other_than_unavailable_is_a_bug_and_propagates(
-) -> None:
+async def test_a_backend_that_raises_something_other_than_unavailable_is_a_bug_and_propagates() -> (
+    None
+):
     """Swallowing every exception would turn each future programming error in a retriever into a
     quietly worse answer."""
 
@@ -272,7 +275,7 @@ def test_the_merge_prefers_a_passage_more_than_one_backend_found() -> None:
 
 
 def test_the_merge_records_every_backend_that_found_a_passage() -> None:
-    """"Both halves agreed" is the most useful thing a trace can say about a passage."""
+    """ "Both halves agreed" is the most useful thing a trace can say about a passage."""
     one = passage("x", locator="a.md#A")
     one.backend = "lexical"
     two = passage("x", locator="a.md#A")
@@ -318,18 +321,18 @@ async def test_the_composite_never_returns_more_than_k(engine: AsyncEngine, tmp_
 def test_the_encoder_is_stable_across_processes() -> None:
     """Keyed on ``blake2b``, never on Python's salted ``hash``. A corpus indexed by one process
     has to be findable by the next, and the fake provider replays by request fingerprint."""
-    import subprocess  # noqa: PLC0415
-    import sys  # noqa: PLC0415
+    import subprocess
+    import sys
 
     script = (
         "import asyncio;"
         "from support_core.knowledge.embedding import DeterministicEncoder as E;"
         "print(asyncio.run(E().embed_query('refund policy'))[:4])"
     )
-    first = subprocess.run(  # noqa: S603
+    first = subprocess.run(
         [sys.executable, "-c", script], capture_output=True, text=True, check=True
     ).stdout
-    second = subprocess.run(  # noqa: S603
+    second = subprocess.run(
         [sys.executable, "-c", script], capture_output=True, text=True, check=True
     ).stdout
     assert first == second

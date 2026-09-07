@@ -70,7 +70,7 @@ def load_migration(name: str) -> Any:
     what the database column's width *is*, and a test that copied the number instead of reading
     it would agree with itself for ever.
     """
-    import importlib.util  # noqa: PLC0415
+    import importlib.util
 
     path = MIGRATIONS / f"{name}.py"
     spec = importlib.util.spec_from_file_location(f"_migration_{name}", path)
@@ -103,9 +103,7 @@ async def source_row(engine: AsyncEngine, source_id: str = "policy-docs") -> Doc
 # -- markdown_dir ------------------------------------------------------------------------------
 
 
-async def test_a_first_sync_writes_a_versioned_corpus(
-    engine: AsyncEngine, tmp_path: Path
-) -> None:
+async def test_a_first_sync_writes_a_versioned_corpus(engine: AsyncEngine, tmp_path: Path) -> None:
     result = await synced(engine, tmp_path, {"policy.md": POLICY_V1, "timing.md": TIMING})
 
     assert result.documents == 2
@@ -428,11 +426,14 @@ def test_the_sources_schema_is_what_the_sync_reads() -> None:
 
 def test_a_chunk_row_carries_a_uuid_primary_key() -> None:
     """The Qdrant payload names chunks by this id and reads their text back from Postgres."""
-    assert repo.ChunkRow(
-        id=uuid.uuid4(),
-        source_id="s",
-        source_version="r1-x",
-        chunk_index=0,
-        locator="p.md#H",
-        text="t",
-    ).score == 0.0
+    assert (
+        repo.ChunkRow(
+            id=uuid.uuid4(),
+            source_id="s",
+            source_version="r1-x",
+            chunk_index=0,
+            locator="p.md#H",
+            text="t",
+        ).score
+        == 0.0
+    )

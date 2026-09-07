@@ -115,7 +115,9 @@ def test_split_pieces_are_numbered_and_unsplit_ones_are_not() -> None:
 
 def test_two_identically_headed_sections_get_distinct_locators() -> None:
     """Two ``## Notes`` in one document would otherwise be one string naming two chunks."""
-    markdown = "# Doc\n\n## Notes\n\nFirst note.\n\n## Other\n\nMiddle.\n\n## Notes\n\nSecond note.\n"
+    markdown = (
+        "# Doc\n\n## Notes\n\nFirst note.\n\n## Other\n\nMiddle.\n\n## Notes\n\nSecond note.\n"
+    )
     found = locators(markdown)
     assert len(found) == len(set(found)), found
 

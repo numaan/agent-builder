@@ -33,8 +33,18 @@ from tests.knowledge_support import FakeRetriever, composite, passage
 
 KNOWLEDGE_PACK = PACKS / "knowledge_pack"
 
+CLASSIFY = "Classify what the customer is asking about"
 ANSWER = "Answer the customer's question about the refund policy"
 CHAT = "Reply to the small talk"
+
+
+def classify(label: str = "answer") -> Rule:
+    """The first node: it writes the retrieval query into state and chooses the next node.
+
+    Every test here goes through it, because the node under test only retrieves when something
+    has told it what to look for - which is DESIGN.md 6.4's own shape for a knowledge query.
+    """
+    return Rule(when=CLASSIFY, respond=decision(label, updates={"topic": "refund timing"}))
 
 
 def decision(
@@ -102,7 +112,7 @@ def test_hedging_is_not_punished() -> None:
 
 
 def test_a_first_person_action_is_somebody_else_s_guardrail() -> None:
-    """"I have refunded $29" is a claim, and the check it needs is DESIGN.md 14's
+    """ "I have refunded $29" is a claim, and the check it needs is DESIGN.md 14's
     forbidden-promise check against the *tool ledger* - a stronger check than a citation, and
     phase 7's. Requiring a knowledge citation would teach a pack to cite a policy for an action.
     """
@@ -238,6 +248,7 @@ async def test_an_uncited_claim_is_re_prompted_once_and_then_accepted(
         pack,
         engine,
         [
+            classify(),
             Rule(
                 when="stated something about timing",
                 respond=decision(
@@ -260,7 +271,7 @@ async def test_an_uncited_claim_is_re_prompted_once_and_then_accepted(
         "It takes five to seven business days."
     ]
     assert recorder.handoffs == []
-    assert len(provider.calls) == 2, "exactly one re-prompt"
+    assert len(provider.calls) == 3, "the classifier, then one answer and exactly one re-prompt"
 
 
 async def test_a_second_uncited_claim_reaches_phase_6_s_real_handoff(
@@ -275,7 +286,7 @@ async def test_a_second_uncited_claim_reaches_phase_6_s_real_handoff(
     executor, recorder, provider = build(
         pack,
         engine,
-        [Rule(when=ANSWER, respond=decision("done", message="It takes five business days."))],
+        [classify(), Rule(when=ANSWER, respond=decision("done", message="It takes five days."))],
         retriever=offered(),
     )
     conversation_id = await executor.start_conversation()
@@ -284,7 +295,7 @@ async def test_a_second_uncited_claim_reaches_phase_6_s_real_handoff(
     row = await run_row(engine, conversation_id)
     assert row["status"] == "waiting_human"
     assert [request.reason for request in recorder.handoffs] == ["uncited_claim"]
-    assert len(provider.calls) == 2, "one re-prompt, then a handoff - not an endless retry"
+    assert len(provider.calls) == 3, "the classifier, then one answer and one re-prompt"
     # The customer is told, in core's words, that a person is coming (phase W finding W6).
     assert await outbound_texts(engine, conversation_id)
 
@@ -301,7 +312,7 @@ async def test_the_handoff_carries_the_passages_the_node_was_looking_at(
     executor, recorder, _ = build(
         pack,
         engine,
-        [Rule(when=ANSWER, respond=decision("done", message="It takes five business days."))],
+        [classify(), Rule(when=ANSWER, respond=decision("done", message="It takes five days."))],
         retriever=offered(),
     )
     conversation_id = await executor.start_conversation()
@@ -342,7 +353,7 @@ async def test_a_node_with_no_knowledge_block_may_still_not_make_an_uncited_clai
         pack,
         engine,
         [
-            Rule(when=ANSWER, respond=decision("chat", message="Hello.")),
+            classify("chat"),
             Rule(when=CHAT, respond=decision("done", message="Setup fees are not refundable.")),
         ],
         retriever=offered(),
@@ -362,7 +373,7 @@ async def test_a_node_that_says_nothing_factual_needs_no_knowledge(
         pack,
         engine,
         [
-            Rule(when=ANSWER, respond=decision("chat", message="Hello.")),
+            classify("chat"),
             Rule(when=CHAT, respond=decision("done", message="Good to hear from you.")),
         ],
         retriever=offered(),
@@ -370,7 +381,7 @@ async def test_a_node_that_says_nothing_factual_needs_no_knowledge(
     conversation_id = await executor.start_conversation()
     await executor.on_inbound(conversation_id, "hello")
     row = await run_row(engine, conversation_id)
-    assert await path(engine, row["id"]) == ["answer", "ungrounded", "finish"]
+    assert await path(engine, row["id"]) == ["classify", "ungrounded", "finish"]
     assert recorder.handoffs == []
 
 
@@ -384,18 +395,18 @@ async def test_a_pack_that_turned_the_guardrail_off_is_not_checked(
     executor, recorder, provider = build(
         pack,
         engine,
-        [Rule(when=ANSWER, respond=decision("done", message="It takes five business days."))],
+        [classify(), Rule(when=ANSWER, respond=decision("done", message="It takes five days."))],
         retriever=offered(),
     )
     conversation_id = await executor.start_conversation()
     await executor.on_inbound(conversation_id, "when?")
     assert recorder.handoffs == []
-    assert len(provider.calls) == 1
+    assert len(provider.calls) == 2, "the classifier and one answer; nothing was re-prompted"
 
 
 def test_the_error_carries_a_correction_and_is_a_structured_output_failure() -> None:
     """A subclass, so it reuses the ladder phase 3 built rather than adding a second one."""
-    from support_core.llm.types import StructuredOutputError  # noqa: PLC0415
+    from support_core.llm.types import StructuredOutputError
 
     error = UncitedClaimError("x", summary="s", correction="c")
     assert isinstance(error, StructuredOutputError)

@@ -143,9 +143,7 @@ def test_a_source_path_outside_the_pack_is_a_finding(tmp_path: Path) -> None:
     # ``/etc`` has no drive letter, so Windows calls it relative-but-escaping and Linux calls it
     # absolute - and both are the same refusal, so the test asserts the refusal rather than the
     # wording. The pack must load the same way on a laptop and in CI, which is the point.
-    absolute = parse_sources(
-        {"documents": [{"id": "x", "type": "markdown_dir", "path": "/etc"}]}
-    )
+    absolute = parse_sources({"documents": [{"id": "x", "type": "markdown_dir", "path": "/etc"}]})
     problem = next(iter(path_findings(tmp_path, absolute)))[1]
     assert "must be relative" in problem or "escapes the pack directory" in problem
 
@@ -159,7 +157,7 @@ def test_a_missing_directory_is_a_finding(tmp_path: Path) -> None:
 
 def test_the_validator_reports_a_broken_source_file_at_load(tmp_path: Path) -> None:
     """The point of sharing the schema: a bad source file fails ``support pack validate``."""
-    import shutil  # noqa: PLC0415
+    import shutil
 
     pack = tmp_path / "pack"
     shutil.copytree(KNOWLEDGE_PACK, pack)
@@ -177,7 +175,7 @@ def test_the_validator_warns_about_a_source_with_no_documents_in_it(tmp_path: Pa
     """A node with a ``knowledge:`` block over an empty corpus produces an empty layer 7, and the
     citation guardrail then turns its first factual claim into a handoff - correct behaviour
     arrived at for a reason nobody can see from outside."""
-    import shutil  # noqa: PLC0415
+    import shutil
 
     pack = tmp_path / "pack"
     shutil.copytree(KNOWLEDGE_PACK, pack)
@@ -247,7 +245,7 @@ LOOKUP = LiveLookup(
 
 
 def context(ref: str | None = "cust_1") -> Any:
-    from support_core.graph.context import ConversationContext  # noqa: PLC0415
+    from support_core.graph.context import ConversationContext
 
     return ConversationContext.model_validate({"customer": {"ref": ref}} if ref else {})
 
@@ -302,11 +300,7 @@ async def test_a_lookup_may_only_read_ctx() -> None:
     bad = LiveLookup(tool="get_plan_details", args={"customer_ref": "state.charge_id"})
     retriever = LiveLookupRetriever([bad], gateway(runner))
     assert (
-        list(
-            await retriever.retrieve(
-                request("anything").model_copy(update={"ctx": context()})
-            )
-        )
+        list(await retriever.retrieve(request("anything").model_copy(update={"ctx": context()})))
         == []
     )
     assert runner.invoked == []

@@ -335,7 +335,8 @@ def test_entry_graph_must_exist_once_graphs_are_present(pack_copy: Path) -> None
 @pytest.mark.parametrize(
     "args",
     [
-        ["pack", "knowledge", "sync", "packs/acme_billing"],
+        # `pack knowledge sync` left this list in phase 5; its own tests are in
+        # tests/test_knowledge_cli.py.
         ["pack", "eval", "packs/acme_billing"],
         ["replay", "some-conversation-id"],
     ],

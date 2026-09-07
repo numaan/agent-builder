@@ -114,8 +114,7 @@ async def retrieval_in_trace(engine: AsyncEngine, run_id: uuid.UUID) -> list[dic
         rows = (
             await connection.execute(
                 sql_text(
-                    "SELECT node_id, llm_response FROM trace_step "
-                    "WHERE run_id = :r ORDER BY seq"
+                    "SELECT node_id, llm_response FROM trace_step WHERE run_id = :r ORDER BY seq"
                 ),
                 {"r": run_id},
             )
@@ -219,10 +218,10 @@ async def test_the_trace_names_the_document_and_the_heading_not_only_the_version
 async def test_the_trace_records_that_an_answer_was_given_with_a_backend_missing(
     engine: AsyncEngine, tmp_path: Path
 ) -> None:
-    """"These are the best passages available *because Qdrant was down*" is a materially
+    """ "These are the best passages available *because Qdrant was down*" is a materially
     different fact from "these are the best there are", when somebody is later asked why an
     answer was wrong (DESIGN.md 15)."""
-    from tests.knowledge_support import unreachable_store  # noqa: PLC0415
+    from tests.knowledge_support import unreachable_store
 
     write_corpus(tmp_path, {"policy.md": WRONG})
     await ingestor(engine, tmp_path).sync_source(markdown_source())
@@ -274,12 +273,12 @@ async def test_the_old_collection_still_holds_what_produced_the_old_answer(
     def versions(hits: Any) -> set[str]:
         return {hit.payload["source_version"] for hit in hits}
 
-    assert versions(
-        await qdrant.search_colbert(old, dense=dense, colbert=colbert, limit=5)
-    ) == {first.version}
-    assert versions(
-        await qdrant.search_colbert(new, dense=dense, colbert=colbert, limit=5)
-    ) == {second.version}
+    assert versions(await qdrant.search_colbert(old, dense=dense, colbert=colbert, limit=5)) == {
+        first.version
+    }
+    assert versions(await qdrant.search_colbert(new, dense=dense, colbert=colbert, limit=5)) == {
+        second.version
+    }
     # The alias - what a live query names - points at the new one and nothing else.
     assert versions(
         await qdrant.search_colbert(

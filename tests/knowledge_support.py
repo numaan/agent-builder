@@ -144,8 +144,8 @@ def scratch_store(*, keep: int = 3) -> QdrantStore:
 async def drop_prefixed(store: QdrantStore) -> None:
     """Remove every collection this store's prefix owns."""
     try:
-        client = store._connect()  # noqa: SLF001 - teardown, and the alternative is leaked state
-        listing = await store._call("get_collections", client.get_collections)  # noqa: SLF001
+        client = store._connect()
+        listing = await store._call("get_collections", client.get_collections)
     except RetrieverUnavailable:  # pragma: no cover - nothing to clean if it is not there
         return
     for description in listing.collections:
