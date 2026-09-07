@@ -43,6 +43,9 @@ ENV_API_KEY = "ANTHROPIC_API_KEY"
 ENV_MODEL = "SUPPORT_MODEL"
 ENV_ESCALATION_MODEL = "SUPPORT_ESCALATION_MODEL"
 ENV_DESK_TOKEN = "SUPPORT_DESK_TOKEN"
+ENV_QDRANT_URL = "SUPPORT_QDRANT_URL"
+"""The same variable :mod:`support_core.knowledge.config` reads, so the CLI's sync and the
+service's retriever cannot end up pointed at two different instances."""
 
 MIN_DESK_TOKEN = 16
 """Shortest desk credential accepted.
@@ -146,6 +149,22 @@ class AppConfig(BaseModel):
     identity, rotation and an audit of who did what belong with phase 7's work on this surface,
     and the desk already takes a ``human_id`` on every action for the audit half."""
 
+    qdrant_url: str | None = None
+    """Where the vector side of the knowledge layer is (DESIGN.md section 9.1).
+
+    ``None`` means ``SUPPORT_QDRANT_URL``, and that means the compose default. A URL is not a
+    secret, so unlike the database password it may live in a config file."""
+
+    use_qdrant: bool = True
+    """Whether this deployment has a Qdrant at all.
+
+    Off is a *configuration*: retrieval runs on the Postgres lexical and dense halves only, said
+    once at startup. It is not the same as a Qdrant that is down, which is a *fault*: that
+    degrades per call, is logged per call, and is what
+    :class:`~support_core.knowledge.composite.CompositeRetriever` exists to survive. Keeping the
+    two apart is what stops a restart during an outage turning into a deployment that quietly
+    never uses the vector side again."""
+
     handoff_webhook_url: str | None = None
     """A second sink for handoff packets (DESIGN.md section 13's webhook sink).
 
@@ -183,6 +202,8 @@ class AppConfig(BaseModel):
             values["models"]["escalation"] = source[ENV_ESCALATION_MODEL]
         if source.get(ENV_DESK_TOKEN):
             values["desk_token"] = source[ENV_DESK_TOKEN]
+        if source.get(ENV_QDRANT_URL):
+            values["qdrant_url"] = source[ENV_QDRANT_URL]
         try:
             return cls.model_validate(values)
         except ValidationError as exc:

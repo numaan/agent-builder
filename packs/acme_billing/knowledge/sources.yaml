@@ -1,16 +1,34 @@
 # Knowledge sources for the Acme Billing pack (DESIGN.md section 9.1).
-# Empty until phase 5. The shape each section takes:
 #
-# documents:
-#   - id: policy-docs
-#     type: markdown_dir
-#     path: ./docs/policies
-# knowledge_graph:
-#   - id: products
-#     type: yaml
-#     path: ./kg/products.yaml
-# live_lookups:
-#   - tool: get_plan_details
-documents: []
+# One markdown_dir source, because that is what this pack owns: the refund policy and the
+# processing times the refund graph's `knowledge:` blocks ask for. `support pack knowledge sync
+# packs/acme_billing` chunks them by heading, embeds them, writes them to `doc_chunk` under a new
+# `source_version`, marks the previous version's chunks stale and builds a new Qdrant collection
+# whose alias is flipped at the end (section 9.3).
+#
+# A help centre would be an `html_crawl` source beside this one:
+#
+#   - id: help-center
+#     type: html_crawl
+#     url: https://help.acme.example/billing
+#     depth: 2
+#     refresh: daily
+#
+# There is no such site to crawl from this repository, and pointing a sample pack at a real one
+# would make `pytest` and CI depend on somebody else's uptime. The crawler is exercised against a
+# stub fetcher in tests/test_knowledge_ingest.py instead.
+documents:
+  - id: policy-docs
+    type: markdown_dir
+    path: ./knowledge/docs
+    refresh: weekly
+
+# Entities and relations are phase 9's. The section is parsed now so a pack that declares one
+# gets its typos caught at load rather than at first use.
 knowledge_graph: []
+
+# READ tools the retriever may call for a fact no document can hold (section 9.1). None here:
+# every question this pack's knowledge answers is about policy, and the one dynamic fact the
+# refund workflow needs - the charge itself - is fetched by a `tool` node in the graph, where the
+# argument comes from state the workflow established rather than from the customer's wording.
 live_lookups: []

@@ -13,6 +13,7 @@ from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from support_core import __version__
+from support_core.guardrails.outbound import CitationPolicy
 
 Channel = Literal["web_chat", "email"]
 """Customer channels core knows how to serve (section 12). The desk is not a customer channel."""
@@ -114,6 +115,26 @@ class HandoffConfig(BaseModel):
 
     queue: str = Field(min_length=1)
     sla_minutes: int | None = Field(default=None, ge=0)
+
+
+class GuardrailsConfig(BaseModel):
+    """DESIGN.md section 14's "pack-supplied configuration", which section 5.1 has nowhere to put.
+
+    Same precedent and the same argument as phase 2's ``timeouts:``, phase 3's ``memory:`` and
+    phase 6's ``limits.max_node_errors``: the design requires the setting and its example manifest
+    has no key for it, so the key is added and the addition is written down.
+
+    Only the *non-structural* guardrails are configurable here, which is section 14's own line -
+    "packs cannot disable structural guardrails". Risk tiers, approval hashes, gates and the
+    per-turn limits are enforced by the tool runtime and the engine and appear nowhere in this
+    block, by construction rather than by a rule somebody has to remember.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    citations: CitationPolicy = Field(default_factory=CitationPolicy)
+    """The outbound citation check of sections 9.2 and 14. On by default: a guardrail a pack has
+    to remember to enable is not a guardrail."""
 
 
 class LimitsConfig(BaseModel):
@@ -220,6 +241,7 @@ class PackManifest(BaseModel):
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     timeouts: TimeoutsConfig = Field(default_factory=TimeoutsConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    guardrails: GuardrailsConfig = Field(default_factory=GuardrailsConfig)
 
     @field_validator("version")
     @classmethod

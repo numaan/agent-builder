@@ -71,10 +71,13 @@ from support_core.engine.runners import (
     HANDOFF_UNDELIVERED_MESSAGE,
     NO_TOOL_ACCESS,
     GateRunner,
+    NodeRetrieval,
     NodeRuntime,
     NodeToolAccess,
+    ToolGatewayFactory,
     build_runner,
     resolve_edge,
+    retrieval_factory,
     tool_gateway_factory,
 )
 from support_core.engine.types import (
@@ -100,6 +103,9 @@ from support_core.graph.nodes import (
 from support_core.graph.pack import Pack
 from support_core.graph.routing import WorkflowIntent
 from support_core.graph.schema import Graph
+from support_core.knowledge.composite import CompositeRetriever
+from support_core.knowledge.live import LiveLookupRetriever, declared_tools
+from support_core.knowledge.types import Passage
 from support_core.llm.prompt import DeferredIntent, TranscriptMessage
 from support_core.llm.service import LlmService
 from support_core.llm.tool_loop import (
@@ -324,6 +330,7 @@ class Executor:
         llm: LlmService | None = None,
         tool_runner: ModelToolRunner | None = None,
         tools: ToolRuntime | None = None,
+        retriever: CompositeRetriever | None = None,
     ) -> None:
         self.pack = pack
         self.engine = engine
@@ -349,6 +356,17 @@ class Executor:
         self._tool_risk = dict(pack.registry.risks)
         """Risk tiers for the model loop's cross-check, from the registry and not from the
         pack's YAML declarations (phase-1 deferred finding I)."""
+
+        self.retriever = retriever
+        """The knowledge layer (DESIGN.md section 9.1). ``None`` is a legitimate configuration -
+        a pack with no knowledge sources, or a deployment running the engine's own tests - and an
+        ``llm`` node with a ``knowledge:`` block then gets an empty layer 7 rather than an error.
+        What stops that becoming a quiet ungrounded answer is the citation guardrail of section
+        9.2, which refuses a claim that cites nothing and hands the conversation to a person.
+
+        The executor is the only thing that holds it, for the same reason it is the only thing
+        that holds the tool runtime: a node gets a closure carrying this conversation's context
+        and its own ``k``, built by :func:`~support_core.engine.runners.retrieval_factory`."""
 
         self._workflow_intents: tuple[WorkflowIntent, ...] | None = None
         """The root graph's declared edges as workflows (DESIGN.md section 6.6), derived once."""
@@ -1174,6 +1192,14 @@ class Executor:
                 customer=ctx.customer,
                 channel=ctx.channel,
             )
+            gateway = tool_gateway_factory(
+                self.tool_runner
+                or RegistryToolRunner(self.tools, site, allowed=_model_tools(node)),
+                tool_risk=self._tool_risk,
+                max_calls=budget,
+                step_id=sid,
+                record=opened.append,
+            )
             runtime = NodeRuntime(
                 graph=graph,
                 frame=frame,
@@ -1184,16 +1210,10 @@ class Executor:
                 environment=self.pack.environment,
                 llm=self.llm,
                 history=await self._history(turn.conversation_id),
-                tool_gateway=tool_gateway_factory(
-                    self.tool_runner
-                    or RegistryToolRunner(self.tools, site, allowed=_model_tools(node)),
-                    tool_risk=self._tool_risk,
-                    max_calls=budget,
-                    step_id=sid,
-                    record=opened.append,
-                ),
+                tool_gateway=gateway,
                 tools=self._tool_access(node, site),
                 pending_intents=self._pending_intents(turn, frame),
+                retrieve=self._retrieval(ctx, frame.node_id, gateway),
             )
             runner = self._runner(graph, frame.node_id, node)
             started = self.hooks.clock()
@@ -1243,6 +1263,29 @@ class Executor:
             await self.hooks.probe("after_node", {"step_id": sid, "node_id": frame.node_id})
             check_gates = await self._advance(turn, ctx, graph, frame, node, result, sid, started)
         return turn.pending_event
+
+    def _retrieval(
+        self, ctx: ConversationContext, node_id: str, gateway: ToolGatewayFactory
+    ) -> NodeRetrieval | None:
+        """The knowledge layer, narrowed to one node of one conversation (section 9.1).
+
+        The pack's document backends are composed once, at startup, and held on the executor. The
+        *live lookup* backend is composed here, because it calls READ tools: the gateway it holds
+        is this node's, so a live lookup obeys the same allow-list, the same risk-tier check and
+        the same per-turn budget an ``llm`` node's own tool loop obeys, and the calls it makes
+        appear in the turn's tool accounting rather than beside it.
+
+        The tools it may call come from ``knowledge/sources.yaml`` and never from the node, which
+        is what stops a node reaching a tool its own ``tools:`` list does not declare by asking
+        the retriever for it.
+        """
+        if self.retriever is None:
+            return None
+        lookups = self.pack.knowledge.live_lookups
+        extra: tuple[LiveLookupRetriever, ...] = ()
+        if lookups:
+            extra = (LiveLookupRetriever(lookups, gateway(declared_tools(lookups))),)
+        return retrieval_factory(self.retriever, ctx=ctx, node_id=node_id, extra=extra)
 
     def _tool_access(self, node: NodeBase, site: CallSite) -> NodeToolAccess:
         """What this node may do with the tool runtime (DESIGN.md section 8.2's table).
@@ -1632,7 +1675,15 @@ class Executor:
             # names ``llm_unavailable``, and phase 3 distinguishes it from a model that answered
             # with something the graph does not allow. Whoever picks the conversation up needs
             # to know which happened.
-            await self._handoff(turn, node_id, exc.reason, str(exc), started=started, sid=sid)
+            await self._handoff(
+                turn,
+                node_id,
+                exc.reason,
+                str(exc),
+                started=started,
+                sid=sid,
+                citations=exc.citations,
+            )
             return False
         frame.node_id = on_error
         frame.attempts[node_id] = frame.attempts.get(node_id, 0) + 1
@@ -1660,6 +1711,7 @@ class Executor:
         *,
         started: datetime | None = None,
         sid: str | None = None,
+        citations: Sequence[Passage] = (),
     ) -> None:
         """Give up on the turn and park the run for a human (DESIGN.md sections 7.3, 13).
 
@@ -1689,7 +1741,7 @@ class Executor:
         frame.attempts[node_id] = attempt + 1
         turn.status = "waiting_human"
         now = self.hooks.clock()
-        queued = await self._tell_a_human(turn, node_id, reason, detail, step)
+        queued = await self._tell_a_human(turn, node_id, reason, detail, step, citations=citations)
         turn.notices.append(DEFAULT_HANDOFF_MESSAGE if queued else HANDOFF_UNDELIVERED_MESSAGE)
         await self._checkpoint(
             turn,
@@ -1721,6 +1773,7 @@ class Executor:
         sid: str,
         *,
         next_steps: Sequence[str] = (),
+        citations: Sequence[Passage] = (),
     ) -> bool:
         """Hand the failure to the handoff hook. Returns whether a human was actually told.
 
@@ -1747,6 +1800,7 @@ class Executor:
                         node_id=node_id,
                         step_id=sid,
                         next_steps=list(next_steps),
+                        citations=list(citations),
                     )
                 )
             )

@@ -53,6 +53,8 @@ from support_core.graph.nodes import (
 )
 from support_core.graph.schema import Graph, parse_value
 from support_core.graph.templates import TemplateError, render
+from support_core.knowledge.composite import CompositeRetriever, Retrieval
+from support_core.knowledge.types import RetrievalRequest
 from support_core.llm.prompt import Decision, DeferredIntent, TranscriptMessage
 from support_core.llm.service import LlmService, NodeRequest
 from support_core.llm.tool_loop import (
@@ -61,7 +63,12 @@ from support_core.llm.tool_loop import (
     ToolsUnavailableError,
     UnavailableToolRunner,
 )
-from support_core.llm.types import LLMError, LLMUnavailableError, StructuredOutputError
+from support_core.llm.types import (
+    LLMError,
+    LLMUnavailableError,
+    StructuredOutputError,
+    UncitedClaimError,
+)
 from support_core.tools.base import ToolError, ToolFailed, ToolRefused
 from support_core.tools.risk import Risk
 from support_core.tools.runtime import ToolCallResult
@@ -197,12 +204,58 @@ class NodeRuntime:
     step 5), surfaced to the root graph's classifier (section 19 step 15). Non-empty only for a
     node in the root frame; the executor decides that, not the node."""
 
+    retrieve: "NodeRetrieval | None" = None
+    """The knowledge layer (DESIGN.md section 9.1), narrowed to this node.
+
+    Built by the executor from the pack's :class:`~support_core.knowledge.composite.
+    CompositeRetriever`, in the same shape as :attr:`tool_gateway` and for the same reason: a
+    node holds a callable that already carries the conversation's context, and cannot widen what
+    it may ask for. ``None`` where no retriever is configured, which is every phase-2 test and
+    any pack with no knowledge sources - a node with a ``knowledge:`` block then gets an empty
+    layer 7, and the citation guardrail is what turns that into a handoff if the node then makes
+    a claim.
+
+    Calling it is a *read*, outside the checkpoint transaction. That is what makes a second
+    stateful dependency acceptable at all (BACKLOG.md decisions log, 2026-09-06), so a future
+    change that moved retrieval inside the checkpoint would break more than it looks."""
+
     def render(self, source: str, scope: Mapping[str, Any]) -> str:
         return render(source, dict(scope), env=self.environment)
 
 
 ToolGatewayFactory = Callable[[Sequence[str]], ReadOnlyToolGateway]
 """Builds the gateway for one node from that node's own ``tools:`` list, and nothing wider."""
+
+NodeRetrieval = Callable[[str, int], Awaitable[Retrieval]]
+"""``(query, k) -> Retrieval``. The conversation's context is already captured by the executor,
+so a node cannot retrieve as somebody else."""
+
+
+def retrieval_factory(
+    retriever: "CompositeRetriever",
+    *,
+    ctx: ConversationContext,
+    node_id: str,
+    extra: Sequence[Any] = (),
+) -> NodeRetrieval:
+    """Capture the retriever and the conversation, leaving the node only a query and a ``k``.
+
+    The same construction as :func:`tool_gateway_factory`, for the same reason (review finding
+    V4): a pack-registered custom node type is arbitrary Python whose only handle on the outside
+    is ``rt``, so what it holds must be a closure that cannot be widened rather than an object
+    with the whole knowledge layer hanging off it.
+
+    ``extra`` is the per-node half of the layer - today only
+    :class:`~support_core.knowledge.live.LiveLookupRetriever`, which calls READ tools through a
+    gateway built for *this* node and spending *this* turn's tool budget. It cannot be composed
+    once at startup for the same reason a tool gateway cannot be: the budget belongs to the turn.
+    """
+    composed = retriever.plus(extra) if extra else retriever
+
+    async def retrieve(query: str, k: int) -> Retrieval:
+        return await composed.gather(RetrievalRequest(query=query, ctx=ctx, k=k, node_id=node_id))
+
+    return retrieve
 
 
 def tool_gateway_factory(
@@ -543,6 +596,7 @@ class LlmRunner(_Runner):
             )
             raise NodeError(msg, reason="llm_unavailable")
 
+        retrieval = await self._retrieve(state, ctx, rt)
         request = NodeRequest(
             node_id=self.id,
             instructions=self.node.instructions,
@@ -550,6 +604,7 @@ class LlmRunner(_Runner):
             output_schema=dict(self.node.output_schema or {}),
             state=state.model_dump(mode="json"),
             pending_intents=rt.pending_intents,
+            knowledge=[passage.for_prompt() for passage in retrieval.passages],
             summary=ctx.summary,
             window=list(rt.history),
             gateway=rt.tool_gateway(self.node.tools) if self.node.tools else None,
@@ -558,12 +613,23 @@ class LlmRunner(_Runner):
         )
         try:
             decision = await rt.llm.decide(request)
+        except UncitedClaimError as exc:
+            # DESIGN.md 9.2's third step. The service has already re-prompted once with core's
+            # own words; a second uncited claim is a handoff, and it carries the passages the
+            # node was given so that the packet says what the agent was looking at when it
+            # decided to assert something it could not support.
+            msg = f"{self.id}: {exc}"
+            raise NodeError(
+                msg, reason="uncited_claim", citations=list(retrieval.passages)
+            ) from exc
         except StructuredOutputError as exc:
             msg = (
                 f"{self.id}: the model did not produce a usable decision after a retry: {exc}. "
                 f"The allowed decisions were {sorted(self.node.edges)}"
             )
-            raise NodeError(msg, reason="llm_invalid_output") from exc
+            raise NodeError(
+                msg, reason="llm_invalid_output", citations=list(retrieval.passages)
+            ) from exc
         except (LLMUnavailableError, ToolsUnavailableError) as exc:
             raise NodeError(f"{self.id}: {exc}", reason="llm_unavailable") from exc
         except LLMError as exc:  # pragma: no cover - every subclass is handled above
@@ -571,6 +637,14 @@ class LlmRunner(_Runner):
 
         output = decision.output
         trace = decision.as_trace()
+        if self.node.knowledge is not None:
+            # The exit criterion of phase 5, in one assignment: what a passage's *version* was at
+            # the moment it was used is written into the step, so an answer given before a
+            # re-sync still names the revision that produced it, and an investigation of a wrong
+            # answer starts from a fact rather than from a reconstruction.
+            trace["retrieval"] = retrieval.as_trace()
+            if retrieval.degraded:
+                trace["retrieval_degraded"] = list(retrieval.degraded)
         if output.needs_handoff:
             msg = (
                 f"{self.id}: the model asked for a human "
@@ -601,6 +675,33 @@ class LlmRunner(_Runner):
             outbound=outbound,
             llm_response=trace,
         )
+
+    async def _retrieve(
+        self, state: BaseModel, ctx: ConversationContext, rt: NodeRuntime
+    ) -> Retrieval:
+        """Fill layer 7 from the node's own ``knowledge:`` block (DESIGN.md sections 6.4, 9.1).
+
+        The query is a Jinja template, as DESIGN.md 6.4 says, and it is rendered with the same
+        sandboxed environment every other pack template uses - so a query may interpolate state,
+        which holds the customer's own words. That is safe *here* and would not be in layer 4:
+        what the customer wrote reaches a search index and comes back as fenced data, and the
+        node's instructions are still placed verbatim.
+
+        A retrieval that fails entirely is not a node error. An empty knowledge block plus a
+        factual claim is what the citation guardrail refuses two steps later, so the failure
+        reaches a human by the route DESIGN.md 9.2 describes rather than by a traceback - and a
+        node whose question needed no passage still answers.
+        """
+        if self.node.knowledge is None or rt.retrieve is None:
+            return Retrieval()
+        try:
+            query = rt.render(self.node.knowledge.query, {"state": state, "ctx": ctx}).strip()
+        except Exception as exc:
+            msg = f"{self.id}: the knowledge query template failed: {exc}"
+            raise NodeError(msg, reason="pack_incompatible") from exc
+        if not query:
+            return Retrieval()
+        return await rt.retrieve(query, self.node.knowledge.k)
 
     def _decisions(self, graph: Graph) -> list[Decision]:
         """The node's edge labels, described by the node each one leads to.

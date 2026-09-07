@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from support_core.graph.context import ConversationContext
 from support_core.handoff.packet import ActionRecord, CustomerRef, HandoffPacket, Passage
+from support_core.knowledge.types import RetrievalRequest
 from support_core.storage import repositories as repo
 from support_core.storage.models import ActionApproval, ToolCall
 from support_core.tools.risk import Risk
@@ -35,15 +36,26 @@ SIDE_EFFECTING = frozenset({Risk.WRITE.value, Risk.HIGH.value})
 conversation"). READ calls are left out on purpose: a human taking over needs to see what was
 *changed*, and twenty lookups around one refund hide the refund."""
 
+GROUNDING_PASSAGES = 3
+"""Passages a handoff summary may rest on when the failing node supplied none.
+
+Three, not more: DESIGN.md section 13's packet is read by a person under time pressure, and a
+summariser handed ten passages writes about the passages rather than about the customer."""
+
 TRANSCRIPT_IN_PACKET = 40
 """Messages the summary is written from. Not the whole conversation: the packet carries a
 ``transcript_url`` for that, and a summariser given four hundred turns writes a worse summary
 than one given the last forty."""
 
 Gathered = tuple[
-    list["ActionRecord"], "ActionRecord | None", "ConversationContext | None", list[tuple[str, str]]
+    list["ActionRecord"],
+    "ActionRecord | None",
+    "ConversationContext | None",
+    list[tuple[str, str]],
+    list[Passage],
 ]
-"""What :func:`gather` reads back: the ledger, the pending action, the context, the talk."""
+"""What :func:`gather` reads back: the ledger, the pending action, the context, the talk, and
+the passages a summariser may rest on."""
 
 UNFINISHED = frozenset({"running", "awaiting_callback", "indeterminate"})
 """Statuses that mean "this may or may not have happened". Exactly what a second person must not
@@ -66,7 +78,12 @@ class PacketRequest:
     step_id: str | None = None
     suggested_next_steps: Sequence[str] = ()
     citations: Sequence[Passage] = ()
-    """The seam for phase 5 (see :mod:`support_core.handoff.packet`). Always empty today."""
+    """The passages the failing node had in front of it (DESIGN.md section 13).
+
+    Filled by :class:`~support_core.engine.errors.NodeError` for a node that failed with
+    passages loaded - above all a claim the citation guardrail refused, where they are the first
+    thing a human needs. When it is empty and a retriever is available, :func:`gather` retrieves
+    on the customer's last message instead, so a packet that could be grounded is."""
 
     extra_state: dict[str, Any] = field(default_factory=dict)
 
@@ -154,12 +171,23 @@ def default_next_steps(reason: str, pending: ActionRecord | None) -> list[str]:
     return steps
 
 
-async def gather(sessions: Any, request: PacketRequest) -> "Gathered":
-    """Read the durable half of a packet: the ledger, the pending action, the context, the talk."""
+async def gather(sessions: Any, request: PacketRequest, *, retriever: Any = None) -> "Gathered":
+    """Read the durable half of a packet, and the knowledge half if there is one.
+
+    ``retriever`` is optional and is the phase-6 forward-compatibility line the backlog asked
+    phase 5 to fill: with one, a packet whose node carried no passages is grounded on the
+    customer's own last message, so a human reading a summary can see what the agent could have
+    known. Retrieval here is best-effort by construction - a packet is built because something
+    already went wrong, and a retriever that is also down must not stop the page.
+
+    ``request.citations`` wins where it is non-empty. What the failing node was looking at is a
+    fact about the failure; what a retrieval a minute later returns is a fact about the corpus.
+    """
     actions: list[ActionRecord] = []
     pending: ActionRecord | None = None
     context: ConversationContext | None = None
     transcript: list[tuple[str, str]] = []
+    passages: list[Passage] = list(request.citations)
     async with sessions() as session, session.begin():
         conversation = await repo.get_conversation(session, request.conversation_id)
         if conversation is not None:
@@ -187,7 +215,30 @@ async def gather(sessions: Any, request: PacketRequest) -> "Gathered":
                 live = await repo.live_approvals(session, request.conversation_id)
                 if live:
                     pending = _proposed(live[-1])
-    return actions, pending, context, transcript
+    if not passages and retriever is not None and context is not None:
+        passages = await _ground(retriever, context, transcript)
+    return actions, pending, context, transcript, passages
+
+
+async def _ground(
+    retriever: Any, context: "ConversationContext", transcript: Sequence[tuple[str, str]]
+) -> list[Passage]:
+    """Retrieve on the customer's last message, for a packet nothing else grounded.
+
+    Every failure is swallowed. This is the one place in the system where a retrieval error is
+    genuinely uninteresting: the alternative to a grounded summary is an ungrounded one, and the
+    alternative to a delivered packet is a customer waiting for a person nobody paged.
+    """
+    said = next((text for author, text in reversed(transcript) if author == "customer"), "")
+    if not said.strip():
+        return []
+    try:
+        found = await retriever.retrieve(
+            RetrievalRequest(query=said, ctx=context, k=GROUNDING_PASSAGES, node_id="__handoff__")
+        )
+    except Exception:
+        return []
+    return list(found)
 
 
 def assemble(

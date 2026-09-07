@@ -10,6 +10,7 @@ from datetime import UTC
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from support_core.knowledge.embedding import DIMENSIONS as EMBEDDING_DIMENSIONS
 from support_core.storage.models import Conversation, DocChunk, DocSource
 
 
@@ -51,6 +52,18 @@ async def test_pgvector_extension_is_installed(engine: AsyncEngine) -> None:
         assert row.scalar_one_or_none() is not None
 
 
+DIMENSIONS = EMBEDDING_DIMENSIONS
+"""``doc_chunk.embedding`` is ``vector(128)`` from migration ``0010`` on (phase-0 finding N12).
+
+The number is imported rather than written out, because the point of fixing the dimension was
+that two places can no longer disagree about it - and a test that hard-coded 128 would be a third
+place."""
+
+NEAR = [0.1, 0.2, 0.3] + [0.0] * (DIMENSIONS - 3)
+FAR = [10.0, 10.0, 10.0] + [0.0] * (DIMENSIONS - 3)
+PROBE = [0.1, 0.2, 0.31] + [0.0] * (DIMENSIONS - 3)
+
+
 async def test_doc_chunk_embedding_and_tsvector(db_session: AsyncSession) -> None:
     source = DocSource(id="policy-docs", type="markdown_dir", version="v1")
     chunk = DocChunk(
@@ -59,7 +72,7 @@ async def test_doc_chunk_embedding_and_tsvector(db_session: AsyncSession) -> Non
         chunk_index=0,
         locator="docs/refunds.md#processing-time",
         text="Refunds take 5 to 7 business days to reach the original payment method.",
-        embedding=[0.1, 0.2, 0.3],
+        embedding=NEAR,
     )
     # No ORM relationship links the two models, so flush the parent first as ingestion will.
     db_session.add(source)
@@ -97,7 +110,7 @@ async def test_doc_chunk_embedding_and_tsvector(db_session: AsyncSession) -> Non
         await db_session.execute(select(DocChunk.embedding).where(DocChunk.chunk_index == 0))
     ).scalar_one()
     assert stored is not None
-    assert [round(float(x), 6) for x in stored] == [0.1, 0.2, 0.3]
+    assert [round(float(x), 6) for x in stored] == NEAR
 
     # Vector distance operators work through SQLAlchemy (phase 5's hybrid search needs this).
     far = DocChunk(
@@ -106,7 +119,7 @@ async def test_doc_chunk_embedding_and_tsvector(db_session: AsyncSession) -> Non
         chunk_index=1,
         locator="docs/other.md#x",
         text="Unrelated.",
-        embedding=[10.0, 10.0, 10.0],
+        embedding=FAR,
     )
     db_session.add(far)
     await db_session.commit()
@@ -114,7 +127,7 @@ async def test_doc_chunk_embedding_and_tsvector(db_session: AsyncSession) -> Non
         (
             await db_session.execute(
                 select(DocChunk.chunk_index).order_by(
-                    DocChunk.embedding.l2_distance([0.1, 0.2, 0.31])
+                    DocChunk.embedding.l2_distance(PROBE)
                 )
             )
         )

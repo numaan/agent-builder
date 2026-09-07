@@ -98,9 +98,14 @@ nodes:
     type: llm
     description: Confirm the refund and say when the money arrives.
     instructions: |
-      Tell the customer the refund is on its way. Say that it takes five to seven business days
-      to appear on their statement. Do not promise anything else and do not offer to do more
-      here; the next step asks whether they need anything else.
+      Tell the customer the refund is on its way, and say when the money will reach them. Take
+      the timing from the knowledge block and cite the passage you took it from; do not state a
+      number the passages do not give you. Do not promise anything else and do not offer to do
+      more here; the next step asks whether they need anything else.
+    # DESIGN.md 6.4's own example gives this node exactly this block. The timing used to be in
+    # the instructions, which is knowledge in a prompt - the thing decision Q8 forbids - and it
+    # meant a change to the published wait needed a deploy. Now it is a document.
+    knowledge: { query: "refund processing time card statement", k: 3 }
     output_schema: {}
     edges:
       done: done
@@ -109,9 +114,12 @@ nodes:
     type: llm
     description: Explain why the refund cannot be made.
     instructions: |
-      Explain, using the reason in the state block, why this charge cannot be refunded. Be
-      direct about it and do not suggest a way around the policy. If the customer disagrees with
-      the decision, decide "disputes"; if they accept it, decide "accepted".
+      Explain, using the reason in the state block, why this charge cannot be refunded, and cite
+      the policy passage the reason rests on. Be direct about it and do not suggest a way around
+      the policy. If a passage does not support the reason, say you cannot explain it rather than
+      inventing a rule. If the customer disagrees with the decision, decide "disputes"; if they
+      accept it, decide "accepted".
+    knowledge: { query: "refund policy {{ state.denial_reason }}", k: 3 }
     output_schema: {}
     edges:
       accepted: done_denied

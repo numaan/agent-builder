@@ -60,6 +60,7 @@ def service_for_pack(
         max_tool_iterations=manifest.llm.max_tool_iterations,
         retries=manifest.llm.retries,
         max_tokens=manifest.llm.max_output_tokens,
+        citation_policy=manifest.guardrails.citations,
         sleep=sleep,
     )
 

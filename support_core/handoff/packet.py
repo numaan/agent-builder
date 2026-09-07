@@ -32,6 +32,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from support_core.knowledge.types import Passage as KnowledgePassage
+
 
 class CustomerRef(BaseModel):
     """Who the conversation is with, as much as is known (DESIGN.md sections 10, 13)."""
@@ -75,19 +77,17 @@ class ActionRecord(BaseModel):
         return f"{self.tool} [{self.risk}] {self.status}{where}{failed}"
 
 
-class Passage(BaseModel):
-    """A knowledge passage a claim rests on (DESIGN.md sections 9.2, 13).
+Passage = KnowledgePassage
+"""A knowledge passage a claim rests on (DESIGN.md sections 9.2, 13).
 
-    The seam for phase 5. Nothing produces one yet and :attr:`HandoffPacket.citations` is
-    therefore always empty; the shape is here so a retriever fills it rather than redefining it.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    source: str | None = None
-    version: str | None = None
-    text: str | None = None
+Phase 6 declared a four-field placeholder here and said in as many words that phase 5 should
+"fill it rather than redefine it". Filling it means *this*: the packet's passage is now
+:class:`support_core.knowledge.types.Passage`, the same object a retriever produced and a trace
+step recorded, re-exported under the name this module already used. Two types where there were
+three, and - the part that matters for a person reading a packet - the passage on the packet now
+carries its ``locator`` and its ``source_version``, so "which document, which heading, which
+revision" is answerable from the payload rather than by going back to the trace.
+"""
 
 
 class HandoffPacket(BaseModel):

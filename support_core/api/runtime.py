@@ -47,6 +47,7 @@ from support_core.graph.context import ConversationContext
 from support_core.graph.manifest import Channel
 from support_core.graph.pack import Pack
 from support_core.handoff import HandoffService, default_sink
+from support_core.knowledge.wiring import build_retriever, build_store
 from support_core.llm.provider import LLMProvider
 from support_core.llm.service import LlmService
 from support_core.llm.wiring import (
@@ -58,7 +59,7 @@ from support_core.llm.wiring import (
 )
 from support_core.memory import LlmSummarizer
 from support_core.storage import repositories as repo
-from support_core.storage.session import make_engine
+from support_core.storage.session import make_engine, make_session_factory
 
 SEND_FAILURES_KEPT = 50
 """How many delivery failures :attr:`AppRuntime.send_failures` remembers."""
@@ -363,12 +364,22 @@ def build_runtime(
 
     owns_engine = engine is None
     db = engine if engine is not None else make_engine()
+    sessions = make_session_factory(db)
     executor = Executor(
         pack,
         db,
         hooks=engine_hooks,
         lock_wait_seconds=config.lock_wait_seconds,
         llm=service,
+        # DESIGN.md section 9.1, from the pack's own `knowledge/sources.yaml`. `None` for a pack
+        # that declares nothing, which is a real configuration and not a failure: layer 7 is then
+        # empty and section 9.2's citation guardrail is what stops that becoming a guess.
+        retriever=build_retriever(
+            pack.knowledge,
+            sessions,
+            store=build_store(config.qdrant_url) if config.use_qdrant else None,
+            use_qdrant=config.use_qdrant,
+        ),
     )
     # DESIGN.md section 13's "universal fallback for every failure path in section 7.3", filled.
     # One service for the ``handoff`` node and for the engine's own routing, so a conversation
@@ -380,6 +391,9 @@ def build_runtime(
         llm=service,
         clock=engine_hooks.clock,
         transcript_template=config.transcript_url_template,
+        # The same retriever the engine holds, so a packet grounded on the customer's last
+        # message rests on the corpus the conversation itself was answered from.
+        retriever=executor.retriever,
     )
     engine_hooks.handoff = handoff
 

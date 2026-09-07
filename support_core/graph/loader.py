@@ -16,6 +16,7 @@ from support_core.graph.pack import Pack, build_pin
 from support_core.graph.schema import read_graphs
 from support_core.graph.tools_source import resolve_tools
 from support_core.graph.validator import validate_pack
+from support_core.knowledge.sources import KnowledgeSources, SourceError, load_sources
 
 
 class PackValidationError(ValueError):
@@ -78,8 +79,19 @@ def load_pack_report(path: Path | str) -> tuple[Pack | None, ValidationReport]:
         tools=resolved.manifest,
         pin=build_pin(report.manifest, graphs, __version__),
         registry=resolved.registry,
+        # `validate_pack` has already parsed this file and reported anything wrong with it, so
+        # this cannot raise on a pack that reached here; the `except` is for the pack that is
+        # edited between the two reads, which is the same window the graph snapshot closes.
+        knowledge=_read_sources(pack_path),
     )
     return pack, report
+
+
+def _read_sources(pack_path: Path) -> KnowledgeSources:
+    try:
+        return load_sources(pack_path)
+    except SourceError:  # pragma: no cover - validate_pack reports it and returns above
+        return KnowledgeSources()
 
 
 def _read_text(path: Path) -> str:

@@ -1,0 +1,8 @@
+# The corpus lives in `knowledge/docs`. Tests that need a *hostile* corpus write their own into
+# a tmp_path pack rather than committing attack payloads into a fixture the whole suite loads.
+documents:
+  - id: policy-docs
+    type: markdown_dir
+    path: ./knowledge/docs
+knowledge_graph: []
+live_lookups: []

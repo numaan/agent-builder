@@ -1,0 +1,7 @@
+# One READ tool, for the live-lookup retriever of DESIGN.md section 9.1.
+tools:
+  - name: get_plan_details
+    description: What the customer's current plan includes.
+    risk: read
+    input: { customer_ref: str }
+    output: { plan: str, seats: int }

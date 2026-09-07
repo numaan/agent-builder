@@ -38,6 +38,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from support_core.engine.types import Frame, OutboundMessage
 from support_core.graph.context import ConversationContext
+from support_core.knowledge.types import Passage
 
 
 class InterruptDecision(BaseModel):
@@ -107,6 +108,14 @@ class HandoffRequest(BaseModel):
     """What the pack's ``handoff`` node suggests the human does, overriding core's
     reason-keyed checklist (DESIGN.md section 13's ``suggested_next_steps``). Empty for a
     handoff the engine raised: core does not know a pack's desk."""
+
+    citations: list[Passage] = Field(default_factory=list)
+    """The knowledge passages the failing node was looking at (DESIGN.md sections 9.2, 13).
+
+    Filled by the node that failed, through :attr:`support_core.engine.errors.NodeError.
+    citations`, and not re-retrieved here: for the reason that matters most - a claim the model
+    could not support - the human needs the passages that were in front of it when it decided
+    to assert something, and a second retrieval a minute later is a different set."""
 
 
 class InterruptCheck(Protocol):

@@ -21,6 +21,7 @@ from support_core.engine import Executor
 from support_core.engine.hooks import EngineHooks
 from support_core.engine.interrupts import workflow_intents
 from support_core.handoff import HandoffService, HandoffSink, default_sink
+from support_core.knowledge.wiring import build_ingestor, build_retriever
 from support_core.llm.fake import Rule
 from support_core.llm.provider import LLMProvider
 from support_core.llm.types import ToolCall
@@ -32,6 +33,7 @@ from support_core.llm.wiring import (
     service_for_pack,
 )
 from support_core.memory import LlmSummarizer
+from support_core.storage.session import make_session_factory
 from support_core.tools.loading import import_pack_tools
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -59,12 +61,20 @@ def answer(
     message: str | None = None,
     confidence: float = 0.9,
     updates: dict[str, Any] | None = None,
+    citations: Sequence[str] = (),
 ) -> dict[str, Any]:
+    """One structured answer, as the model would return it.
+
+    ``citations`` is the ids from the node's knowledge block that the message rests on
+    (DESIGN.md 9.2). A scripted answer that states a policy, a price or a timing without one is
+    refused by the outbound guardrail and the conversation goes to a person - which is correct
+    behaviour, and is why the refund scenarios' closing message names ``k1``.
+    """
     return {
         "message_to_customer": message,
         "decision": label,
         "state_updates": dict(updates or {}),
-        "citations": [],
+        "citations": list(citations),
         "confidence": confidence,
         "needs_handoff": False,
     }
@@ -301,6 +311,7 @@ ACME_REFUND = Scenario(
                     "That is refunded. It takes five to seven business days to show on your "
                     "statement."
                 ),
+                citations=["k1"],
             ),
         ),
         Rule(
@@ -442,6 +453,7 @@ ACME_INTERRUPT_DEFERRED = Scenario(
                     "That is refunded. It takes five to seven business days to show on your "
                     "statement."
                 ),
+                citations=["k1"],
             ),
         ),
         # Step 15: the root graph is shown the request it could not take up, and chooses it.
@@ -577,6 +589,7 @@ ACME_INTERRUPT_SWITCH = Scenario(
                     "That is refunded. It takes five to seven business days to show on your "
                     "statement."
                 ),
+                citations=["k1"],
             ),
         ),
         Rule(
@@ -654,6 +667,20 @@ SCENARIOS: tuple[Scenario, ...] = (
 )
 
 
+async def sync_pack_knowledge(pack: Any, engine: AsyncEngine) -> None:
+    """Run the real ingestion for every document source the pack declares.
+
+    The real one, not a fixture that inserts rows: a golden conversation is meant to be what the
+    service would really do, and the chunk boundaries and locators a customer's citation names
+    come out of the chunker rather than out of a test.
+    """
+    if not pack.knowledge.documents:
+        return
+    ingestor = build_ingestor(pack.path, make_session_factory(engine), store=None)
+    for source in pack.knowledge.documents:
+        await ingestor.sync_source(source)
+
+
 async def play(
     scenario: Scenario,
     engine: AsyncEngine,
@@ -670,6 +697,17 @@ async def play(
         scenario.setup()
     pack = load_pack(scenario.pack_path)
     service = service_for_pack(pack, provider)
+    # The pack's knowledge, synced into this database before the conversation starts (DESIGN.md
+    # 9.3). A golden conversation has to run against a corpus, because two of the sample pack's
+    # `llm` nodes carry a `knowledge:` block and the citation guardrail refuses what they say
+    # without one - so a scenario played against an unsynced database would record a handoff and
+    # call it the worked example.
+    #
+    # Qdrant is deliberately *not* used here. A recording has to be reproducible on a machine
+    # that has only Postgres, and the lexical and dense halves are enough to ground these
+    # answers; what a running service does with the vector side beside them is tested in
+    # tests/test_knowledge_retrieval.py rather than baked into a fixture.
+    await sync_pack_knowledge(pack, engine)
     hooks = EngineHooks(
         extract_slots=StructuredSlotExtractor(service),
         confirm_decision=StructuredConfirmClassifier(service),
@@ -681,7 +719,15 @@ async def play(
         ),
         resume_offer=StructuredResumeOffer(service),
     )
-    executor = Executor(pack, engine, hooks=hooks, llm=service)
+    executor = Executor(
+        pack,
+        engine,
+        hooks=hooks,
+        llm=service,
+        retriever=build_retriever(
+            pack.knowledge, make_session_factory(engine), use_qdrant=False
+        ),
+    )
     # DESIGN.md section 13, wired after the executor because the sink writes through the
     # executor's own session factory: one database connection story, not two.
     hooks.handoff = HandoffService(
@@ -689,6 +735,7 @@ async def play(
         executor.sessions,
         sink=sink or default_sink(executor.sessions),
         llm=service,
+        retriever=executor.retriever,
     )
     conversation_id = await executor.start_conversation(
         customer_ref=(scenario.context.get("customer") or {}).get("ref"),

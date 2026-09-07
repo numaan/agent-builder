@@ -1,0 +1,22 @@
+# A pack for the phase-5 tests: an `llm` node with a `knowledge:` block, and the outbound
+# citation guardrail of DESIGN.md sections 9.2 and 14 wired to phase 6's real handoff.
+#
+# Separate from `llm_pack` on purpose. Adding a knowledge node there would change the graph every
+# phase-3 test runs against, and those tests are about a prompt boundary that must not move.
+id: knowledge-pack
+version: 1.0.0
+core: ">=0.0.1,<1"
+entry_graph: root
+language: en
+channels: [web_chat]
+llm:
+  default_model: test-model
+  escalation_model: test-escalation-model
+  confidence_threshold: 0.4
+  max_tool_iterations: 3
+  retries: 1
+handoff:
+  queue: knowledge-tests
+limits:
+  max_nodes_per_turn: 12
+  max_tool_calls_per_turn: 4

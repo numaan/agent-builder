@@ -6,6 +6,10 @@ routed - to the node's ``on_error`` edge if it declares one, otherwise to the ha
 turn loudly, because turning a programming error into a handoff would hide it.
 """
 
+from collections.abc import Sequence
+
+from support_core.knowledge.types import Passage
+
 
 class EngineError(RuntimeError):
     """Base class for every failure raised by the execution engine."""
@@ -19,11 +23,26 @@ class NodeError(EngineError):
     and phase 3 adds two more of the same kind (``llm_invalid_output``, ``low_confidence``),
     because "the model would not answer", "the model answered with something the graph does not
     allow" and "the model was not sure enough to be believed" are three different things for
-    whoever picks the conversation up. The default stays ``node_error``.
+    whoever picks the conversation up. Phase 5 adds ``uncited_claim`` for the outbound citation
+    guardrail of sections 9.2 and 14. The default stays ``node_error``.
+
+    ``citations`` is the passages the node had in front of it when it failed. It exists for one
+    handoff reason above all - a claim the model could not support - where the first thing a
+    human needs is what the agent was actually looking at; DESIGN.md section 13 puts them on the
+    packet and phase 6 left the field empty waiting for this. It is carried on the exception
+    rather than fetched by the builder because the retrieval that produced them happened inside
+    the node and re-running it would give a different answer than the one that went wrong.
     """
 
-    def __init__(self, message: str, *, reason: str = "node_error") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str = "node_error",
+        citations: "Sequence[Passage] | None" = None,
+    ) -> None:
         self.reason = reason
+        self.citations: tuple[Passage, ...] = tuple(citations or ())
         super().__init__(message)
 
 

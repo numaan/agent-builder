@@ -23,12 +23,13 @@ would turn "we could not tell anyone" into "we also lost the conversation".
 """
 
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from support_core.graph.pack import Pack
 from support_core.handoff.builder import PacketRequest, assemble, fallback_summary, gather
-from support_core.handoff.packet import HandoffPacket
+from support_core.handoff.packet import HandoffPacket, Passage
 from support_core.handoff.sinks import HandoffSink, NullSink, SinkError, transcript_url
 from support_core.llm.prompt import TranscriptMessage
 from support_core.llm.service import HandoffSummaryRequest, LlmService
@@ -65,11 +66,17 @@ class HandoffService:
         llm: LlmService | None = None,
         clock: Callable[[], datetime] = utc_now,
         transcript_template: str = DEFAULT_TRANSCRIPT_URL,
+        retriever: Any = None,
     ) -> None:
         self.pack = pack
         self.sessions = sessions
         self.sink = sink or NullSink()
         self.llm = llm
+        self.retriever = retriever
+        """The knowledge layer (DESIGN.md sections 9.1, 13), used only to *ground* a summary
+        whose failing node supplied no passages. Optional, and every failure of it is swallowed:
+        a packet is built because something already went wrong, and a retriever that is also down
+        must not stop a person being paged."""
         self.clock = clock
         self.transcript_template = transcript_template
         self.delivered: list[HandoffPacket] = []
@@ -120,11 +127,16 @@ class HandoffService:
 
     async def build(self, request: PacketRequest) -> HandoffPacket:
         """DESIGN.md section 13's packet, from durable state plus one model call."""
-        actions, pending, context, transcript = await gather(self.sessions, request)
+        actions, pending, context, transcript, passages = await gather(
+            self.sessions, request, retriever=self.retriever
+        )
         window = [TranscriptMessage(author=author, text=text) for author, text in transcript]
-        summary = await self._summary(request, actions, pending, context, window)
+        summary = await self._summary(request, actions, pending, context, window, passages)
+        # The packet carries whatever grounded the summary, which is the node's own passages
+        # where it had any and a retrieval on the customer's last message where it did not.
+        grounded = replace(request, citations=passages)
         return assemble(
-            request,
+            grounded,
             actions=actions,
             pending=pending,
             context=context,
@@ -167,6 +179,7 @@ class HandoffService:
         pending: Any,
         context: Any,
         window: Sequence[TranscriptMessage],
+        passages: Sequence[Passage] = (),
     ) -> str:
         """The escalation model's summary, or the facts (see the module docstring)."""
         if self.llm is None:
@@ -187,6 +200,7 @@ class HandoffService:
                     detail=request.detail,
                     state=dict(top.state) if top is not None else {},
                     window=window,
+                    knowledge=[passage.for_prompt() for passage in passages],
                     summary=context.summary if context is not None else None,
                     max_chars=self.pack.manifest.memory.max_summary_chars * 2,
                 )

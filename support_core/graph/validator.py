@@ -30,6 +30,13 @@ from support_core.graph.manifest import (
 from support_core.graph.rules import validate_graph_set
 from support_core.graph.schema import read_graphs
 from support_core.graph.tools_source import resolve_tools
+from support_core.knowledge.sources import (
+    KnowledgeSources,
+    MarkdownDirSource,
+    SourceError,
+    parse_sources,
+    path_findings,
+)
 
 __all__ = [
     "Finding",
@@ -339,7 +346,68 @@ def _check_knowledge_sources(pack_path: Path) -> list[Finding]:
                     location=location,
                 )
             )
+    if findings:
+        return findings
+
+    # Phase 5 widens the check from the shape of the file to the shape of what is *in* it. Every
+    # source is validated against the schema the sync will read it with
+    # (:mod:`support_core.knowledge.sources`), so a missing path, an unknown type or a duplicate
+    # id is a load-time finding rather than a traceback in a scheduled job. Same argument phase 1
+    # made for type-checking tool arguments at load.
+    try:
+        sources = parse_sources(raw)
+    except SourceError as exc:
+        return [
+            Finding(
+                severity=Severity.ERROR,
+                rule="knowledge.sources_invalid",
+                message=str(exc),
+                location=location,
+            )
+        ]
+    findings.extend(
+        Finding(
+            severity=Severity.ERROR,
+            rule="knowledge.source_unreadable",
+            message=f"source {source_id!r}: {problem}",
+            location=location,
+        )
+        for source_id, problem in path_findings(pack_path, sources)
+    )
+    findings.extend(
+        Finding(
+            severity=Severity.WARNING,
+            rule="knowledge.source_empty",
+            message=(
+                f"source {source_id!r} names a directory with no markdown in it, so it will "
+                f"index nothing and an `llm` node citing it will have nothing to cite"
+            ),
+            location=location,
+        )
+        for source_id in _empty_markdown_sources(pack_path, sources)
+    )
     return findings
+
+
+def _empty_markdown_sources(pack_path: Path, sources: KnowledgeSources) -> list[str]:
+    """Markdown sources whose directory exists and holds no document.
+
+    A warning rather than an error: a pack may add the documents after the graphs, and a pack
+    with no knowledge at all is legitimate. What is not legitimate is silence - a node with a
+    ``knowledge:`` block pointing at an empty corpus produces an empty layer 7, and the citation
+    guardrail then turns the node's first factual claim into a handoff, which is correct
+    behaviour arrived at for a reason nobody can see from the outside.
+    """
+    empty: list[str] = []
+    for source in sources.documents:
+        if not isinstance(source, MarkdownDirSource):
+            continue
+        root = source.resolve(pack_path)
+        if root.is_dir() and not any(
+            path.suffix.lower() in (".md", ".markdown") for path in root.rglob("*")
+        ):
+            empty.append(source.id)
+    return empty
 
 
 def _check_policies(pack_path: Path) -> list[Finding]:

@@ -57,6 +57,32 @@ class StructuredOutputError(LLMError):
         self.summary = summary or "it did not fit the shape you were given"
 
 
+class UncitedClaimError(StructuredOutputError):
+    """The model made a factual claim with no citation (DESIGN.md sections 9.2, 14).
+
+    A subclass rather than a new branch, because it wants everything
+    :class:`StructuredOutputError` already arranges: one retry with the reason stated back to the
+    model, then the caller hands off. DESIGN.md 9.2 asks for exactly that ladder - "the engine
+    re-prompts once before routing to handoff" - and it is the ladder phase 3 built and phase 3's
+    review hardened, so this reuses it rather than adding a second one.
+
+    It is a distinct *type* because the outcome is a distinct handoff reason. "The model answered
+    with something the graph does not allow" and "the model asserted a policy it could not
+    support" send a conversation to the same place for very different causes, and the person who
+    picks it up needs to know which. :class:`~support_core.llm.service.LlmService` raises it and
+    :class:`~support_core.engine.runners.LlmRunner` turns it into
+    ``NodeError(reason="uncited_claim")``.
+
+    ``correction`` is the sentence the retry shows the model, already reduced to core's own
+    vocabulary by :meth:`support_core.guardrails.outbound.CitationVerdict.correction` - nothing
+    the model wrote reaches a prompt through it (review finding V5).
+    """
+
+    def __init__(self, message: str, *, summary: str, correction: str) -> None:
+        super().__init__(message, summary=summary)
+        self.correction = correction
+
+
 class Usage(BaseModel):
     """Token counts for one call, for the cost metrics of DESIGN.md section 15."""
 

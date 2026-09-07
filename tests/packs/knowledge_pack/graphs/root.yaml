@@ -1,0 +1,47 @@
+id: root
+description: Classify the question, then answer it from knowledge - or say something ungrounded.
+outputs:
+  outcome: str | None
+state:
+  topic: str | None
+  outcome: str | None
+start: classify
+nodes:
+  classify:
+    type: llm
+    description: |
+      Decides what the question is about and writes it into state. No knowledge block, because
+      this is the step that produces the query the next one retrieves with.
+    instructions: |
+      Classify what the customer is asking about and put it in topic.
+    output_schema:
+      topic: str | None
+    edges:
+      answer: answer
+      chat: ungrounded
+
+  answer:
+    type: llm
+    description: The node under test - it retrieves, and every claim it makes must be cited.
+    instructions: |
+      Answer the customer's question about the refund policy from the knowledge block, and cite
+      the passage you took the answer from.
+    # The query is a template over state, which is DESIGN.md 6.4's own shape for this
+    # (`query: "refund policy {{ state.denial_reason }}"`). It is what makes the customer's own
+    # words reach a search index and come back as fenced data rather than as instructions.
+    knowledge: { query: "{{ state.topic }}", k: 3 }
+    output_schema: {}
+    edges:
+      done: finish
+
+  ungrounded:
+    type: llm
+    description: An llm node with no knowledge block, so layer 7 is empty by construction.
+    instructions: Reply to the small talk in one short sentence.
+    output_schema: {}
+    edges:
+      done: finish
+
+  finish:
+    type: end
+    outputs: { outcome: "answered" }

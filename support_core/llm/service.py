@@ -23,6 +23,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from support_core.guardrails.outbound import CitationPolicy, check_citations
 from support_core.llm.prompt import (
     Decision,
     DeferredIntent,
@@ -56,6 +57,7 @@ from support_core.llm.types import (
     StructuredOutputError,
     StructuredSpec,
     ToolResultPart,
+    UncitedClaimError,
     Usage,
 )
 
@@ -235,6 +237,14 @@ class HandoffSummaryRequest:
     detail: str | None = None
     state: Mapping[str, Any] = field(default_factory=dict)
     window: Sequence[TranscriptMessage] = ()
+    knowledge: Sequence[Passage] = ()
+    """Passages the conversation rested on (DESIGN.md sections 9.2, 13).
+
+    The backlog's phase-5 line: "so a handoff summary can be grounded". They render into layer 7
+    like any other passage - fenced, with the same per-render token - because a passage is
+    untrusted text whichever call is reading it, and a summariser is exactly the call that would
+    otherwise be given a document and asked to believe it."""
+
     summary: str | None = None
     max_chars: int = 1500
 
@@ -318,6 +328,7 @@ class LlmService:
         retries: int = 2,
         backoff_seconds: float = 0.5,
         max_tokens: int = 4096,
+        citation_policy: CitationPolicy | None = None,
         sleep: Sleeper | None = None,
     ) -> None:
         self.provider = provider
@@ -330,6 +341,7 @@ class LlmService:
         self.retries = retries
         self.backoff_seconds = backoff_seconds
         self.max_tokens = max_tokens
+        self.citation_policy = citation_policy or CitationPolicy()
         self.sleep: Sleeper = sleep or asyncio.sleep
 
     # -- the llm node --------------------------------------------------------------------
@@ -340,6 +352,13 @@ class LlmService:
         The answer is validated against a model whose ``decision`` is a ``Literal`` over exactly
         the node's declared edges, so an invented transition cannot get through (principle 2).
         One retry, then the caller hands off; nothing is guessed at.
+
+        The same loop carries DESIGN.md section 9.2's citation guardrail, and that is the whole
+        of "the engine re-prompts once before routing to handoff": an answer that makes a factual
+        claim about policy, pricing or timing with nothing to cite is rejected exactly as a
+        malformed one is, told why in core's own words, and asked again. A second failure raises
+        :class:`~support_core.llm.types.UncitedClaimError`, which
+        :class:`~support_core.engine.runners.LlmRunner` turns into a handoff with its own reason.
         """
         schema = build_node_output_model(
             request.node_id, [d.label for d in request.decisions], request.output_schema
@@ -357,6 +376,11 @@ class LlmService:
         for attempt in range(2):
             try:
                 output = await self._answer(request, schema, spec, correction, state)
+                self._check_citations(request, output)
+            except UncitedClaimError as exc:
+                last = exc
+                correction = exc.correction
+                continue
             except StructuredOutputError as exc:
                 last = exc
                 # `exc.summary` and not `exc`: the detailed message names the offending *field*,
@@ -381,6 +405,32 @@ class LlmService:
             )
         assert last is not None
         raise last
+
+    def _check_citations(self, request: NodeRequest, output: LlmNodeOutput) -> None:
+        """DESIGN.md sections 9.2 and 14's outbound citation check, on one answer.
+
+        The passages the node was *given* are the only thing that makes a citation checkable, and
+        they are held here rather than passed in: a caller who could supply its own list of
+        offered ids could satisfy the check by widening it.
+        """
+        verdict = check_citations(
+            output.message_to_customer,
+            output.citations,
+            [passage.id for passage in request.knowledge],
+            self.citation_policy,
+        )
+        if verdict.ok:
+            return
+        offered = [passage.id for passage in request.knowledge]
+        msg = (
+            f"{request.node_id}: {'; '.join(verdict.problems)}. "
+            f"The passages offered were {offered or 'none'}. Detail: {verdict.detail()}"
+        )
+        raise UncitedClaimError(
+            msg,
+            summary="you stated a fact about policy, pricing or timing without citing a passage",
+            correction=verdict.correction(),
+        )
 
     async def _answer(
         self,
@@ -682,6 +732,7 @@ class LlmService:
                     "engine_detail": request.detail,
                     "workflow_state": dict(request.state),
                 },
+                knowledge=request.knowledge,
                 summary=request.summary,
                 window=request.window,
                 task="Write the summary, in the structured form you were given.",

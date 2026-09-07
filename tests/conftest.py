@@ -28,6 +28,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from support_core.knowledge.qdrant import QdrantStore
 from support_core.storage.config import UnsafeTestDatabaseError, test_database_url
 from support_core.storage.models import ALL_TABLES
 from support_core.storage.session import make_session_factory
@@ -133,3 +134,30 @@ async def engine(migrated_database: None) -> AsyncIterator[AsyncEngine]:
 async def db_session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
     async with make_session_factory(engine)() as session:
         yield session
+
+
+@pytest.fixture
+async def qdrant() -> AsyncIterator[QdrantStore]:
+    """The vector side of the knowledge layer, namespaced to this test (phase 5).
+
+    Every collection carries a per-run random prefix, so a suite run against a developer's own
+    Qdrant leaves their collections alone and two suites cannot collide - which is why there is
+    no ``_test`` suffix rule of the kind the database has: these tests never name, let alone
+    drop, a collection they did not create.
+
+    It **skips** when Qdrant does not answer, and that is deliberate rather than lax. The phase's
+    own claim is that the system keeps working with the vector side absent, so a suite that could
+    not run without it would contradict the thing it is testing. The degradation test in
+    ``tests/test_knowledge_retrieval.py`` does not use this fixture at all: it points a store at
+    a port nothing listens on, so an outage is checkable whether or not Qdrant is installed.
+    """
+    from tests.knowledge_support import drop_prefixed, scratch_store
+
+    store = scratch_store()
+    if not await store.ping():
+        pytest.skip(f"no Qdrant at {store.url}; start it with scripts/db-up.sh")
+    await drop_prefixed(store)
+    try:
+        yield store
+    finally:
+        await drop_prefixed(store)

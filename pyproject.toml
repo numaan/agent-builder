@@ -30,9 +30,20 @@ dependencies = [
   # protocol implementation it uses for one. Both are also what the api tests drive.
   "uvicorn>=0.30",
   "websockets>=12",
+  # The vector side of the knowledge layer (DESIGN.md 9.1, BACKLOG.md's 2026-09-06 decision).
+  # Not optional: `CompositeRetriever` degrades when Qdrant is *unreachable*, which is an
+  # outage, and an import error is not an outage - it is a deployment that would silently
+  # serve keyword search for ever without anybody being told.
+  "qdrant-client>=1.9",
 ]
 
 [project.optional-dependencies]
+colbert = [
+  # The real local ColBERT encoder (`support_core.knowledge.embedding.FastEmbedColbertEncoder`).
+  # An extra rather than a dependency because it pulls onnxruntime and downloads ~400 MB of
+  # weights on first use, and the deterministic encoder is what CI and this deployment run.
+  "fastembed>=0.3",
+]
 dev = [
   "pytest>=8.3",
   "pytest-asyncio>=0.24",

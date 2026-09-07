@@ -25,6 +25,7 @@ from support_core.graph.manifest import PackManifest
 from support_core.graph.schema import Graph
 from support_core.graph.templates import make_environment
 from support_core.graph.tools_manifest import ToolManifest
+from support_core.knowledge.sources import KnowledgeSources
 from support_core.tools.registry import ToolRegistry
 
 
@@ -138,6 +139,15 @@ class Pack:
     registry: ToolRegistry = field(default_factory=ToolRegistry)
     """The pack's tools as *behaviour*: the only source of a risk tier at run time (phase-1
     deferred finding I). Empty for a pack that exports none."""
+
+    knowledge: KnowledgeSources = field(default_factory=KnowledgeSources)
+    """``knowledge/sources.yaml``, parsed (DESIGN.md section 9.1).
+
+    On the pack rather than read again by whoever needs it, so the sync, the composition root and
+    the validator all work from one reading of one file - the same reason the graphs are read
+    once and parsed from a snapshot (phase-1 deferred finding P1). Empty for a pack with no
+    knowledge, which is a legitimate pack: an ``llm`` node then gets an empty layer 7 and the
+    citation guardrail of section 9.2 is what stops that becoming an ungrounded answer."""
 
     environment: SandboxedEnvironment = field(default_factory=make_environment)
     """This pack's own sandboxed Jinja environment.

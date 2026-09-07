@@ -8,8 +8,8 @@ Deliberate choices (see reviews/phase-0.md "Plan"):
 
 * Enum-like columns (``status``, ``direction``, ``author``, ``risk``, ``approved_by``) are
   ``text``. Their vocabularies belong to phases 2, 4 and 6.
-* ``doc_chunk.embedding`` is an untyped ``vector``; phase 5 fixes the dimension and adds the
-  ANN index once the embedding model is chosen.
+* ``doc_chunk.embedding`` is ``vector(128)`` with an HNSW cosine index (migration ``0010``,
+  phase-0 finding N12). The width is :data:`support_core.knowledge.embedding.DIMENSIONS`.
 * ``doc_chunk.tsv`` is a stored generated column so full-text search can never drift from
   the chunk text.
 """
@@ -33,6 +33,8 @@ from sqlalchemy import (
 from sqlalchemy import text as sql_text
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from support_core.knowledge.embedding import DIMENSIONS as EMBEDDING_DIMENSIONS
 
 JsonObject = dict[str, Any]
 JsonArray = list[Any]
@@ -443,7 +445,9 @@ class DocSource(Base):
     """A knowledge document source from ``knowledge/sources.yaml`` (section 9.1).
 
     ``version`` is the current ``source_version``; chunks carry the version they were built
-    from, so an old trace can still name the version it used (section 9.2).
+    from, so an old trace can still name the version it used (section 9.2). It is
+    ``r<revision>-<checksum[:12]>``, so it is both ordered and content-addressed: a sync of
+    unchanged content keeps it, and any edit changes it.
     """
 
     __tablename__ = "doc_source"
@@ -452,6 +456,16 @@ class DocSource(Base):
     type: Mapped[str] = mapped_column(nullable=False)
     config: Mapped[JsonObject] = mapped_column(nullable=False, server_default=_EMPTY_OBJECT)
     version: Mapped[str] = mapped_column(nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
+    """Monotonic sync number, and the Qdrant collection suffix (``<prefix><source>_v<n>``).
+
+    Versions are by *collection* rather than in place, so a re-sync builds ``_v4`` beside ``_v3``
+    and flips an alias; a trace that names revision 3 can still be answered from the collection
+    that produced it."""
+
+    checksum: Mapped[str | None] = mapped_column()
+    """sha256 of the normalised corpus the last sync read. ``None`` means never synced."""
+
     last_synced_at: Mapped[datetime | None] = mapped_column()
     created_at: Mapped[datetime] = _created_at()
 
@@ -466,6 +480,12 @@ class DocChunk(Base):
         ),
         Index("ix_doc_chunk_tsv", "tsv", postgresql_using="gin"),
         Index("ix_doc_chunk_source_stale", "source_id", "stale"),
+        Index(
+            "ix_doc_chunk_embedding",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -476,7 +496,7 @@ class DocChunk(Base):
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     locator: Mapped[str] = mapped_column(nullable=False)
     text: Mapped[str] = mapped_column(nullable=False)
-    embedding: Mapped[list[float] | None] = mapped_column(Vector())
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIMENSIONS))
     tsv: Mapped[str | None] = mapped_column(
         TSVECTOR, Computed("to_tsvector('english'::regconfig, text)", persisted=True)
     )

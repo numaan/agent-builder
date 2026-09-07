@@ -6,6 +6,17 @@ Create Date: 2026-09-05
 
 Hand-written to match ``support_core.storage.models``; ``tests/test_migrations.py`` fails if the
 two drift. See reviews/phase-0.md "Plan" for the column-type decisions.
+
+**The downgrade does not drop the ``vector`` extension**, and that asymmetry is deliberate
+(phase-0 review finding N2, deferred to phase 5 which owns pgvector). The upgrade creates it with
+``IF NOT EXISTS``, which means it may well have been there first: ``CREATE EXTENSION`` needs
+superuser on this image, so on a managed instance an administrator usually installs it once for
+the whole database before the application ever runs. A ``DROP EXTENSION`` on the way down would
+then remove something this migration did not create, taking every ``vector`` column in that
+database - including another application's - with it, and ``downgrade base`` means "remove this
+application's schema", not "remove pgvector". An extension left behind costs nothing: the next
+upgrade's ``IF NOT EXISTS`` is a no-op, and a fresh database that genuinely wants it gone can
+drop it in one statement that a human chose to type.
 """
 
 from collections.abc import Sequence
@@ -251,4 +262,4 @@ def downgrade() -> None:
         "conversation",
     ):
         op.drop_table(table)
-    op.execute("DROP EXTENSION IF EXISTS vector")
+    # The `vector` extension is deliberately left in place; see the module docstring (finding N2).
