@@ -108,17 +108,26 @@ def build_ingestor(
     embedder: Embedder | None = None,
     encoder: LateInteractionEncoder | None = None,
     store: QdrantStore | None = None,
+    use_qdrant: bool = True,
     fetch: Fetcher = http_fetch,
     now: Any = None,
 ) -> Ingestor:
-    """The sync pipeline behind ``support pack knowledge sync`` (DESIGN.md section 9.3)."""
+    """The sync pipeline behind ``support pack knowledge sync`` (DESIGN.md section 9.3).
+
+    ``use_qdrant=False`` builds a sync that indexes the Postgres halves and nothing else. Same
+    distinction as :func:`build_retriever`: not having a Qdrant is a configuration, and it is why
+    this is a separate flag rather than ``store=None`` - a default argument cannot tell "I did
+    not pass one" from "there is not one".
+    """
     chosen = _default(embedder, encoder)
+    if use_qdrant and store is None:
+        store = build_store()
     return Ingestor(
         pack_path=pack_path,
         sessions=sessions,
         embedder=chosen[0],
         encoder=chosen[1],
-        store=store if store is not None else build_store(),
+        store=store if use_qdrant else None,
         fetch=fetch,
         now=now,
     )

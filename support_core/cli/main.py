@@ -80,7 +80,13 @@ def knowledge_sync(path: Path, force: bool, only: tuple[str, ...]) -> None:
     Postgres and answer without it, and a pack that could not correct its knowledge because a
     secondary index was down would be a worse system than one that degrades.
     """
-    sources = load_sources(path)
+    try:
+        sources = load_sources(path)
+    except SourceError as exc:
+        # The same message `support pack validate` gives, because it is the same schema; a
+        # scheduled job that printed a traceback would be a job whose failures nobody reads.
+        click.echo(f"sync failed: {exc}", err=True)
+        sys.exit(EXIT_INVALID)
     wanted = [s for s in sources.documents if not only or s.id in only]
     unknown = sorted(set(only) - {s.id for s in sources.documents})
     if unknown:

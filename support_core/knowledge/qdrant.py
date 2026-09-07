@@ -155,12 +155,33 @@ class QdrantStore:
         return True
 
     async def create_collection(self, name: str, *, dimensions: int) -> None:
-        """One collection carrying both a dense vector and a MaxSim-scored multivector."""
+        """One collection carrying both a dense vector and a MaxSim-scored multivector.
+
+        **An existing collection of this name is replaced.** Qdrant's ``create_collection``
+        refuses a name it already holds, and the name is ``<prefix><source>_v<n>`` where ``n``
+        comes from ``doc_source.revision`` in Postgres - so the two stores can disagree about
+        which revisions exist. They do so in two ordinary situations: a sync that crashed between
+        building a collection and flipping the alias onto it, and a Postgres database restored
+        from a backup or reset in development, which restarts the revision count while the
+        collections stay. Both then produce a permanent 409 on every sync, and the whole vector
+        side degrades to nothing for a reason nobody would find.
+
+        Replacing is safe *here* and only here, because this is the collection the sync is about
+        to fill and no alias points at it yet: the alias still names the previous revision until
+        :meth:`flip_alias` at the end. What is never replaced is a collection an alias names.
+        """
         from qdrant_client import models
 
         client = self._connect()
+        if await self.collection_exists(name):
+            logger.warning(
+                "qdrant collection %s already exists and is being rebuilt; a previous sync did "
+                "not finish, or the database's revision count was reset",
+                name,
+            )
+            await self.drop(name)
         await self._call(
-            "recreate_collection",
+            "create_collection",
             client.create_collection,
             collection_name=name,
             vectors_config={
