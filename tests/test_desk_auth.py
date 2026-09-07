@@ -31,7 +31,14 @@ from starlette.routing import Router
 
 from support_core.api import AppConfig
 from support_core.api.config import ConfigError
-from tests.app_support import ACME, CASSETTES, build_app, reset_acme_backend, serving
+from tests.app_support import (
+    ACME,
+    CASSETTES,
+    build_app,
+    reset_acme_backend,
+    serving,
+    sync_acme_knowledge,
+)
 
 
 def api_routes(app: FastAPI) -> list[APIRoute]:
@@ -81,8 +88,11 @@ def desk_config(**overrides: Any) -> AppConfig:
 
 
 @pytest.fixture(autouse=True)
-def _fresh_backend() -> None:
+async def _fresh_backend(engine: AsyncEngine) -> None:
+    """Seed account and corpus. The desk tests drive a real conversation, and phase 5 gave the
+    sample pack knowledge that its `llm` nodes now answer from."""
     reset_acme_backend()
+    await sync_acme_knowledge(engine)
 
 
 async def _a_customer_conversation(host: str) -> tuple[str, str]:

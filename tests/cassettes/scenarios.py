@@ -376,6 +376,117 @@ ACME_REFUND = Scenario(
     ),
 )
 
+
+# -- phase 5: an answer the customer will not like, with a source behind it --------------------
+#
+# "Why was my refund refused" is the question the phase's knowledge documents exist for. The
+# denial reason comes from the pack's tool - the charge is outside the 60-day window - and the
+# *rule* behind it comes from the corpus, retrieved by `explain_denial`'s own knowledge block
+# (`query: "refund policy {{ state.denial_reason }}"`). Without a citation the outbound guardrail
+# refuses the sentence and the conversation goes to a person, so this scenario is also the
+# clearest demonstration that the guardrail is wired into the pack a demo runs.
+
+DENIED_ASK = "I want a refund for the extra seats I was charged for in June."
+EXPLAIN_DENIAL = "Explain, using the reason in the state block, why this charge cannot be refunded"
+
+ACME_REFUND_DENIED = Scenario(
+    name="acme_refund_denied",
+    pack_path=ACME,
+    context={
+        "customer": {"ref": "cus_acme_1", "email": "me@example.com", "name": "Sam"},
+    },
+    setup=_reset_acme,
+    # Three turns, not four: `explain_denial` is an `llm` node and does not suspend, so the
+    # whole refund workflow finishes inside the second turn and the third answers "anything
+    # else?". A fourth would open a second root frame and say the same thing twice.
+    turns=[
+        DENIED_ASK,
+        f"The code is {OTP_CODE}.",
+        "I see. That is annoying, but I understand. Nothing else, thanks.",
+    ],
+    rules=(
+        Rule(
+            when=DENIED_ASK,
+            respond=answer(
+                "refund",
+                updates={"intent": "refund", "charge_hint": "extra seats charged in June"},
+            ),
+            purpose="node",
+            uses=1,
+        ),
+        Rule(
+            when=FIND_CHARGE,
+            tool_calls=[ToolCall(id="tu_charges", name="list_recent_charges", arguments={})],
+            uses=1,
+        ),
+        # ch_0900 is 2 June 2026 and the fake billing system's today is 6 September, so the
+        # charge is 96 days old and the tool refuses it as outside the window.
+        Rule(when=FIND_CHARGE, respond=answer("found", updates={"charge_id": "ch_0900"})),
+        Rule(
+            when=EXPLAIN_DENIAL,
+            respond=answer(
+                "accepted",
+                message=(
+                    "I am sorry - that charge was made in June, which is outside the 60-day "
+                    "refund window, so I cannot refund it."
+                ),
+                citations=["k1"],
+            ),
+        ),
+        Rule(
+            when=EXTRACT,
+            respond={"slots": {"code": OTP_CODE}, "unfilled": [], "confidence": 0.95},
+            uses=1,
+        ),
+        Rule(
+            when=EXTRACT,
+            respond={"slots": {"anything_else": "no"}, "unfilled": [], "confidence": 0.9},
+        ),
+        Rule(when=INTERRUPT, respond=_interrupt("continue"), purpose="interrupt"),
+        Rule(when=CLASSIFY, respond=answer("finished", updates={"intent": "finished"})),
+        Rule(
+            when=SUMMARY,
+            respond={
+                "summary": (
+                    "The customer asked for a refund of a June charge for extra seats. It is "
+                    "outside the 60-day window, and they accepted the explanation."
+                )
+            },
+        ),
+    ),
+    expected_path=(
+        "classify",
+        "do_refund",
+        "identity_gate",
+        "send_code",
+        "ask_code",
+        "ask_code",
+        "check_code",
+        "verified_router",
+        "verified",
+        "identity_gate",
+        "find_charge",
+        "fetch_charge",
+        "check_eligibility",
+        "eligibility_router",
+        "explain_denial",
+        "done_denied",
+        "anything_else",
+        "anything_else",
+        "classify",
+        "done_finished",
+    ),
+    expected_authors=(
+        "customer",
+        "agent",
+        "customer",
+        "agent",
+        "agent",
+        "customer",
+    ),
+)
+
+
 # -- the phase 6 exit criterion ---------------------------------------------------------------
 #
 # DESIGN.md section 19 end to end, including the two things phase 6 owns: the interrupt at step 7
@@ -662,6 +773,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     ACME_UNCLEAR,
     ACME_FINISHED_AT_ONCE,
     ACME_REFUND,
+    ACME_REFUND_DENIED,
     ACME_INTERRUPT_DEFERRED,
     ACME_INTERRUPT_SWITCH,
 )
@@ -676,7 +788,7 @@ async def sync_pack_knowledge(pack: Any, engine: AsyncEngine) -> None:
     """
     if not pack.knowledge.documents:
         return
-    ingestor = build_ingestor(pack.path, make_session_factory(engine), store=None)
+    ingestor = build_ingestor(pack.path, make_session_factory(engine), use_qdrant=False)
     for source in pack.knowledge.documents:
         await ingestor.sync_source(source)
 
@@ -724,9 +836,7 @@ async def play(
         engine,
         hooks=hooks,
         llm=service,
-        retriever=build_retriever(
-            pack.knowledge, make_session_factory(engine), use_qdrant=False
-        ),
+        retriever=build_retriever(pack.knowledge, make_session_factory(engine), use_qdrant=False),
     )
     # DESIGN.md section 13, wired after the executor because the sink writes through the
     # executor's own session factory: one database connection story, not two.

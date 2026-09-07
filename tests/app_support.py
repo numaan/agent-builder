@@ -125,6 +125,26 @@ def texts(events: Sequence[dict[str, Any]]) -> list[str]:
     return [event["text"] for event in events if event.get("type") == "message"]
 
 
+async def sync_acme_knowledge(engine: AsyncEngine) -> None:
+    """Index the sample pack's policy documents into the test database (DESIGN.md 9.3).
+
+    An application test that drives the refund workflow needs this for the same reason the demo
+    does: ``tell_done`` answers from the corpus, and the citation guardrail turns an ungrounded
+    timing into a handoff. The tables are truncated per test, so this runs per test too - a
+    corpus of two documents costs milliseconds and buys a test that is about what it says it is
+    about.
+    """
+    from support_core.knowledge.wiring import build_ingestor
+    from support_core.storage.session import make_session_factory
+
+    pack = load_pack(ACME)
+    # No Qdrant: an application test must run on a machine that has only Postgres, and the vector
+    # side is covered where it belongs (tests/test_knowledge_retrieval.py).
+    ingestor = build_ingestor(pack.path, make_session_factory(engine), use_qdrant=False)
+    for source in pack.knowledge.documents:
+        await ingestor.sync_source(source)
+
+
 def reset_acme_backend() -> None:
     """Put the sample pack's in-memory billing system and passcodes back to seed.
 

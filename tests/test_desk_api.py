@@ -23,7 +23,15 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from support_core.api import AppConfig
-from tests.app_support import ACME, CASSETTES, build_app, chatting, reset_acme_backend, serving
+from tests.app_support import (
+    ACME,
+    CASSETTES,
+    build_app,
+    chatting,
+    reset_acme_backend,
+    serving,
+    sync_acme_knowledge,
+)
 from tests.test_desk_auth import DESK_AUTH, DESK_TOKEN
 
 ACCOUNT_QUESTION = "Why was I charged 40 dollars on the 3rd?"
@@ -66,8 +74,11 @@ async def _handed_off(host: str, session: str) -> dict[str, Any]:
 
 
 @pytest.fixture(autouse=True)
-def _fresh_backend() -> None:
+async def _fresh_backend(engine: AsyncEngine) -> None:
+    """Seed account and corpus. The desk tests drive a real conversation, and phase 5 gave the
+    sample pack knowledge that its `llm` nodes now answer from."""
     reset_acme_backend()
+    await sync_acme_knowledge(engine)
 
 
 async def test_the_queue_lists_what_is_waiting_and_why(engine: AsyncEngine) -> None:

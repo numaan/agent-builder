@@ -32,6 +32,7 @@ from tests.app_support import (
     chatting,
     reset_acme_backend,
     serving,
+    sync_acme_knowledge,
 )
 from tests.cassettes.scenarios import ACME_REFUND, SCENARIOS
 
@@ -166,6 +167,7 @@ async def test_a_turn_that_fails_still_says_something_to_the_customer(
     not in the customer's transcript.
     """
     reset_acme_backend()
+    await sync_acme_knowledge(engine)
     app = build_app(ACME, engine, config=acme_config())
     async with serving(app) as host, chatting(host, "failing-turn-01") as chat:
         await chat.ready()
@@ -215,6 +217,7 @@ async def test_the_refund_conversation_runs_through_the_socket_with_the_confirma
     refund in the billing system, authorised by one approval.
     """
     reset_acme_backend()
+    await sync_acme_knowledge(engine)
     app = build_app(ACME, engine, config=acme_config())
     async with serving(app) as host, chatting(host, "refund-demo-0001") as chat:
         ready = await chat.ready()
@@ -269,6 +272,7 @@ async def test_a_suspended_conversation_resumes_on_a_second_connection(
     the *first* one was asked. The confirmation then arrives on the second connection.
     """
     reset_acme_backend()
+    await sync_acme_knowledge(engine)
     app = build_app(ACME, engine, config=acme_config())
     async with serving(app) as host:
         async with chatting(host, "reconnect-demo-01") as first:
