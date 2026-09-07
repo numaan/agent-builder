@@ -6,10 +6,15 @@
    1. The conversation is identified by a *session key*, never by this connection. The key is
       kept in localStorage, sent in the socket's opening `hello` frame, and reused after a
       reload, a dropped network or a server restart - which is how a conversation suspended
-      waiting for the customer (DESIGN.md 7.2) resumes on a different connection. In a frame and
-      not in the URL: the key is the whole of this channel's access control, and a query string
-      is written verbatim into every access log between the browser and the app (review finding
-      W9).
+      waiting for the customer (DESIGN.md 7.2) resumes on a different connection.
+
+      In a frame and *never* in the URL, in both directions. The key is the whole of this
+      channel's access control, so a query string is two holes at once: it is written verbatim
+      into every access log between the browser and the app, and a link someone was sent could
+      seat their conversation on a key its sender already holds. The security review of
+      2026-09-07 demonstrated the second one - it read a customer's own message back from a
+      second connection - so this page ignores a `session` parameter and strips it from the
+      address bar rather than honouring it (review finding W9, and its unfixed half).
    2. A confirmation is not an ordinary message. When the run is waiting on a `confirm` node the
       page says so loudly, names the action, and shows the exact proposal the approval is bound
       to. Nothing moves until the customer answers.
@@ -50,11 +55,26 @@ const state = {
   fatal: false,
 };
 
-function readSession() {
-  const fromUrl = new URLSearchParams(window.location.search).get("session");
-  if (fromUrl) {
-    return fromUrl;
+function discardSessionInUrl() {
+  /* A `session` parameter is not a way to resume a conversation, it is a way to be handed
+     someone else's. Drop it before anything reads it, and take it out of the address bar so it
+     stops travelling in history, bookmarks and referrers. */
+  const params = new URLSearchParams(window.location.search);
+  if (!params.has("session")) {
+    return;
   }
+  params.delete("session");
+  const query = params.toString();
+  const clean = window.location.pathname + (query ? "?" + query : "") + window.location.hash;
+  try {
+    window.history.replaceState(null, "", clean);
+  } catch (error) {
+    /* nothing to do: some embeddings forbid it, and the key is ignored either way */
+  }
+}
+
+function readSession() {
+  /* localStorage only. See the note at the top of this file on why not the URL. */
   try {
     return window.localStorage.getItem(SESSION_STORAGE_KEY);
   } catch (error) {
@@ -266,6 +286,7 @@ el.restart.addEventListener("click", () => {
   }, 50);
 });
 
+discardSessionInUrl();
 state.session = readSession();
 if (state.session) {
   el.sessionKey.textContent = state.session;
