@@ -234,7 +234,7 @@ async def test_every_chunk_is_written_with_a_vector_of_the_column_s_width(
     async with make_session_factory(engine)() as session, session.begin():
         rows = (await session.execute(select(DocChunk.embedding))).scalars().all()
     assert rows
-    assert all(len(vector) == DIMENSIONS for vector in rows)
+    assert all(vector is not None and len(vector) == DIMENSIONS for vector in rows)
 
 
 async def test_a_vector_of_the_wrong_width_is_refused_by_name(

@@ -237,7 +237,7 @@ async def test_a_pool_timeout_is_a_503_with_a_retry_after(engine: AsyncEngine) -
         raise SQLTimeoutError("QueuePool limit of size 5 overflow 10 reached")
 
     async with serving(app) as host, httpx.AsyncClient(base_url=f"http://{host}") as client:
-        app.state.runtime.executor.on_inbound = no_connection  # type: ignore[method-assign]
+        app.state.runtime.executor.on_inbound = no_connection
         response = await client.post(
             "/channels/web_chat/messages", json={"session": "refused-01", "text": "hello"}
         )

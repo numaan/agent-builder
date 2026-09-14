@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from support_core import load_pack
 from support_core.engine import Executor
+from support_core.knowledge.composite import CompositeRetriever
 from support_core.knowledge.embedding import DeterministicEncoder
 from support_core.knowledge.qdrant import alias_name, collection_name
 from support_core.knowledge.wiring import build_retriever
@@ -332,8 +333,8 @@ async def test_retrieval_happens_outside_the_checkpoint_transaction(
 
     executor = build(engine, "Within 60 days.")
     order: list[str] = []
-    inner = executor.retriever
-    assert inner is not None
+    assert executor.retriever is not None
+    inner: CompositeRetriever = executor.retriever
 
     class Watched:
         name = "watched"

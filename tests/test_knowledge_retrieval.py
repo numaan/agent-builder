@@ -15,13 +15,16 @@ Three claims are being checked and they are not equally important:
 3. Each backend finds what it should, and the merge prefers what more than one of them found.
 """
 
+from collections.abc import Sequence
+from pathlib import Path
+
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from support_core.knowledge.composite import CompositeRetriever
 from support_core.knowledge.document import fuse
 from support_core.knowledge.embedding import DeterministicEncoder, maxsim, tokenize
-from support_core.knowledge.qdrant import alias_name, collection_name
+from support_core.knowledge.qdrant import QdrantStore, alias_name, collection_name
 from support_core.knowledge.types import Passage, RetrieverUnavailable
 from tests.knowledge_support import (
     FakeRetriever,
@@ -62,15 +65,15 @@ A refund by bank transfer takes three to five business days.
 }
 
 
-def locators(passages: object) -> list[str]:
-    return [p.locator for p in passages]  # type: ignore[union-attr]
+def locators(passages: Sequence[Passage]) -> list[str]:
+    return [p.locator for p in passages]
 
 
 # -- the Postgres halves -----------------------------------------------------------------------
 
 
 async def test_the_lexical_half_finds_the_section_whose_words_match(
-    engine: AsyncEngine, tmp_path
+    engine: AsyncEngine, tmp_path: Path
 ) -> None:
     await synced(engine, tmp_path, CORPUS)
     found = await document_retriever(engine).lexical("duplicate charge", 3)
@@ -81,7 +84,7 @@ async def test_the_lexical_half_finds_the_section_whose_words_match(
 
 
 async def test_the_dense_half_finds_the_same_section_without_the_exact_words(
-    engine: AsyncEngine, tmp_path
+    engine: AsyncEngine, tmp_path: Path
 ) -> None:
     """The stand-in encoder is a hashed projection with character trigrams, so it matches
     morphological variants - "refundable" against "refunded" - and not synonyms. That limit is
@@ -95,7 +98,7 @@ async def test_the_dense_half_finds_the_same_section_without_the_exact_words(
 
 
 async def test_a_lexical_query_of_pure_punctuation_returns_nothing_rather_than_anything(
-    engine: AsyncEngine, tmp_path
+    engine: AsyncEngine, tmp_path: Path
 ) -> None:
     """An empty tsquery matches everything at rank zero, which is an arbitrary k rows presented
     as evidence."""
@@ -104,14 +107,14 @@ async def test_a_lexical_query_of_pure_punctuation_returns_nothing_rather_than_a
 
 
 async def test_a_retriever_scoped_to_a_source_cannot_see_another(
-    engine: AsyncEngine, tmp_path
+    engine: AsyncEngine, tmp_path: Path
 ) -> None:
     await synced(engine, tmp_path, CORPUS)
     scoped = document_retriever(engine, source_ids=["some-other-pack"])
     assert await scoped.lexical("duplicate charge", 3) == []
 
 
-async def test_stale_chunks_are_not_retrieved(engine: AsyncEngine, tmp_path) -> None:
+async def test_stale_chunks_are_not_retrieved(engine: AsyncEngine, tmp_path: Path) -> None:
     """The live version is what a customer's next question meets; the old rows stay for the
     trace."""
     await synced(engine, tmp_path, CORPUS)
@@ -128,7 +131,9 @@ async def test_stale_chunks_are_not_retrieved(engine: AsyncEngine, tmp_path) -> 
 # -- the vector side ---------------------------------------------------------------------------
 
 
-async def test_colbert_scores_late_interaction_over_qdrant(engine: AsyncEngine, tmp_path, qdrant):
+async def test_colbert_scores_late_interaction_over_qdrant(
+    engine: AsyncEngine, tmp_path: Path, qdrant: QdrantStore
+) -> None:
     """MaxSim over a multivector collection, which is the whole reason Qdrant is here."""
     await synced(engine, tmp_path, CORPUS, store=qdrant)
     found = await colbert_retriever(engine, qdrant, ["policy-docs"]).retrieve(
@@ -144,7 +149,7 @@ async def test_colbert_scores_late_interaction_over_qdrant(engine: AsyncEngine, 
 
 
 async def test_a_sync_builds_a_new_collection_and_flips_the_alias(
-    engine: AsyncEngine, tmp_path, qdrant
+    engine: AsyncEngine, tmp_path: Path, qdrant: QdrantStore
 ) -> None:
     """Versions are collections, not rows. This is what makes "an older trace still names the old
     version" exact: the collection that produced the old answer is still there, unchanged."""
@@ -174,7 +179,7 @@ async def test_a_sync_builds_a_new_collection_and_flips_the_alias(
 
 
 async def test_retention_drops_the_oldest_collection_and_keeps_the_rest(
-    engine: AsyncEngine, tmp_path, qdrant
+    engine: AsyncEngine, tmp_path: Path, qdrant: QdrantStore
 ) -> None:
     for marker in ("60", "70", "80", "90"):
         edited = dict(CORPUS)
@@ -193,7 +198,7 @@ async def test_retention_drops_the_oldest_collection_and_keeps_the_rest(
 
 
 async def test_the_lexical_half_still_answers_when_qdrant_is_not_there(
-    engine: AsyncEngine, tmp_path
+    engine: AsyncEngine, tmp_path: Path
 ) -> None:
     """The claim the second store was accepted on, against a port nothing listens on.
 
@@ -245,7 +250,7 @@ async def test_a_backend_that_raises_something_other_than_unavailable_is_a_bug_a
 
 
 async def test_a_missing_collection_degrades_that_source_and_not_the_backend(
-    engine: AsyncEngine, tmp_path, qdrant
+    engine: AsyncEngine, tmp_path: Path, qdrant: QdrantStore
 ) -> None:
     """A pack that declares a source nobody has synced yet must not lose the vector side for the
     sources that *are* there."""
@@ -309,7 +314,7 @@ async def test_a_composite_with_no_backends_answers_empty_rather_than_failing() 
     assert (await CompositeRetriever([]).gather(request("x"))).passages == ()
 
 
-async def test_the_composite_never_returns_more_than_k(engine: AsyncEngine, tmp_path) -> None:
+async def test_the_composite_never_returns_more_than_k(engine: AsyncEngine, tmp_path: Path) -> None:
     await synced(engine, tmp_path, CORPUS)
     merged = composite(document_retriever(engine, source_ids=["policy-docs"]))
     assert len(await merged.retrieve(request("refund", k=2))) <= 2
