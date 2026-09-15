@@ -32,7 +32,7 @@ from tests.app_support import (
     serving,
     sync_acme_knowledge,
 )
-from tests.cassettes.scenarios import ACME_REFUND
+from tests.cassettes.scenarios import ACME_INTERRUPT_DEFERRED, ACME_REFUND
 
 QUEUE_PACK = TEST_PACKS / "queue_pack"
 REFUND_ASK, OTP_REPLY, APPROVE, FINISH = ACME_REFUND.turns
@@ -267,6 +267,62 @@ def test_the_translator_maps_a_confirm_gate_to_a_tool_call() -> None:
     assert turn[1]["toolCallName"] == "issue_refund"
     assert json.loads(turn[2]["delta"])["proposal"] == "I can refund 29.00 USD. Shall I go ahead?"
     assert translator.done is True
+
+
+def test_the_translator_maps_a_form_gate_to_a_render_form_tool_call() -> None:
+    """A gate whose node declares a form becomes a ``render_form`` tool call carrying the schema,
+    and the (large) schema is kept out of the state snapshot."""
+    translator = RunTranslator("thread-x", "run-x")
+    form = {
+        "title": "Confirm address",
+        "sections": [
+            {"title": "Address", "fields": [{"key": "line1", "label": "Line 1", "type": "text"}]}
+        ],
+    }
+    turn = translator.translate(
+        {
+            "type": "turn",
+            "status": "waiting_customer",
+            "awaiting": {
+                "kind": "confirm",
+                "node": "confirm_change",
+                "tool": "set_address",
+                "form": form,
+            },
+        }
+    )
+    assert [e["type"] for e in turn] == [
+        "STATE_SNAPSHOT",
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+    ]
+    assert turn[1]["toolCallName"] == "render_form"
+    assert json.loads(turn[2]["delta"])["title"] == "Confirm address"
+    # the proposal tool call is not also emitted, and the schema is not duplicated in the snapshot
+    assert "form" not in (turn[0]["snapshot"]["awaiting"] or {})
+
+
+async def test_the_address_confirm_renders_as_a_form_over_ag_ui(engine: AsyncEngine) -> None:
+    """End to end: the Acme pack declares a form for ``confirm_change``, so when that gate opens the
+    AG-UI stream carries a ``render_form`` tool call with the address schema instead of a plain
+    approval."""
+    reset_acme_backend()
+    await sync_acme_knowledge(engine)
+    app = build_app(ACME, engine, config=acme_config())
+    thread = "agui-form-0001"
+    async with serving(app) as host, httpx.AsyncClient(base_url=f"http://{host}") as client:
+        events: list[dict[str, Any]] = []
+        for turn in ACME_INTERRUPT_DEFERRED.turns:
+            events = await run_agui(client, turn, thread_id=thread)
+
+    # The last turn lands on confirm_change, which has a declared form.
+    assert tools_called(events) == ["render_form"]
+    args = "".join(e["delta"] for e in events if e["type"] == "TOOL_CALL_ARGS")
+    schema = json.loads(args)
+    keys = [f["key"] for s in schema["sections"] for f in s["fields"]]
+    assert {"line1", "postcode", "country", "authorized"} <= set(keys)
+    assert snapshots(events)[-1]["awaiting"].get("form") is None  # schema not duplicated
 
 
 def test_the_translator_maps_a_question_gate_to_state_only() -> None:

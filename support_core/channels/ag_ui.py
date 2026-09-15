@@ -169,17 +169,26 @@ class RunTranslator:
     def _turn(self, frame: Mapping[str, Any]) -> list[dict[str, Any]]:
         awaiting = frame.get("awaiting")
         summary = awaiting if isinstance(awaiting, Mapping) else None
+        form = summary.get("form") if summary else None
+        # Keep the (possibly large) form schema out of the state snapshot; it rides the tool call.
+        snapshot_awaiting = {k: v for k, v in summary.items() if k != "form"} if summary else None
         events: list[dict[str, Any]] = [
             {
                 "type": STATE_SNAPSHOT,
-                "snapshot": {
-                    "status": frame.get("status"),
-                    "awaiting": dict(summary) if summary else None,
-                },
+                "snapshot": {"status": frame.get("status"), "awaiting": snapshot_awaiting},
             }
         ]
-        # A confirm gate is a tool call the front end renders as an approval.
-        if summary and summary.get("kind") == "confirm" and summary.get("tool"):
+        if summary and form:
+            # Generative UI: the node declares a form, so it is rendered rather than answered as
+            # free text. The front end renders `render_form`'s schema and returns the values.
+            call_id = f"{self.run_id}-form-{summary.get('node') or 'form'}"
+            events += [
+                {"type": TOOL_CALL_START, "toolCallId": call_id, "toolCallName": "render_form"},
+                {"type": TOOL_CALL_ARGS, "toolCallId": call_id, "delta": json.dumps(form)},
+                {"type": TOOL_CALL_END, "toolCallId": call_id},
+            ]
+        elif summary and summary.get("kind") == "confirm" and summary.get("tool"):
+            # A confirm gate with no form is a tool call the front end renders as an approval.
             tool = str(summary["tool"])
             call_id = f"{self.run_id}-approve-{summary.get('node') or tool}"
             args = json.dumps({"proposal": self._last_agent_text})

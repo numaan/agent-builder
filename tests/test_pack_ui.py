@@ -13,7 +13,7 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from support_core.api import AppConfig
-from support_core.graph.manifest import PackUI
+from support_core.graph.manifest import FormField, FormSchema, FormSection, PackUI
 from tests.app_support import (
     ACME,
     CASSETTES,
@@ -116,3 +116,60 @@ def test_pack_ui_defaults_are_empty() -> None:
     assert ui.accent is None
     assert ui.suggestions == []
     assert ui.dir == "ui"
+    assert ui.forms == {}
+
+
+# -- form schema constraints ---------------------------------------------------------------
+
+
+def _text(key: str = "line1") -> FormField:
+    return FormField(key=key, label="Line 1", type="text")
+
+
+def test_a_choice_field_requires_options() -> None:
+    with pytest.raises(ValidationError):
+        FormField(key="country", label="Country", type="select")
+
+
+def test_a_non_choice_field_rejects_options() -> None:
+    from support_core.graph.manifest import FormOption
+
+    with pytest.raises(ValidationError):
+        FormField(
+            key="line1", label="Line 1", type="text", options=[FormOption(value="a", label="A")]
+        )
+
+
+def test_a_field_pattern_must_compile() -> None:
+    with pytest.raises(ValidationError):
+        FormField(key="postcode", label="Postcode", type="text", pattern="[unterminated")
+
+
+def test_a_field_key_must_be_an_identifier() -> None:
+    with pytest.raises(ValidationError):
+        FormField(key="Not A Key", label="x", type="text")
+
+
+def test_form_field_keys_are_unique_across_sections() -> None:
+    section = FormSection(title="A", fields=[_text("dup")])
+    other = FormSection(title="B", fields=[_text("dup")])
+    with pytest.raises(ValidationError):
+        FormSchema(title="Form", sections=[section, other])
+
+
+def test_a_valid_form_schema_builds() -> None:
+    schema = FormSchema(
+        title="Confirm address",
+        sections=[FormSection(title="Address", fields=[_text("line1"), _text("city")])],
+    )
+    assert [f.key for s in schema.sections for f in s.fields] == ["line1", "city"]
+
+
+def test_the_acme_pack_declares_a_form_for_confirm_change() -> None:
+    """The example that the AG-UI transport renders as a tool call."""
+    from support_core import load_pack
+
+    forms = load_pack(ACME).manifest.ui.forms
+    assert "confirm_change" in forms
+    keys = [f.key for s in forms["confirm_change"].sections for f in s.fields]
+    assert {"line1", "city", "postcode", "country", "authorized"} <= set(keys)

@@ -11,6 +11,7 @@ const el = {
   approval: document.getElementById("approval"),
   approvalTool: document.getElementById("approval-tool"),
   approvalPrompt: document.getElementById("approval-prompt"),
+  formHost: document.getElementById("form-host"),
   suggestions: document.getElementById("suggestions"),
   composer: document.getElementById("composer"),
   message: document.getElementById("message"),
@@ -59,6 +60,180 @@ function showApproval(tool, proposal) {
   el.approval.hidden = false;
 }
 
+// Generative UI: build a form from a render_form tool call's schema, validate it, and send the
+// values back as the next message. Labels come from the trusted pack, and every value goes in as
+// textContent, so there is no injection from the rendered form.
+function buildField(field) {
+  const wrap = document.createElement("div");
+  wrap.className = "fld";
+  wrap.dataset.key = field.key;
+  const id = "pf_" + field.key;
+  const addLabel = (forId, text) => {
+    const l = document.createElement("label");
+    l.className = "l";
+    if (forId) l.setAttribute("for", forId);
+    l.textContent = text;
+    if (field.required) {
+      const s = document.createElement("span");
+      s.className = "req";
+      s.textContent = "*";
+      l.appendChild(s);
+    }
+    wrap.appendChild(l);
+  };
+  if (field.type === "select") {
+    addLabel(id, field.label);
+    const sel = document.createElement("select");
+    sel.id = id;
+    for (const o of field.options || []) {
+      const opt = document.createElement("option");
+      opt.value = o.value;
+      opt.textContent = o.label;
+      sel.appendChild(opt);
+    }
+    wrap.appendChild(sel);
+  } else if (field.type === "radio" || field.type === "checklist") {
+    addLabel(null, field.label);
+    for (const o of field.options || []) {
+      const lab = document.createElement("label");
+      lab.className = "opt";
+      const inp = document.createElement("input");
+      inp.type = field.type === "checklist" ? "checkbox" : "radio";
+      inp.name = id;
+      inp.value = o.value;
+      const sp = document.createElement("span");
+      sp.textContent = o.label;
+      lab.append(inp, sp);
+      wrap.appendChild(lab);
+    }
+  } else if (field.type === "checkbox") {
+    const lab = document.createElement("label");
+    lab.className = "opt";
+    const inp = document.createElement("input");
+    inp.type = "checkbox";
+    inp.id = id;
+    const sp = document.createElement("span");
+    sp.textContent = field.label;
+    if (field.required) {
+      const s = document.createElement("span");
+      s.className = "req";
+      s.textContent = "*";
+      sp.appendChild(s);
+    }
+    lab.append(inp, sp);
+    wrap.appendChild(lab);
+  } else {
+    addLabel(id, field.label);
+    const inp = document.createElement("input");
+    inp.type = field.type === "email" ? "email" : field.type === "date" ? "date" : "text";
+    inp.id = id;
+    wrap.appendChild(inp);
+  }
+  if (field.hint) {
+    const h = document.createElement("div");
+    h.className = "hint";
+    h.textContent = field.hint;
+    wrap.appendChild(h);
+  }
+  const err = document.createElement("div");
+  err.className = "err";
+  err.hidden = true;
+  wrap.appendChild(err);
+  return wrap;
+}
+
+function renderForm(schema) {
+  el.approval.hidden = true;
+  const host = el.formHost;
+  host.innerHTML = "";
+  const title = document.createElement("h3");
+  title.textContent = schema.title || "Please complete this form";
+  host.appendChild(title);
+  if (schema.intro) {
+    const intro = document.createElement("p");
+    intro.className = "intro";
+    intro.textContent = schema.intro;
+    host.appendChild(intro);
+  }
+  const all = [];
+  for (const section of schema.sections || []) {
+    if (section.title) {
+      const s = document.createElement("div");
+      s.className = "sec";
+      s.textContent = section.title;
+      host.appendChild(s);
+    }
+    for (const field of section.fields || []) {
+      host.appendChild(buildField(field));
+      all.push(field);
+    }
+  }
+  const byKey = Object.fromEntries(all.map((f) => [f.key, f]));
+  const actions = document.createElement("div");
+  actions.className = "pactions";
+  const submit = document.createElement("button");
+  submit.type = "button";
+  submit.textContent = schema.submit_label || "Submit";
+  actions.appendChild(submit);
+  host.appendChild(actions);
+  host.hidden = false;
+
+  const nodeFor = (key) => host.querySelector('.fld[data-key="' + key + '"]');
+  function raw(field) {
+    const n = nodeFor(field.key);
+    if (!n) return field.type === "checklist" ? [] : "";
+    if (field.type === "checkbox") return n.querySelector("input").checked;
+    if (field.type === "checklist")
+      return [...n.querySelectorAll("input:checked")].map((i) => i.value);
+    if (field.type === "radio") {
+      const c = n.querySelector("input:checked");
+      return c ? c.value : "";
+    }
+    const inp = n.querySelector("input, select");
+    return inp ? inp.value.trim() : "";
+  }
+  const visible = (f) => !f.show_if || raw(byKey[f.show_if.field]) === f.show_if.equals;
+  const needed = (f) =>
+    f.required || (f.required_if && raw(byKey[f.required_if.field]) === f.required_if.equals);
+  function refresh() {
+    for (const f of all) {
+      const n = nodeFor(f.key);
+      if (n) n.style.display = visible(f) ? "" : "none";
+    }
+  }
+  host.addEventListener("input", refresh);
+  host.addEventListener("change", refresh);
+  refresh();
+
+  submit.addEventListener("click", () => {
+    let ok = true;
+    const parts = [];
+    for (const f of all) {
+      const n = nodeFor(f.key);
+      const err = n.querySelector(".err");
+      let msg = "";
+      if (visible(f)) {
+        const v = raw(f);
+        const empty = v === "" || v === false || (Array.isArray(v) && v.length === 0);
+        if (needed(f) && empty) msg = f.type === "checkbox" ? "Please confirm." : "Required.";
+        else if (f.type === "email" && v && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v))
+          msg = "Enter a valid email.";
+        else if (f.pattern && v && !new RegExp(f.pattern).test(v)) msg = "Doesn't match the format.";
+        if (!msg && !empty) {
+          const shown = Array.isArray(v) ? v.join(", ") : v === true ? "yes" : v;
+          parts.push(f.label.replace(/\s*\*$/, "") + ": " + shown);
+        }
+      }
+      err.textContent = msg;
+      err.hidden = !msg;
+      if (msg) ok = false;
+    }
+    if (!ok) return;
+    host.hidden = true;
+    send("Here are the details — " + parts.join("; "));
+  });
+}
+
 async function loadInfo() {
   try {
     const resp = await fetch("/channels/ag_ui", { headers: { accept: "application/json" } });
@@ -102,13 +277,22 @@ function handleEvent(event) {
       break;
     case "TOOL_CALL_END":
       if (state.tool) {
-        let proposal = "";
-        try {
-          proposal = JSON.parse(state.tool.args).proposal || "";
-        } catch {
-          proposal = "";
+        if (state.tool.name === "render_form") {
+          // Generative UI: the agent asked us to render a form. Draw it from the schema.
+          try {
+            renderForm(JSON.parse(state.tool.args));
+          } catch {
+            note("The assistant sent a form we could not read.", true);
+          }
+        } else {
+          let proposal = "";
+          try {
+            proposal = JSON.parse(state.tool.args).proposal || "";
+          } catch {
+            proposal = "";
+          }
+          showApproval(state.tool.name, proposal);
         }
-        showApproval(state.tool.name, proposal);
         state.tool = null;
       }
       break;
@@ -186,6 +370,7 @@ async function send(text) {
   if (!message) return;
   el.message.value = "";
   el.approval.hidden = true;
+  el.formHost.hidden = true;
   say("customer", message);
   await runTurn(message);
 }
@@ -199,6 +384,7 @@ el.restart.addEventListener("click", () => {
   state.threadId = uuid();
   el.transcript.innerHTML = "";
   el.approval.hidden = true;
+  el.formHost.hidden = true;
   note("New conversation. Say something to begin.");
 });
 

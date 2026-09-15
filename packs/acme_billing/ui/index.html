@@ -73,6 +73,25 @@
                          border-radius: 8px; padding: 10px 16px; cursor: pointer; }
       .note { min-height: 1.4em; margin: 10px 2px 0; font-size: 13px; color: var(--muted); }
       .note.warn { color: #b42318; }
+      .pform { border: 1px solid var(--line); border-radius: 12px; padding: 15px 16px;
+               margin-bottom: 14px; background: var(--card); }
+      .pform h3 { margin: 0 0 4px; font-size: 16px; }
+      .pform .intro { margin: 0 0 12px; font-size: 13px; color: var(--muted); }
+      .pform .sec { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+                    color: var(--muted); margin: 14px 0 8px; }
+      .pform .fld { margin-bottom: 10px; }
+      .pform label.l { display: block; font-size: 13px; font-weight: 500; margin-bottom: 4px; }
+      .pform input[type="text"], .pform input[type="email"], .pform input[type="date"],
+      .pform select { width: 100%; font: inherit; font-size: 14px; padding: 8px 10px;
+                      border: 1px solid var(--line); border-radius: 8px; background: var(--paper);
+                      color: var(--ink); }
+      .pform .opt { display: flex; gap: 8px; align-items: center; font-size: 14px; margin: 4px 0; }
+      .pform .req { color: var(--accent); margin-left: 2px; }
+      .pform .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+      .pform .err { color: #b42318; font-size: 12px; margin-top: 3px; }
+      .pform .pactions { margin-top: 14px; }
+      .pform button { font: inherit; font-weight: 600; color: #fff; background: var(--accent);
+                      border: 0; border-radius: 8px; padding: 9px 15px; cursor: pointer; }
       .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden;
                          clip: rect(0 0 0 0); }
       [hidden] { display: none !important; }
@@ -89,6 +108,8 @@
 
     <main>
       <ol class="transcript" id="transcript" aria-live="polite" aria-label="Conversation"></ol>
+
+      <section class="pform" id="form-host" hidden aria-label="Form from the assistant"></section>
 
       <section class="approval" id="approval" hidden role="region" aria-labelledby="approval-title">
         <h2 id="approval-title">Your approval is needed</h2>
