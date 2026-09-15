@@ -223,6 +223,13 @@ def create_app(
         app.include_router(desk_router(runtime, token=desk_token))
     if settings.serve_client:
         app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+        # A pack may ship its own front end (DESIGN.md section 12). When it does, serve it at
+        # `/app` beside the built-in demo pages - the same `serve_client` gate, so a deployment
+        # with its own hosting turns both off together. `ui.dir` is validated to a single segment
+        # inside the pack, and a pack that ships no UI mounts nothing.
+        pack_ui = pack.path / pack.manifest.ui.dir
+        if pack_ui.is_dir():
+            app.mount("/app", StaticFiles(directory=pack_ui, html=True), name="pack-ui")
     return app
 
 
@@ -304,6 +311,10 @@ def _routes(runtime: AppRuntime) -> APIRouter:
                 "provider": runtime.provider_name,
                 "pack": runtime.pack.manifest.id,
                 "suggestions": list(runtime.config.suggestions),
+                # The pack's own branding and starter messages, so a pack front end (and the
+                # generic client) can theme per-pack with no assets. `suggestions` above stays the
+                # deployment's (the demo config); `ui.suggestions` is the pack's own.
+                "ui": json.loads(runtime.pack.manifest.ui.model_dump_json()),
             }
         )
 

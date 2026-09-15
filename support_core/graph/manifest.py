@@ -222,6 +222,38 @@ class TimeoutsConfig(BaseModel):
         return rule
 
 
+class PackUI(BaseModel):
+    """A pack's own front end (DESIGN.md section 12's "own front end").
+
+    A pack may ship static assets under :attr:`dir` (default ``ui/``); the service mounts them at
+    ``/app`` when :attr:`support_core.api.config.AppConfig.serve_client` is on, so a domain team's
+    branded chat lives in the same bundle as its graphs and tools. The other fields are branding
+    the generic AG-UI client (and a pack's own) reads from ``GET /channels/ag_ui`` - so a pack can
+    be themed with no assets at all.
+
+    ``accent`` is constrained to a hex colour on purpose: it is echoed to a browser and a client
+    that drops it into a stylesheet would otherwise be an injection point.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = None
+    subtitle: str | None = None
+    accent: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{3,8}$")
+    suggestions: list[str] = Field(default_factory=list)
+    dir: str = "ui"
+    """Directory of static assets, relative to the pack root. One path segment - never a traversal
+    out of the pack: a pack describes its own bundle, not the filesystem around it."""
+
+    @field_validator("dir")
+    @classmethod
+    def _dir_is_a_safe_segment(cls, value: str) -> str:
+        if value in {"", ".", ".."} or "/" in value or "\\" in value:
+            msg = "ui.dir must be a single directory name inside the pack, not a path"
+            raise ValueError(msg)
+        return value
+
+
 class PackManifest(BaseModel):
     """Parsed ``pack.yaml``. Unknown keys are rejected."""
 
@@ -242,6 +274,7 @@ class PackManifest(BaseModel):
     timeouts: TimeoutsConfig = Field(default_factory=TimeoutsConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     guardrails: GuardrailsConfig = Field(default_factory=GuardrailsConfig)
+    ui: PackUI = Field(default_factory=PackUI)
 
     @field_validator("version")
     @classmethod

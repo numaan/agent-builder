@@ -134,10 +134,13 @@ for a confirm gate, STATE_SNAPSHOT, RUN_FINISHED).
 
 ## Run (human path) — the browser
 
-Open <http://127.0.0.1:8000/> (WebSocket UI) or <http://127.0.0.1:8000/agui> (AG-UI
-SSE UI) in a browser — Windows `localhost:8000` reaches the WSL server. Click the
-suggested messages in order; watch the bordered "Your approval is needed" panel gate
-the refund. Useful for a look; the drivers are what prove it works.
+Three pages: <http://127.0.0.1:8000/> (built-in WebSocket UI),
+<http://127.0.0.1:8000/agui> (built-in AG-UI SSE UI), and
+<http://127.0.0.1:8000/app/> (the **pack's own** front end, shipped in
+`packs/acme_billing/ui/` and served when it exists). Windows `localhost:8000` reaches
+the WSL server. Click the suggested messages in order; watch the bordered "Your
+approval is needed" panel gate the refund. Useful for a look; the drivers are what
+prove it works.
 
 ## Test
 
