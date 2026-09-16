@@ -355,7 +355,9 @@ class AppRuntime:
                 conversation_id=conversation_id,
                 session=conversation.channel_key if conversation is not None else None,
                 status=run.status if run is not None else "idle",
-                awaiting=AwaitingSummary.of(run.awaiting if run is not None else None),
+                awaiting=self._awaiting_with_form(
+                    AwaitingSummary.of(run.awaiting if run is not None else None)
+                ),
                 history=[
                     {
                         "author": row.author,
@@ -365,6 +367,21 @@ class AppRuntime:
                     for row in rows
                 ],
             )
+
+    def _awaiting_with_form(self, awaiting: AwaitingSummary | None) -> AwaitingSummary | None:
+        """Attach the pack's form for the waiting node, if it declares one.
+
+        Rendering is a pack concern, not an engine one: the run's ``awaiting`` says *which* node is
+        waiting, and the pack's :attr:`~support_core.graph.manifest.PackUI.forms` says how to render
+        that node's input. A node with no declared form is unchanged, so a pack that ships no forms
+        pays a dictionary lookup and nothing else.
+        """
+        if awaiting is None or awaiting.node is None:
+            return awaiting
+        form = self.pack.manifest.ui.forms.get(awaiting.node)
+        if form is None:
+            return awaiting
+        return awaiting.model_copy(update={"form": form})
 
 
 def build_runtime(

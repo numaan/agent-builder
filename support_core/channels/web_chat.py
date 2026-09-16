@@ -38,6 +38,7 @@ from support_core.channels.base import (
     InboundRejected,
 )
 from support_core.engine.types import OutboundMessage
+from support_core.graph.manifest import FormSchema
 
 CHANNEL = "web_chat"
 
@@ -226,6 +227,11 @@ class AwaitingSummary(BaseModel):
 
     node: str | None = None
     tool: str | None = None
+    form: FormSchema | None = None
+    """The pack's form for this node, when it declares one (:attr:`PackUI.forms`). Filled by the
+    runtime from the pack, not by the engine: it is how the node is *rendered*, not part of what
+    the run is waiting for. A client that has one shows a form; a client that does not falls back
+    to a text reply, and both resume the same gate."""
 
     @classmethod
     def of(cls, awaiting: Mapping[str, Any] | None) -> "AwaitingSummary | None":

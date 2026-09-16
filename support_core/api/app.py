@@ -54,9 +54,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import APIRouter, FastAPI, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
 from sqlalchemy.exc import TimeoutError as SQLTimeoutError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -64,6 +65,7 @@ from support_core.api.config import AppConfig
 from support_core.api.desk import desk_router
 from support_core.api.runtime import AppRuntime, build_runtime
 from support_core.channels import ChannelAdapter, ChatState, InboundRejected
+from support_core.channels.ag_ui import AgUiStream, RunAgentInput, RunTranslator, sse
 from support_core.channels.web_chat import CHANNEL as WEB_CHAT
 from support_core.engine.hooks import EngineHooks
 from support_core.graph.manifest import Channel
@@ -86,6 +88,13 @@ HELLO_TIMEOUT = 15.0
 
 The key arrives in a frame rather than in the URL (finding W9), so a client that connects and
 says nothing would otherwise hold a socket for ever for free."""
+
+AG_UI_TURN_TIMEOUT = 60.0
+"""How long an AG-UI run's SSE stream waits for the turn it started to settle.
+
+A run is one turn, and a turn is seconds; a queued turn waits on the drain worker, which has its
+own budget. This bound stops an SSE response hanging for ever if the turn it is watching never
+produces its end-of-turn frame - the connection is closed with a ``RUN_ERROR`` instead."""
 
 
 RETRY_AFTER_SECONDS = 5
@@ -214,6 +223,13 @@ def create_app(
         app.include_router(desk_router(runtime, token=desk_token))
     if settings.serve_client:
         app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+        # A pack may ship its own front end (DESIGN.md section 12). When it does, serve it at
+        # `/app` beside the built-in demo pages - the same `serve_client` gate, so a deployment
+        # with its own hosting turns both off together. `ui.dir` is validated to a single segment
+        # inside the pack, and a pack that ships no UI mounts nothing.
+        pack_ui = pack.path / pack.manifest.ui.dir
+        if pack_ui.is_dir():
+            app.mount("/app", StaticFiles(directory=pack_ui, html=True), name="pack-ui")
     return app
 
 
@@ -285,11 +301,95 @@ def _routes(runtime: AppRuntime) -> APIRouter:
     async def web_chat_socket(socket: WebSocket) -> None:
         await _serve_socket(runtime, socket)
 
+    @router.get("/channels/ag_ui")
+    async def ag_ui_info() -> JSONResponse:
+        """What an AG-UI client needs before its first run: the same static bits the socket's
+        ``ready`` frame carries (provider, pack, the demo's one-click suggestions). No conversation
+        state and no secret - everything here is already in ``/healthz``."""
+        return JSONResponse(
+            {
+                "provider": runtime.provider_name,
+                "pack": runtime.pack.manifest.id,
+                "suggestions": list(runtime.config.suggestions),
+                # The pack's own branding and starter messages, so a pack front end (and the
+                # generic client) can theme per-pack with no assets. `suggestions` above stays the
+                # deployment's (the demo config); `ui.suggestions` is the pack's own.
+                "ui": json.loads(runtime.pack.manifest.ui.model_dump_json()),
+            }
+        )
+
+    @router.post("/channels/ag_ui")
+    async def ag_ui_run(request: Request) -> Response:
+        """One AG-UI run over the web chat channel (see :mod:`support_core.channels.ag_ui`).
+
+        The body is an AG-UI ``RunAgentInput``; ``threadId`` is the web chat session key and
+        stays in the body, never the URL (finding W9). The response is a ``text/event-stream`` of
+        AG-UI events for the single turn this message runs - the same committed messages and the
+        same approval gate the socket sees, in AG-UI's vocabulary.
+        """
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            return JSONResponse({"error": "the body is not JSON"}, status_code=400)
+        try:
+            run_input = RunAgentInput.model_validate(body)
+        except ValidationError:
+            return JSONResponse({"error": "this is not an AG-UI RunAgentInput"}, status_code=400)
+        text = run_input.latest_user_text()
+        if text is None:
+            return JSONResponse({"error": "no user message to run"}, status_code=400)
+        thread_id = run_input.threadId or new_session_key()
+        run_id = run_input.runId or f"run_{uuid.uuid4().hex}"
+        try:
+            # Validate the session key by the web chat adapter's own rules before opening a stream.
+            key = runtime.adapter(WEB_CHAT).conversation_key({"session": thread_id})
+        except InboundRejected as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+        async def events() -> AsyncIterator[str]:
+            translator = RunTranslator(thread_id, run_id)
+            stream = AgUiStream()
+            # Watch the key before delivering, so `deliver_inbound`'s `attach` moves this stream
+            # onto the conversation before the turn runs (the same ordering the socket relies on).
+            runtime.connections.wait(key, stream)
+            try:
+                yield sse(translator.run_started())
+                try:
+                    await runtime.accept({"session": thread_id, "text": text}, channel=WEB_CHAT)
+                except InboundRejected as exc:
+                    yield sse(translator.run_error(str(exc)))
+                    return
+                except SQLTimeoutError:
+                    yield sse(translator.run_error(OVERLOADED_DETAIL))
+                    return
+                # Drain committed frames until the end-of-turn frame. Inline turns have already
+                # queued theirs; a queued turn's arrive from the drain worker. A timeout stops a
+                # run that never settles rather than holding the response open for ever.
+                while not translator.done:
+                    try:
+                        frame = await asyncio.wait_for(
+                            stream.queue.get(), timeout=AG_UI_TURN_TIMEOUT
+                        )
+                    except TimeoutError:
+                        yield sse(translator.run_error("the run did not finish in time"))
+                        return
+                    for event in translator.translate(frame):
+                        yield sse(event)
+                yield sse(translator.run_finished())
+            finally:
+                runtime.connections.forget(stream)
+
+        return StreamingResponse(events(), media_type="text/event-stream")
+
     if runtime.config.serve_client:
 
         @router.get("/")
         async def client() -> FileResponse:
             return FileResponse(STATIC_DIR / "index.html")
+
+        @router.get("/agui")
+        async def ag_ui_client() -> FileResponse:
+            return FileResponse(STATIC_DIR / "agui.html")
 
     return router
 

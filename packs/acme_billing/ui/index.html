@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Acme Billing support</title>
+    <link rel="icon" href="data:," />
+    <!-- A pack's own front end, shipped in the bundle and served at /app. Self-contained: no
+         framework, no build step, no external request, so it works with no network. It reads its
+         title, accent and starter messages from GET /channels/ag_ui and drives the conversation
+         over the AG-UI SSE endpoint. -->
+    <style>
+      :root {
+        color-scheme: light dark;
+        --accent: #1f6feb;
+        --ink: #16181d;
+        --paper: #f6f7f9;
+        --card: #fff;
+        --line: #d9dce3;
+        --muted: #5d6470;
+        --agent: #eef1f6;
+        --warn-line: #b8860b;
+        --warn-bg: #fff8e2;
+        --warn-ink: #4a3a05;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --ink: #e8eaee;
+          --paper: #14161a;
+          --card: #1c1f25;
+          --line: #333944;
+          --muted: #9aa3b2;
+          --agent: #242932;
+          --warn-bg: #35300f;
+          --warn-ink: #f2e4b4;
+          --warn-line: #c9a227;
+        }
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--paper); color: var(--ink);
+             font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+      .bar { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+             padding: 12px 18px; background: var(--accent); color: #fff; }
+      .bar h1 { font-size: 17px; margin: 0; }
+      .bar .sub { font-size: 12px; opacity: 0.85; }
+      .bar button { font: inherit; color: #fff; background: rgba(255, 255, 255, 0.15);
+                    border: 1px solid rgba(255, 255, 255, 0.5); border-radius: 8px;
+                    padding: 6px 11px; cursor: pointer; }
+      main { max-width: 720px; margin: 0 auto; padding: 18px; }
+      .transcript { list-style: none; margin: 0 0 14px; padding: 0; display: flex;
+                    flex-direction: column; gap: 10px; min-height: 44vh; }
+      .turn { max-width: 82%; padding: 9px 13px; border-radius: 14px; white-space: pre-wrap;
+              overflow-wrap: anywhere; }
+      .turn.agent { background: var(--agent); border: 1px solid var(--line); align-self: flex-start;
+                    border-bottom-left-radius: 4px; }
+      .turn.customer { background: var(--accent); color: #fff; align-self: flex-end;
+                       border-bottom-right-radius: 4px; }
+      .approval { border: 2px solid var(--warn-line); background: var(--warn-bg); color: var(--warn-ink);
+                  border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; }
+      .approval h2 { margin: 0 0 6px; font-size: 16px; }
+      .approval code { font-weight: 700; }
+      .approval blockquote { margin: 8px 0 0; padding: 10px 12px; background: var(--card);
+                             color: var(--ink); border: 1px solid var(--line); border-radius: 8px;
+                             white-space: pre-wrap; }
+      .suggestions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+      .suggestions button { font: inherit; font-size: 13px; text-align: left; color: var(--muted);
+                            background: var(--card); border: 1px solid var(--line);
+                            border-radius: 8px; padding: 7px 12px; cursor: pointer; }
+      .composer { display: flex; gap: 8px; }
+      .composer input { flex: 1; font: inherit; color: var(--ink); background: var(--card);
+                        border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+      .composer button { font: inherit; color: #fff; background: var(--accent); border: 0;
+                         border-radius: 8px; padding: 10px 16px; cursor: pointer; }
+      .note { min-height: 1.4em; margin: 10px 2px 0; font-size: 13px; color: var(--muted); }
+      .note.warn { color: #b42318; }
+      .pform { border: 1px solid var(--line); border-radius: 12px; padding: 15px 16px;
+               margin-bottom: 14px; background: var(--card); }
+      .pform h3 { margin: 0 0 4px; font-size: 16px; }
+      .pform .intro { margin: 0 0 12px; font-size: 13px; color: var(--muted); }
+      .pform .sec { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+                    color: var(--muted); margin: 14px 0 8px; }
+      .pform .fld { margin-bottom: 10px; }
+      .pform label.l { display: block; font-size: 13px; font-weight: 500; margin-bottom: 4px; }
+      .pform input[type="text"], .pform input[type="email"], .pform input[type="date"],
+      .pform select { width: 100%; font: inherit; font-size: 14px; padding: 8px 10px;
+                      border: 1px solid var(--line); border-radius: 8px; background: var(--paper);
+                      color: var(--ink); }
+      .pform .opt { display: flex; gap: 8px; align-items: center; font-size: 14px; margin: 4px 0; }
+      .pform .req { color: var(--accent); margin-left: 2px; }
+      .pform .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+      .pform .err { color: #b42318; font-size: 12px; margin-top: 3px; }
+      .pform .pactions { margin-top: 14px; }
+      .pform button { font: inherit; font-weight: 600; color: #fff; background: var(--accent);
+                      border: 0; border-radius: 8px; padding: 9px 15px; cursor: pointer; }
+      .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden;
+                         clip: rect(0 0 0 0); }
+      [hidden] { display: none !important; }
+    </style>
+  </head>
+  <body>
+    <header class="bar">
+      <div>
+        <h1 id="title">Acme Billing</h1>
+        <div class="sub" id="subtitle"></div>
+      </div>
+      <button type="button" id="restart">New conversation</button>
+    </header>
+
+    <main>
+      <ol class="transcript" id="transcript" aria-live="polite" aria-label="Conversation"></ol>
+
+      <section class="pform" id="form-host" hidden aria-label="Form from the assistant"></section>
+
+      <section class="approval" id="approval" hidden role="region" aria-labelledby="approval-title">
+        <h2 id="approval-title">Your approval is needed</h2>
+        <p>Nothing happens until you answer, and only the exact action described. Approve by
+          sending your reply.</p>
+        <p>waiting to run <code id="approval-tool">a tool</code></p>
+        <blockquote id="approval-prompt"></blockquote>
+      </section>
+
+      <div class="suggestions" id="suggestions" hidden></div>
+
+      <form class="composer" id="composer">
+        <label class="visually-hidden" for="message">Your message</label>
+        <input id="message" type="text" autocomplete="off" placeholder="Type a message"
+               maxlength="4000" />
+        <button type="submit" id="send">Send</button>
+      </form>
+
+      <p class="note" id="note"></p>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

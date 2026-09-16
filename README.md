@@ -447,6 +447,73 @@ graph, across sub-graph calls, not with a pattern match - and refuses, besides, 
 the confirm and the call that rewrites what the approved arguments read, and a second tool node
 that would spend the same approval. All of it is checked again at run time.
 
+## Running for a different domain
+
+`app.py` is `create_app(load_pack(config.pack))`: `support_core` is the library and the **pack is
+the domain**. Running the agent for something other than Acme billing means writing a new pack and
+pointing configuration at it - not forking core. `packs/acme_billing` is the worked example of
+everything below (DESIGN.md section 5).
+
+A pack is a directory with:
+
+- **`pack.yaml`** - the manifest (DESIGN.md 5.1): `id`, `version`, a `core` version specifier, the
+  `entry_graph`, the `channels` it serves, and the `llm`, `interrupts`, `handoff`, `limits`,
+  `memory` and `guardrails` blocks (optionally a `ui` block, below). A typo in a key is a startup
+  failure, not a silent default.
+- **`graphs/`** - the workflows. A `root` graph whose `classify` node routes to the domain's own
+  graphs (the sample has `refund`, `update_address`, `verify_identity`). See "Writing a pack's
+  graphs".
+- **`tools/`** - the domain's real integrations as Python (`TOOLS: list[Tool]`), each with a risk
+  tier. This is where the sample pack's in-memory billing, identity and address fakes are replaced
+  by calls to your billing system, CRM and passcode provider. `tools/` is inside the trust
+  boundary - reviewing it is a security review.
+- **`knowledge/`** - `sources.yaml` and the documents the citation guardrail answers from (pricing,
+  timings, policy). Two of the refund graph's steps answer from here; a domain whose graphs make
+  claims a customer will act on needs its own corpus.
+- **`persona.md`, `policies.md`** - the prompt layers (voice and rules).
+- optionally **`ui/`** with a `ui:` manifest block - the pack's own front end and its forms
+  (below) - and **`evals/`** - golden conversations the CLI can run.
+
+Two rules a new pack cannot skip: a `write`/`high` risk tool needs a `confirm` node on every path
+from the last customer input (the validator proves it), and `identity_verified` is set only by the
+pack's own verification workflow - never by configuration or the client. `new_conversation_context`
+is where a CRM lookup's result is seeded, and it is refused if it tries to set `identity_verified`.
+
+Configuration is a JSON file plus environment (DESIGN.md 4.1, 20). The four commands are the demo's,
+pointed at the new pack:
+
+```sh
+export SUPPORT_APP_CONFIG=deploy/mydomain.json   # pack path, provider, new-conversation context, suggestions
+sh scripts/db-up.sh                              # Postgres + pgvector, Qdrant
+python -m alembic upgrade head
+support pack knowledge sync packs/mydomain       # index the pack's documents
+python -m uvicorn app:app --port 8000
+```
+
+`SUPPORT_APP_CONFIG` (an `AppConfig`) carries which pack, the provider (`auto` picks a live model
+where `ANTHROPIC_API_KEY` is set and the recorded cassettes otherwise), model overrides, the
+new-conversation context, one-click `suggestions`, `serve_client`, and `serve_desk` (which also
+needs `SUPPORT_DESK_TOKEN`). The stateful dependencies are Postgres (required) and Qdrant
+(retrieval degrades to keyword search when it is down).
+
+Before serving, `support pack validate packs/mydomain` must report the pack well-formed - the same
+check `make check` runs: graphs type-check against the real tool signatures, every write sits
+behind a confirm, and the interrupt graphs exist.
+
+**What the pack does not have to build.** Core provides the turn loop and durability, both web
+transports (the WebSocket at `/channels/web_chat/ws` and the AG-UI SSE endpoint at
+`/channels/ag_ui`), the built-in demo pages, the human desk and handoff queue, knowledge retrieval
+and the citation guardrail, rolling memory, and approval binding. A pack may also ship its **own**
+front end: static assets under `ui/` (served at `/app`) and a `ui:` block in `pack.yaml` for
+branding and for `forms` - schemas the agent renders as `render_form` tool calls over AG-UI, keyed
+by the graph node whose gate they belong to. A new domain is graphs, tools, knowledge, prompts and
+a manifest; the runtime is already there.
+
+Today core and the sample pack live in one repository (until the phase-9 split in BACKLOG.md's
+decisions log); the shape a real deployment takes is a separate pack repository that depends on
+`support-core` and provides its own `app.py` and `Dockerfile`, exactly as the docstring at the top
+of `app.py` describes.
+
 ## Conventions
 
 - Every module under `support_core/` starts with a docstring naming the DESIGN.md section it

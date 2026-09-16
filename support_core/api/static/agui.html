@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>support-core · AG-UI</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <header class="bar">
+      <div class="bar-left">
+        <span class="dot" id="link-dot" data-state="connecting"></span>
+        <strong id="pack-name">support-core</strong>
+        <span class="tag" id="provider-tag">provider</span>
+        <span class="tag" id="transport-tag">AG-UI · SSE</span>
+      </div>
+      <div class="bar-right">
+        <span class="status" id="run-status">idle</span>
+        <button type="button" id="restart">New conversation</button>
+      </div>
+    </header>
+
+    <main>
+      <ol class="transcript" id="transcript" aria-live="polite" aria-label="Conversation"></ol>
+
+      <section
+        class="approval"
+        id="approval"
+        hidden
+        aria-labelledby="approval-title"
+        role="region"
+      >
+        <h2 id="approval-title">Your approval is needed</h2>
+        <p class="approval-what">
+          The assistant has proposed an action and stopped. Nothing happens until you answer, and it
+          can only carry out the exact action it just described. Approve by sending your reply.
+        </p>
+        <p class="approval-tool">
+          waiting to run <code id="approval-tool-name">a tool</code>
+        </p>
+        <blockquote id="approval-prompt"></blockquote>
+      </section>
+
+      <div class="suggestions" id="suggestions" hidden></div>
+
+      <form class="composer" id="composer">
+        <label class="visually-hidden" for="message">Your message</label>
+        <input
+          id="message"
+          name="message"
+          type="text"
+          autocomplete="off"
+          placeholder="Type a message"
+          maxlength="4000"
+        />
+        <button type="submit" id="send">Send</button>
+      </form>
+
+      <p class="note" id="note"></p>
+    </main>
+
+    <footer class="foot">
+      <span>thread <code id="session-key">-</code></span>
+      <span id="hint">AG-UI protocol over <code>POST /channels/ag_ui</code> (SSE)</span>
+    </footer>
+
+    <script src="/static/agui.js"></script>
+  </body>
+</html>
