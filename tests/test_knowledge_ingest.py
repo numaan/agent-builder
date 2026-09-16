@@ -27,7 +27,12 @@ from support_core.knowledge.ingest import (
     read_markdown_dir,
     version_string,
 )
-from support_core.knowledge.sources import HtmlCrawlSource, parse_sources
+from support_core.knowledge.sources import (
+    HtmlCrawlSource,
+    MarkdownDirSource,
+    SourceError,
+    parse_sources,
+)
 from support_core.storage import knowledge_repo as repo
 from support_core.storage.models import DocChunk, DocSource
 from support_core.storage.session import make_session_factory
@@ -205,6 +210,43 @@ async def test_a_source_directory_that_is_not_there_is_a_readable_failure(
         await ingestor(engine, tmp_path).sync_source(markdown_source())
 
 
+async def test_a_sync_refuses_a_markdown_dir_path_that_escapes_the_pack(
+    engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """reviews/phase-5.md finding K1. ``support pack validate`` (``path_findings``) always refused
+    a ``markdown_dir`` source whose path walks out of the pack directory; the sync CLI - the
+    command a pack's own README documents for routine knowledge updates - did not, and would read
+    and index whatever the escaping path named. Regression for the sync path itself, both through
+    ``Ingestor.sync_source`` (what the CLI calls) and ``read_markdown_dir`` directly (what the CLI
+    calls transitively), so the fix cannot regress at either layer without this failing.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("# Secret\n\nNot part of this pack.\n", encoding="utf-8")
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    escaping = MarkdownDirSource(id="escaped", type="markdown_dir", path="../outside")
+
+    with pytest.raises(SourceError, match="escapes the pack directory"):
+        await read_markdown_dir(pack, escaping)
+    with pytest.raises(SourceError, match="escapes the pack directory"):
+        await ingestor(engine, pack).sync_source(escaping)
+    assert await chunks(engine, "escaped") == []
+
+
+async def test_a_sync_refuses_an_absolute_markdown_dir_path(
+    engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """The other half of the same finding: an absolute path is refused at sync time too, not only
+    by the validator."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    absolute = MarkdownDirSource(id="escaped-abs", type="markdown_dir", path=str(outside))
+
+    with pytest.raises(SourceError):
+        await ingestor(engine, tmp_path / "pack").sync_source(absolute)
+
+
 async def test_documents_are_read_in_a_stable_order(tmp_path: Path) -> None:
     """The order decides ``chunk_index`` and the corpus checksum, so it cannot come from the
     filesystem - two machines do not agree about that."""
@@ -319,6 +361,33 @@ def test_html_becomes_markdown_with_its_structure_and_without_its_chrome() -> No
     assert links == ["/billing/refunds", "https://elsewhere.example/ad", "/pricing"]
 
 
+async def test_a_crawl_refuses_a_non_http_scheme() -> None:
+    """reviews/phase-5.md finding K1's second half: ``path_findings`` always refused a
+    ``html_crawl`` source whose ``url`` was not ``http``/``https``; ``crawl()``, which is what the
+    sync CLI actually calls, did not. Nothing is fetched - the stub fetcher is never asked."""
+    fetch = StubFetcher({})
+    with pytest.raises(SourceError, match="http or https"):
+        await crawl(crawl_source(url="file:///etc/passwd"), fetch)
+    assert fetch.asked == []
+
+
+async def test_a_crawl_refuses_a_loopback_or_link_local_url() -> None:
+    """Not in the original finding, but flagged by the reviewer as very likely the same gap, and
+    worth closing at the same time: ``path_findings`` only ever checked the scheme, so
+    ``http://169.254.169.254/...`` (a cloud metadata endpoint) or ``http://localhost:6333/...``
+    would have passed validation and reached a real ``crawl()``."""
+    fetch = StubFetcher({})
+    for url in (
+        "http://127.0.0.1:6333/collections",
+        "http://localhost/admin",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[::1]/admin",
+    ):
+        with pytest.raises(SourceError):
+            await crawl(crawl_source(url=url), fetch)
+    assert fetch.asked == []
+
+
 async def test_a_crawl_follows_only_links_under_the_start_url() -> None:
     """Not a bound, a rule. A help-centre page that links to a marketing site would otherwise put
     marketing copy in a policy corpus, and a passage the agent cites has to be something the
@@ -397,6 +466,20 @@ async def test_retention_keeps_enough_old_versions_for_an_old_trace(
     assert versions[-3] in stored
     assert versions[0] not in stored
     assert len(stored) == 3
+
+
+def test_a_qdrant_store_refuses_a_keep_below_one() -> None:
+    """reviews/phase-5.md finding K4. ``keep=0`` used to be accepted at construction, and
+    ``prune(keep=0)`` computes ``sorted(versions, reverse=True)[0:]`` - every collection,
+    including the one the sync just built and just flipped the alias onto, in the same call that
+    created it. Refused at both the constructor and the call site, so a direct ``prune(keep=0)``
+    call cannot rediscover the bug either."""
+    from support_core.knowledge.qdrant import QdrantStore
+
+    with pytest.raises(ValueError, match="keep must be at least 1"):
+        QdrantStore("http://127.0.0.1:6333", keep=0)
+    with pytest.raises(ValueError, match="keep must be at least 1"):
+        QdrantStore("http://127.0.0.1:6333", keep=-1)
 
 
 async def test_the_sync_survives_a_vector_store_that_is_not_configured(

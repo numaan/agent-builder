@@ -55,6 +55,9 @@ from support_core.knowledge.sources import (
     HtmlCrawlSource,
     KnowledgeSources,
     MarkdownDirSource,
+    SourceError,
+    contained_path,
+    validated_crawl_url,
 )
 from support_core.knowledge.types import RetrieverUnavailable
 from support_core.storage import knowledge_repo as repo
@@ -220,8 +223,16 @@ async def read_markdown_dir(pack_path: Path, source: MarkdownDirSource) -> list[
     and a filesystem's own order is not the same on two machines. The same reasoning as every
     other explicit ordering in this repository: an order that is reconstructed from the
     environment is not an order.
+
+    Refuses a ``path`` that is absolute or escapes the pack directory, through
+    :func:`~support_core.knowledge.sources.contained_path` - the same check ``support pack
+    validate`` runs, called here too so a pack edited after validation cannot sync from outside
+    itself (reviews/phase-5.md finding K1).
     """
-    root = source.resolve(pack_path)
+    try:
+        root = contained_path(pack_path, source)
+    except SourceError as exc:
+        raise SourceError(f"{source.id}: {exc}") from exc
     if not root.is_dir():
         msg = f"{source.id}: {source.path} is not a directory"
         raise FileNotFoundError(msg)
@@ -249,7 +260,16 @@ async def crawl(source: HtmlCrawlSource, fetch: Fetcher) -> list[Document]:
     ``/pricing`` are the same host and only one of them is the policy this pack answers from.
 
     "Under the path" is decided by :func:`_boundary`, which is the one judgement call in here.
+
+    Refuses a non-http(s) scheme or a loopback/link-local host, through
+    :func:`~support_core.knowledge.sources.validated_crawl_url` - the same check ``support pack
+    validate`` runs, called here too for the same reason :func:`read_markdown_dir` calls
+    :func:`~support_core.knowledge.sources.contained_path` (reviews/phase-5.md finding K1).
     """
+    try:
+        validated_crawl_url(source)
+    except SourceError as exc:
+        raise SourceError(f"{source.id}: {exc}") from exc
     start = urldefrag(source.url).url
     prefix = _boundary(start)
     origin = urlparse(start)

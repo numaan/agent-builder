@@ -15,9 +15,11 @@ anyway is deliberate - a pack that declares one gets its typos caught now, and p
 a schema instead of inventing one.
 """
 
+import ipaddress
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urlparse
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -199,25 +201,91 @@ def load_sources(pack_path: Path) -> KnowledgeSources:
     return parse_sources(raw)
 
 
+def contained_path(pack_path: Path, source: MarkdownDirSource) -> Path:
+    """Resolve ``source.path`` under ``pack_path``, refusing an absolute or escaping path.
+
+    This is the one place that decides "is this path inside the pack", and it is called from two
+    places that must never disagree: :func:`path_findings` (``support pack validate``) and
+    :func:`~support_core.knowledge.ingest.read_markdown_dir` (``support pack knowledge sync``,
+    the command a pack's own README documents for routine knowledge updates). Before this
+    function existed the two checked the boundary separately and only the validator's copy
+    actually refused anything - a pack whose ``sources.yaml`` was edited to point outside the
+    pack directory *after* being validated would sync and index whatever it now named. Raising
+    here, at the point the directory is about to be walked, closes that whether or not an
+    operator ever ran ``pack validate`` again.
+
+    Raises :class:`SourceError` with no source id in the message, because the two callers name it
+    differently (a ``(id, problem)`` pair here, an id-prefixed exception there).
+    """
+    if Path(source.path).is_absolute():
+        msg = f"path {source.path!r} must be relative to the pack directory"
+        raise SourceError(msg)
+    resolved = source.resolve(pack_path)
+    root = pack_path.resolve()
+    if resolved != root and root not in resolved.parents:
+        msg = f"path {source.path!r} escapes the pack directory"
+        raise SourceError(msg)
+    return resolved
+
+
+_LOOPBACK_HOSTNAMES = frozenset({"localhost"})
+
+
+def validated_crawl_url(source: HtmlCrawlSource) -> str:
+    """``source.url``, refusing a non-http(s) scheme or a loopback/link-local host.
+
+    The same argument as :func:`contained_path`, for the other kind of source: ``crawl()`` opens
+    a socket, and the scheme check that guarded it previously lived only in ``path_findings``.
+    Loopback and link-local hosts are refused too - ``path_findings`` used to accept any
+    http(s) URL, which would pass ``http://169.254.169.254/...`` (a cloud metadata endpoint) or
+    ``http://localhost:6333/...`` straight into a crawl a scheduler runs unattended.
+
+    A crawl never leaves the start URL's origin (``crawl()``'s own boundary rule), so checking
+    the start URL once is checking every page the crawl could ever fetch.
+    """
+    parsed = urlparse(source.url)
+    if parsed.scheme not in ("http", "https"):
+        msg = f"url {source.url!r} must be http or https"
+        raise SourceError(msg)
+    host = parsed.hostname
+    if not host:
+        msg = f"url {source.url!r} has no host"
+        raise SourceError(msg)
+    if host.lower() in _LOOPBACK_HOSTNAMES:
+        msg = f"url {source.url!r} names a loopback host"
+        raise SourceError(msg)
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None and (address.is_loopback or address.is_link_local):
+        msg = f"url {source.url!r} names a loopback or link-local address"
+        raise SourceError(msg)
+    return source.url
+
+
 def path_findings(pack_path: Path, sources: KnowledgeSources) -> Iterable[tuple[str, str]]:
     """``(source id, problem)`` for every source whose location cannot be read.
 
     Separate from :func:`parse_sources` because the schema can be checked anywhere and this needs
-    the pack on disk. The validator turns each pair into a finding.
+    the pack on disk. The validator turns each pair into a finding. Delegates the boundary checks
+    to :func:`contained_path` and :func:`validated_crawl_url`, which are also what the sync path
+    calls, so a pack that passes validation and a pack that syncs are checked the same way.
     """
     for source in sources.documents:
         if isinstance(source, MarkdownDirSource):
-            if Path(source.path).is_absolute():
-                yield source.id, f"path {source.path!r} must be relative to the pack directory"
+            try:
+                resolved = contained_path(pack_path, source)
+            except SourceError as exc:
+                yield source.id, str(exc)
                 continue
-            resolved = source.resolve(pack_path)
-            if not str(resolved).startswith(str(pack_path.resolve())):
-                yield source.id, f"path {source.path!r} escapes the pack directory"
-            elif not resolved.is_dir():
+            if not resolved.is_dir():
                 yield source.id, f"path {source.path!r} is not a directory in this pack"
         else:
-            if not source.url.startswith(("http://", "https://")):
-                yield source.id, f"url {source.url!r} must be http or https"
+            try:
+                validated_crawl_url(source)
+            except SourceError as exc:
+                yield source.id, str(exc)
     for graph in sources.knowledge_graph:
         if not (pack_path / graph.path).is_file():
             yield graph.id, f"path {graph.path!r} is not a file in this pack"

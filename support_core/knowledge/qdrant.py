@@ -102,6 +102,16 @@ class QdrantStore:
         keep: int = KEEP_COLLECTIONS,
         timeout: float = 10.0,
     ) -> None:
+        if keep < 1:
+            # reviews/phase-5.md finding K4. `prune`'s `sorted(versions, reverse=True)[keep:]`
+            # drops every collection when `keep` is 0, including the one the sync just built and
+            # just flipped the alias onto, in the same call that created it - "I don't need
+            # history" is a request this store cannot satisfy without deleting what is live.
+            msg = (
+                f"keep must be at least 1 (the collection a sync just built and aliased), "
+                f"got {keep}"
+            )
+            raise ValueError(msg)
         self.url = url
         self.prefix = prefix
         self.keep = keep
@@ -253,8 +263,15 @@ class QdrantStore:
         )
 
     async def prune(self, source_id: str, *, keep: int | None = None) -> list[str]:
-        """Drop all but the newest ``keep`` collections of one source. Returns what it dropped."""
-        limit = self.keep if keep is None else keep
+        """Drop all but the newest ``keep`` collections of one source. Returns what it dropped.
+
+        ``keep`` is floored at 1 even though ``__init__`` already refuses a ``keep`` below that:
+        this is a second, independent call site (``keep`` is an argument here, not only a
+        constructor default), and the failure a floor of 0 produces - deleting the collection a
+        sync just built and just flipped the alias onto, in the same call - is bad enough to
+        defend twice (reviews/phase-5.md finding K4).
+        """
+        limit = max(1, self.keep if keep is None else keep)
         client = self._connect()
         listing = await self._call("get_collections", client.get_collections)
         stem = f"{alias_name(source_id, prefix=self.prefix)}_v"
