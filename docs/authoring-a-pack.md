@@ -12,6 +12,10 @@ pages, static hosting of a pack's own UI at `/app`, the human desk + handoff que
 retrieval + the citation guardrail, rolling memory, approval binding, and the 9-layer prompt
 assembly. **A new domain is graphs, tools, knowledge, prompts, and a manifest.**
 
+> For a field-by-field reference — every file, every property, with types, defaults, and
+> constraints — see the [pack schema reference](pack-schema-reference.md). This guide is the
+> walkthrough; that one is the schema.
+
 ---
 
 ## 1. Anatomy of a pack — every file

@@ -456,7 +456,8 @@ everything below (DESIGN.md section 5).
 
 For a step-by-step walkthrough - every file, the graph/flow model, the prompt layers, tools, UI
 forms, LLM and MCP configuration, and RAG - see the [domain-pack authoring
-guide](docs/authoring-a-pack.md). The summary below is enough to get oriented.
+guide](docs/authoring-a-pack.md), and for a field-by-field reference of every file and property, the
+[pack schema reference](docs/pack-schema-reference.md). The summary below is enough to get oriented.
 
 A pack is a directory with:
 
