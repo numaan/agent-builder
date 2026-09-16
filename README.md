@@ -454,6 +454,11 @@ the domain**. Running the agent for something other than Acme billing means writ
 pointing configuration at it - not forking core. `packs/acme_billing` is the worked example of
 everything below (DESIGN.md section 5).
 
+For a step-by-step walkthrough - every file, the graph/flow model, the prompt layers, tools, UI
+forms, LLM and MCP configuration, and RAG - see the [domain-pack authoring
+guide](docs/authoring-a-pack.md), and for a field-by-field reference of every file and property, the
+[pack schema reference](docs/pack-schema-reference.md). The summary below is enough to get oriented.
+
 A pack is a directory with:
 
 - **`pack.yaml`** - the manifest (DESIGN.md 5.1): `id`, `version`, a `core` version specifier, the
