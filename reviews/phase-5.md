@@ -690,3 +690,143 @@ it as `2a28eaf phase-5: snapshot the in-flight knowledge layer` and added two re
 this work - the security review explicitly read the in-flight knowledge layer for context and
 recorded no finding against it - and nothing here was rebased or reverted.
 
+## Independent review
+
+Reviewed by an agent that did not write this code, against DESIGN.md sections 3 (principles 5 and
+7), 9.1 to 9.3, 11.2 (layer 7), 13, 14, 17 (`doc_source`, `doc_chunk`), 20, BACKLOG.md's Phase 5
+section, PLAN.md, and reviews/phase-0.md through phase-4.md, phase-w.md and phase-6.md. The
+self-critique is unusually candid and names most of what a careless review would have found first
+(concurrent syncs duplicating a corpus, the crash window between the chunk commit and the alias
+flip, retention outrunning a trace, non-English packs getting no guardrail, citation-check
+attribution). This review does not re-litigate those; it verifies the exit criterion independently
+and hunts in places the self-critique does not look: the sync CLI's actual file-system boundary
+(as opposed to the validator's), what the citation guardrail's own `_ACTION` exemption lets through
+in a single sentence, and whether a node's `knowledge:` block narrows what it can search the way
+the plan and DESIGN.md 9.1 both say it does.
+
+**Exit criterion: met.** `tests/test_source_version_trace.py` was read in full and re-run as part
+of the full suite (below); it checks the strong reading BACKLOG.md asks for - an old trace still
+names the old `source_version`, the old chunks are still readable and still say what they said, a
+single long-lived `Executor` picks up a re-sync's new version on its very next retrieval with no
+restart, and the Qdrant collection that produced the old answer still exists and still contains
+only that version, provable by querying it directly through its own name rather than through the
+alias. All five assertions in that file hold, and the injection matrix (`tests/test_knowledge_
+injection_matrix.py`) re-confirms 0 forged lines across 28 payloads ingested and retrieved through
+the real pipeline. The exit criterion being met is a narrower claim than "the phase is safe" -
+three of the four findings below are must-fix or should-fix precisely because they sit next to the
+exit criterion rather than inside it: a corpus that was never supposed to be in the index at all
+(K1), a claim category the citation check was told to ignore and that nothing else has caught since
+(K2), and a containment promise the design makes that the shipped schema has no field for (K3).
+
+**What was run.** The full verification list at the bottom of this file, against the same
+docker-compose Postgres and Qdrant this phase's own author used (both confirmed healthy via
+`docker compose ps` before starting): `ruff check`, `ruff format --check`, `mypy support_core`, the
+full `pytest -q` suite (**1600 passed, 2 deselected, 0 failed**, 15m21s - the 2 deselected are the
+`-m live` cases that need an API key this environment does not have, same as every prior phase),
+`support pack validate packs/acme_billing` (well-formed, 18 warnings - the same 18 phase 6's review
+recorded, none of them phase 5's), and `alembic downgrade base` / `upgrade head` / `check` (clean
+both ways, `No new upgrade operations detected.`).
+
+**What was attacked.** Read every module under `support_core/knowledge/` and `support_core/
+guardrails/` line by line rather than sampling; wrote and ran a real pack whose `knowledge/
+sources.yaml` names a `markdown_dir` path that walks out of the pack directory, and watched
+`read_markdown_dir` - the function the shipped `support pack knowledge sync` CLI actually calls -
+read this repository's own internal engineering docs (`docs/authoring-a-pack.md`, `docs/pack-
+schema-reference.md`) as if they were the pack's citable corpus; called `support_core.guardrails.
+outbound.check_citations` directly with sentences that combine a first-person action with a
+pricing or timing fact in the one sentence, to see whether the detector's own tested exemption for
+action sentences (`tests/test_citation_guardrail.py::test_a_first_person_action_is_somebody_else_
+s_guardrail`) also exempts the fact riding alongside the action; and read `support_core/graph/
+nodes.py`'s `KnowledgeQuery`, `support_core/knowledge/wiring.py`'s `build_retriever`, and `support_
+core/engine/executor.py`'s `_retrieval` together to check the plan's own claim that a node "cannot
+widen its own `k` or query anything the graph did not declare" against what a `knowledge:` block
+can actually restrict.
+
+### Findings
+
+| ID | severity | location | description | recommendation |
+|----|----------|----------|-------------|-----------------|
+| K1 | must-fix | `support_core/knowledge/sources.py:54-55` (`MarkdownDirSource.resolve`), `support_core/knowledge/sources.py:202-217` (`path_findings`, the only place the boundary is enforced), `support_core/knowledge/ingest.py:216-238` (`read_markdown_dir`), `support_core/cli/main.py:60-118` (`knowledge_sync`) | `support pack knowledge sync` - the command README.md's own four-line demo startup runs, and the command DESIGN.md 9.2 says is the whole of "fixing knowledge" ("edit the source, run `support pack knowledge sync`") - never calls `path_findings`, the function that refuses a `markdown_dir` source whose `path` escapes the pack directory. That check exists only in `support_core/graph/validator.py:374-376`, reached by `support pack validate`, a **separate command the sync workflow does not run**. Reproduced: built a pack whose `knowledge/sources.yaml` declared `path: "../docs"`; `load_sources()` (what `knowledge sync` actually calls) accepted it with no error, while `path_findings()` on the same input correctly reports `"path '../docs' escapes the pack directory"`. Calling `read_markdown_dir` - the function `Ingestor.sync_source` calls on every sync - then read and would index this repository's own internal `docs/authoring-a-pack.md` (31,823 chars) and `docs/pack-schema-reference.md` (24,278 chars) as the pack's corpus: content nobody meant to be customer-facing, retrievable and citable to a customer with a fabricated-looking `locator`. No test anywhere (`test_knowledge_ingest.py`, `test_knowledge_cli.py`) exercises a `sync` of an escaping or absolute path; the only test of the boundary (`test_knowledge_sources.py:139`) is against `path_findings` in isolation. The same root cause - a check written into the validator and never wired into the code that actually opens a socket or a file - very likely also means `html_crawl`'s `path_findings` scheme check (`url` must be `http`/`https`) is bypassed by `sync` too, since `crawl()` never calls it either; not independently reproduced here for lack of time, but worth the same fix. | Move the containment check (or call `path_findings`) into `MarkdownDirSource.resolve()` or `read_markdown_dir()` itself, so a sync refuses the escape rather than only warning about it in a command an operator may never run before syncing. Do the equivalent for `html_crawl`'s scheme (and consider blocking loopback/link-local targets while at it, since `path_findings` currently only rejects a non-`http(s)` scheme and would pass `http://169.254.169.254/...`). |
+| K2 | must-fix | `support_core/guardrails/outbound.py:134-148` (`_ACTION`), `:227` (`find_claims`'s `_ACTION.match` short-circuit), endorsed by `tests/test_citation_guardrail.py:114-120` | `_ACTION` matches a whole sentence and removes it from claim detection on the theory that "the check it needs is DESIGN.md 14's forbidden-promise check... phase 7's" (the module's own docstring, line 147). That check does not exist anywhere in this codebase yet (`grep -rn forbidden support_core` outside comments returns nothing); the sentence therefore passes through **no guardrail at all**, not a weaker one. Because the unit of detection is the whole sentence, any pricing or timing fact that rides in the *same* sentence as the action verb is exempted along with it. Reproduced directly against `check_citations`: `"I have issued a refund of $500 to your card ending 4242, which will arrive in 3 to 5 business days."` returns `ok=True, claims=()` - an uncited dollar amount and an uncited delivery window, in one sentence a model is very likely to actually write, pass with nothing checking them. Splitting the same content into two sentences ("I have refunded you. It will arrive in 5 to 7 business days.") is correctly caught as a timing claim - so the gap is specifically about phrasing, and an LLM has no reason to prefer the phrasing that gets checked. The self-critique's "What the citation check misses" section lists five gaps in the detector's own vocabulary and does not mention this one, which is a different shape of gap: not a pattern the detector fails to recognise, but a claim category the detector was deliberately told to skip on the assumption that a different, unbuilt guardrail covers it. | Either scope the `_ACTION` exemption to the clause asserting the action rather than the whole sentence (don't skip a sentence that also matches a pricing/timing pattern outside the action's own object), or require a citation for the pricing/timing part regardless of `_ACTION` co-occurrence and leave the action assertion itself to the future forbidden-promise check. At minimum, name this gap explicitly in the self-critique so phase 7's forbidden-promise work is scoped with it in mind rather than rediscovering it. |
+| K3 | should-fix | `support_core/graph/nodes.py:95-104` (`KnowledgeQuery`: only `query` and `k`), `support_core/knowledge/wiring.py:84-101` (`build_retriever`: `source_ids = sources.source_ids()`, unconditionally every document source the pack declares), `support_core/engine/executor.py:1347-1368` (`_retrieval`: hands every node the one pack-wide composite, narrowed only by the live-lookup gateway) | DESIGN.md 9.1 states "Packs choose which backends a given `llm` node may use via the node's `knowledge:` block", and this phase's own plan says the per-node retrieval closure is built "in the same shape as `tool_gateway` (the node cannot widen its own `k` or query anything the graph did not declare)" (line 115-116). Neither is true of the shipped schema: `KnowledgeQuery` has no field to name a subset of sources, and `build_retriever` composes *every* `markdown_dir`/`html_crawl` source the pack has ever declared into the one `CompositeRetriever` every node shares - a node's `knowledge:` block can narrow `k` and the query text and nothing else. `DocumentRetriever` and `ColbertRetriever` both already accept a `source_ids` sequence at construction and `tests/test_knowledge_retrieval.py:109` (`test_a_retriever_scoped_to_a_source_cannot_see_another`) proves the underlying mechanism works when a retriever is built with a narrower set directly - but nothing in the executor or the wiring ever builds one narrower than "the whole pack" for a specific node. Not observable as a live defect in `packs/acme_billing` today, because both its sources are meant to be customer-facing, but it is a real containment gap for the first pack that mixes an internal-only source with a customer-facing one, and it is a plain divergence from both the design's sentence and the plan's own claim, recorded nowhere in the "Where the code diverges from DESIGN.md" section. | Add a `sources: list[str] \| None` field to `KnowledgeQuery`, thread it through `RetrievalRequest`, and filter the per-node retrieval to that subset (the retrievers already support it; only the wiring needs to change) - or, if the scope was deliberately deferred, say so in reviews/phase-5.md next to the other recorded deviations rather than leaving the plan's contradicting claim as the only record. |
+| K4 | nit | `support_core/knowledge/ingest.py:493-495` (`_prune`), `support_core/knowledge/qdrant.py:255-273` (`QdrantStore.prune`) | `QdrantStore(url, keep=0)` is accepted at construction with no validation, and `prune(source_id, keep=0)` computes `sorted(versions, reverse=True)[0:]` - every collection, including the one the sync just built and just flipped the alias onto, in the same sync call. A deployment reasoning "I don't need history, keep the footprint small" and setting `keep=0` would delete the collection an in-flight query is about to be pointed at, in the same operation that created it. | Reject `keep < 1` at `QdrantStore.__init__`, or floor `prune`'s effective limit at 1. |
+
+### Reproduction notes
+
+**K1**, exact commands:
+
+```
+python -c "
+from pathlib import Path
+from support_core.knowledge.sources import load_sources, path_findings
+p = Path('tmp_traversal_pack')            # sources.yaml: documents: [{id: escaped, type: markdown_dir, path: '../docs'}]
+s = load_sources(p)                        # what `knowledge sync` calls: succeeds, no error
+print(list(path_findings(p, s)))           # what `pack validate` calls: [('escaped', \"path '../docs' escapes the pack directory\")]
+"
+```
+
+then, calling `read_markdown_dir` (what `Ingestor.sync_source` calls) against the same pack directly
+returned two documents named `authoring-a-pack.md` and `pack-schema-reference.md` with the full text
+of this repository's `docs/` directory - outside the scratch pack entirely.
+
+**K2**:
+
+```
+python -c "
+from support_core.guardrails.outbound import check_citations
+v = check_citations('I have issued a refund of \$500 to your card ending 4242, which will arrive in 3 to 5 business days.', citations=[], offered=['c1'])
+print(v.ok, v.claims, v.problems)   # True () ()  -- nothing detected, nothing required
+"
+```
+
+**K3**: read `support_core/graph/nodes.py` (`KnowledgeQuery` has exactly `query: str` and `k: int`,
+`extra="forbid"` so no undeclared field could sneak past validation), `support_core/knowledge/
+wiring.py`'s `build_retriever` (`source_ids = sources.source_ids()` is the pack's full list, passed
+once to both `DocumentRetriever` and `ColbertRetriever` at startup), and `support_core/engine/
+executor.py`'s `_retrieval` (composes `self.retriever` - the one built at startup - with only the
+per-node live-lookup gateway; no source filter). Cross-checked against `tests/test_knowledge_
+retrieval.py:109`, which proves the retriever-level mechanism exists and is simply never reached
+from a node.
+
+### Missed by the self-critique
+
+The self-critique is thorough about concurrency, crash windows, retrieval-quality honesty and the
+citation detector's *vocabulary* gaps. What it does not name: that the sync path and the validator
+enforce two different sets of rules over the same input and only one of them is on the path an
+operator actually runs (K1); that the `_ACTION` exemption it defends on the record (`tests/
+test_citation_guardrail.py:114-120`, and the self-critique's own "policy claims" discussion) hands
+a free pass to whatever pricing or timing fact happens to share a sentence with it, not only to the
+action assertion itself (K2); and that "the node cannot widen its own `k` or query anything the
+graph did not declare" is stated as an achieved property in the plan (line 115-116) without a test
+or a sentence anywhere checking that a node cannot see a source its own `knowledge:` block never
+named (K3) - the design's own sentence about per-node backend choice is quietly not implemented.
+
+### Verification
+
+Run from a clean tree on 2026-09-16, `.venv/Scripts/python.exe`, against the docker-compose Postgres
+and Qdrant (`docker compose ps` confirmed both `healthy` before starting).
+
+| Command | Result |
+|---------|--------|
+| `python -m ruff check .` | `All checks passed!` (exit 0) |
+| `python -m ruff format --check .` | `196 files already formatted` (exit 0) |
+| `python -m mypy support_core` | `Success: no issues found in 105 source files` |
+| `python -m pytest -q` | `1600 passed, 2 deselected in 921.50s (0:15:21)` - the 2 deselected are `-m live`, which needs an API key this environment does not have |
+| `support pack validate packs/acme_billing` | `acme-billing: well-formed (18 warning(s))`, exit 0 - the same 18 (16 `graph.assignment_optional`/`graph.state_type_unresolved` from phase 4's deferred R8, 2 `graph.confirm_exempt`) phase 6's review recorded; none are phase 5's |
+| `alembic downgrade base` | all ten revisions down cleanly |
+| `alembic upgrade head` | all ten revisions up cleanly |
+| `alembic check` | `No new upgrade operations detected.` |
+
+No test was run twice against the shared database while another process might have been using it
+(phase-0 finding N9's collision mode, which phase 6's review hit); this review ran alone.
+
+**Verdict: 2 must-fix, 1 should-fix, 1 nit.** The exit criterion holds, and it holds under the same
+kind of adversarial pressure phase 6's review applied to the interrupt stack: the version trace is
+exact in both directions, the old collection survives untouched, and a single long-lived executor
+picks up a re-sync with no restart. The injection matrix's 0-forged-lines result also holds against
+a corpus ingested and retrieved by the real pipeline rather than a hand-built `Passage`. What does
+not hold is the boundary around what gets *into* that corpus in the first place (K1) and the
+completeness of what stops an *ungrounded* claim from leaving it (K2) - both are the same class of
+gap the phase's own guiding principles (5, 7) exist to close, found next to a phase that otherwise
+does exactly what it says it does.
+
