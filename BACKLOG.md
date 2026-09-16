@@ -11,7 +11,7 @@ Each phase follows the five-step workflow in [PLAN.md](PLAN.md). Design referenc
 | 3 | LLM layer and prompted nodes | done | reviews/phase-3.md |
 | 4 | Tool runtime and safety nodes | done | reviews/phase-4.md |
 | W | Web chat slice (pulled forward from 7) | done | reviews/phase-w.md |
-| 5 | Knowledge layer and citations | resolving | reviews/phase-5.md |
+| 5 | Knowledge layer and citations | done | reviews/phase-5.md |
 | 6 | Interrupts, root graph, handoff | done | reviews/phase-6.md |
 | 7 | Channels, observability, replay | todo | reviews/phase-7.md |
 | 8 | Evaluation harness | todo | reviews/phase-8.md |

@@ -591,6 +591,22 @@ Beyond the deviations the plan already listed and the decisions log already sett
   would be numbers a model might reason about.
 * **Second stateful dependency**, already decided (BACKLOG.md, 2026-09-06) and restated in the
   plan.
+* **A node's `knowledge:` block cannot narrow which sources it searches.** DESIGN.md 9.1 says
+  "packs choose which backends a given `llm` node may use via the node's `knowledge:` block", and
+  the plan's own task breakdown (item 9) claimed the per-node retrieval closure was built "in the
+  same shape as `tool_gateway` (the node cannot widen its own `k` or query anything the graph did
+  not declare)". Neither is true of what shipped: `KnowledgeQuery` has exactly `query` and `k`,
+  and `build_retriever` composes every document source the pack declares into the one
+  `CompositeRetriever` every node shares, so a `knowledge:` block can narrow `k` and the query text
+  and nothing else. The retrievers underneath already accept a `source_ids` filter at
+  construction and a test already proves it works in isolation
+  (`tests/test_knowledge_retrieval.py:109`) - only the wiring never builds one narrower than "the
+  whole pack" for a specific node. Not observable as a live defect in `packs/acme_billing`, whose
+  two sources are both meant to be customer-facing, but it is a real containment gap for the first
+  pack that mixes an internal-only source with a customer-facing one. Found by the independent
+  review (finding K3, below) and deferred rather than fixed in the resolution pass - see the
+  Resolution section - with a checklist line added under BACKLOG.md's Phase 9, which owns the rest
+  of the knowledge layer's remaining design gaps.
 
 ### Which tests are weak
 
@@ -829,4 +845,68 @@ not hold is the boundary around what gets *into* that corpus in the first place 
 completeness of what stops an *ungrounded* claim from leaving it (K2) - both are the same class of
 gap the phase's own guiding principles (5, 7) exist to close, found next to a phase that otherwise
 does exactly what it says it does.
+
+## Resolution
+
+Resolver: a fresh agent that wrote none of the phase-5 code, 2026-09-16 (PLAN.md step 5). Both
+must-fix findings are fixed, each with a regression test that fails against the reviewed code and
+passes after; the nit is fixed because it was cheap and safe; the should-fix (K3) is deferred,
+recorded in both places the review asked for - a new entry under BACKLOG.md's "Deferred findings"
+and a bullet in this file's own self-critique, under "Where the code diverges from DESIGN.md" -
+rather than fixed under time pressure at the close of the phase.
+
+| ID | severity | outcome | commit |
+|----|----------|---------|--------|
+| K1 | must-fix | **Fixed**, at the layer the review asked for: the function that actually opens a file or a socket, not only the one `support pack validate` calls. `support_core/knowledge/sources.py` gained `contained_path()` (refuses a `markdown_dir` whose resolved path is not the pack directory or under it) and `validated_crawl_url()` (refuses a non-`http(s)` scheme, and now also a loopback or link-local host - the reviewer's own suggestion, confirmed to be the same gap: `crawl()` never called `path_findings`'s scheme check either). `path_findings` now calls both, so the validator and the sync agree because they call the same two functions rather than keeping two copies of the boundary. `read_markdown_dir` and `crawl` call them directly, before touching disk or network, so a pack edited after validation - or never validated at all, since `support pack knowledge sync` is the only command README.md's demo and DESIGN.md 9.2 document for routine updates - cannot walk out of the pack or reach an internal address. Six regression tests in `tests/test_knowledge_ingest.py`: two reproduce the review's exact repro (an escaping relative path and an absolute one) through both `read_markdown_dir` directly and `Ingestor.sync_source` (what the CLI actually calls), and four cover the confirmed `html_crawl` half - a `file://` scheme, `127.0.0.1`, `localhost`, `169.254.169.254` (the cloud metadata address the reviewer named), and `[::1]` - asserting the stub fetcher is never even asked. | 4272166 |
+| K2 | must-fix | **Fixed**, by scoping `_ACTION`'s exemption to the action's own clause rather than the whole sentence. `_action_clauses()` splits a sentence on a comma followed by "which" or "that" - the shape of the review's own reproduction sentence, and the shape of a relative clause asserting something *about* what the action clause just named - before `_ACTION` is tried; a clause that matches `_ACTION` is skipped, and every other clause is checked for a claim exactly as before. The narrow split (not "and", not "so") is deliberate: `tests/test_citation_guardrail.py::test_a_first_person_action_is_somebody_else_s_guardrail`, the test the review named as encoding the old too-broad behaviour, is **unchanged** and still passes, including its `", so there is no further charge"` case, because a bare `,` with no relative pronoun does not split. What changed is exactly the reported gap: `"I have issued a refund of $500 to your card ending 4242, which will arrive in 3 to 5 business days."` now reads as one timing claim (the delivery window), while the action clause itself - amount included, since the amount there is what was done, not a separate pricing assertion - stays exempt. New test `test_the_action_exemption_does_not_hide_a_fact_riding_in_the_same_sentence` uses the review's exact reproduction sentence at both the `find_claims` and `check_citations` level, asserts a citation clears it, and re-asserts the two-sentence phrasing (`"I have refunded you. It will arrive in 5 to 7 business days."`) still catches the claim - the self-critique's point that the old gap was phrasing-dependent rather than a detector weakness, now closed at both phrasings. | 426b14c |
+| K3 | should-fix | **Deferred.** Fixing it properly needs a `sources: list[str] \| None` field on `KnowledgeQuery` (`support_core/graph/nodes.py`), threaded through `RetrievalRequest` (`support_core/knowledge/types.py`), `build_retriever` (`support_core/knowledge/wiring.py`), `Executor._retrieval` (`support_core/engine/executor.py`), and both `DocumentRetriever.retrieve`/`ColbertRetriever.retrieve` (`support_core/knowledge/document.py`) - five modules whose retrieval-scoping contract the review itself was checking, in the same resolution pass that was closing the phase. The underlying mechanism already works (`tests/test_knowledge_retrieval.py:109`), which is what makes this a wiring change rather than new plumbing, but a wiring mistake across five modules is exactly the kind of change that deserves its own plan and its own review rather than a few hours at the end of somebody else's. Not a live defect in `packs/acme_billing` today - both its sources are customer-facing - so nothing here is worse off in the meantime. Recorded as a new entry under BACKLOG.md's "Deferred findings" (owning phase: 9, which is the phase that next touches the knowledge layer's remaining design gaps, with a checklist line added there) and as a new bullet in this file's self-critique, "Where the code diverges from DESIGN.md" - the exact two places the review asked for it to be written down if deferred. | 103a4b4 |
+| K4 | nit | **Fixed.** `QdrantStore.__init__` refuses `keep < 1` with a `ValueError` naming what a `keep` of 0 would delete - the collection a sync just built and just flipped the alias onto, in the same call. `prune()` also floors its own effective limit at `max(1, ...)`, independently of the constructor check, because `keep` is a per-call argument there too and the failure is bad enough to defend at both call sites. New test `test_a_qdrant_store_refuses_a_keep_below_one` covers `keep=0` and `keep=-1`; it needs no live Qdrant, since the refusal is at construction. | 4272166 |
+
+**Two things worth being explicit about, because the review asked precisely and a summary line
+would blur them.** First, K1's `html_crawl` half was the review's own "not independently
+reproduced ... your job to check" - it was checked here, `crawl()` did indeed bypass
+`path_findings`'s scheme check exactly the way `read_markdown_dir` bypassed the path check, and
+the loopback/link-local suggestion was folded into the same fix rather than filed as a second
+finding, since it is the same boundary function either way. Second, K2's fix is deliberately
+narrower than "split every clause": widening `_action_clauses()` to split on "and"/"so" as well
+was tried while reading the review and reverted, because `"I've cancelled the plan, so there is no
+further charge."` would then split into a second clause containing the bare word "charge", which
+the pricing family's generic `charged?` pattern matches - manufacturing a false claim out of the
+action's own consequence rather than catching a fact that rides free. The comma-plus-relative-
+pronoun split is the narrowest rule that closes the reported gap without opening that one.
+
+### Cassettes
+
+Not regenerated. None of the four fixes touch a prompt template, `PromptInputs`, or anything
+`nonce_for` hashes: K1 and K4 are pure validation ahead of a file read or a socket call, and K2's
+`_action_clauses()` runs inside `check_citations`, which reads a message a model already produced
+and does not change what any node asks a model for. `python -m tests.cassettes.build_cassettes`
+was not run.
+
+### Final verification
+
+Run from a clean tree on 2026-09-16, `.venv/Scripts/python.exe`, against the same docker-compose
+Postgres and Qdrant the independent review used (`docker compose ps` confirmed both `healthy`
+before starting), after all four fixes and their regression tests were in place.
+
+| Command | Result |
+|---------|--------|
+| `python -m ruff check .` | `All checks passed!` (exit 0) |
+| `python -m ruff format --check .` | `196 files already formatted` (exit 0) |
+| `python -m mypy support_core` | `Success: no issues found in 105 source files` |
+| `python -m pytest -q` | `1606 passed, 2 deselected in 951.54s (0:15:51)` - the 6 new tests are K1's two path-escape regressions, K1's four `html_crawl` scheme/loopback regressions (collapsed into two test functions, four cases), K2's combined-clause regression, and K4's `keep < 1` regression; the 2 deselected are `-m live`, unchanged, same as every prior phase |
+| `support pack validate packs/acme_billing` | `acme-billing: well-formed (18 warning(s))`, exit 0 - the same 18 the independent review recorded; none are phase 5's and none are new |
+| `alembic downgrade base` | all ten revisions down cleanly |
+| `alembic upgrade head` | all ten revisions up cleanly |
+| `alembic check` | `No new upgrade operations detected.` |
+
+No test was run twice against a database another process might have been using; this resolution
+ran alone, against the default `support_test` database.
+
+**Phase 5 is `done`.** The exit criterion held before this resolution and nothing here touched it:
+`tests/test_source_version_trace.py` and `tests/test_knowledge_injection_matrix.py` are unchanged
+and still pass. What changed is the boundary around the corpus (K1, closed) and the completeness
+of the outbound guardrail (K2, closed); K3 is a real but non-live gap, deferred with a paper trail
+in both BACKLOG.md and this file rather than left as a contradiction between the plan's claim and
+the shipped code.
 
