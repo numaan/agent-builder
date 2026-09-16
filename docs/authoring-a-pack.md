@@ -18,6 +18,44 @@ assembly. **A new domain is graphs, tools, knowledge, prompts, and a manifest.**
 
 ---
 
+## 0. Why a pack — and why each file is required
+
+**What a domain pack is.** A pack is one domain, whole: its workflows, its integrations, its
+knowledge, its voice, and its configuration, as a directory core loads at startup. `create_app`
+does exactly `create_app(load_pack(config.pack))` — so **the pack is the thing that gives core
+something to run.** Core is deliberately domain-agnostic: it ships no refund logic, no billing, no
+address rules, no policy text. On its own it is an engine idling; the pack is the cartridge.
+
+**Why the split (and why you never fork core).** Everything that has to be *the same* for every
+domain lives in core: durability and the turn loop, the risk-tier/approval machinery, the
+prompt-injection defence, knowledge retrieval, the handoff desk. Everything that is *different* per
+domain lives in the pack. Because a domain is data + a little code loaded by core rather than a fork
+of it, a change to your domain can never weaken the engine's guarantees, and an upgrade to the engine
+reaches every domain at once. It is also the unit of deployment — DESIGN.md section 4.1's "one
+domain, one image, one service, one Postgres database."
+
+**Why each file has to be there.** `support pack validate` (the gate `make check` runs) treats the
+files and directories below as **required** — a missing one is an *error*, not a silent default,
+because each fills a role the engine cannot invent for you:
+
+| Path | Required | Why it must exist |
+|---|---|---|
+| `pack.yaml` | ✓ file | The only file every pack must have. It is the pack's identity and contract: which core version, which entry graph, which channels, and the LLM / handoff / limits / guardrails settings the engine reads on every turn. Without it there is no pack to load. |
+| `graphs/` | ✓ dir | Where the domain's behaviour lives. Core has no built-in workflow; the graphs *are* what the agent does. |
+| `graphs/<entry_graph>.yaml` | ✓ file | The `entry_graph` named in `pack.yaml` must have a file here — it is where every conversation starts. A named-but-absent entry graph is a hard error (`graph.entry_missing`). |
+| `tools/` + `tools/__init__.py` | ✓ dir+file | The pack's side effects. `__init__.py` must export `TOOLS: list[Tool]`, which is the *entire* contract with the tool runtime and the only source of a risk tier at run time. Required even if the list is empty, so "this pack has no tools" is a stated fact rather than a missing file. |
+| `persona.md` | ✓ file | Prompt layer 2 (voice). Required so every prompt has a defined persona layer rather than an accidental blank; keep it short (it is never truncated). |
+| `policies.md` | ✓ file | Prompt layer 3 (hard rules), injected into *every* prompt — max ~40 lines. Required because the rules that keep the agent safe and on-domain must be present by construction, not left to chance. |
+| `knowledge/` | ✓ dir | The retrieval corpus's home. |
+| `knowledge/sources.yaml` | ✓ file | Declares what to index (or explicitly nothing). Required so "what does this pack know?" is answerable at load; may declare empty lists for a pack that cites no documents. |
+| `evals/`, `evals/golden/`, `evals/nodes/` | ✓ dirs | Where golden conversations and node evals live (`support pack eval`). Required as a place — they may hold only a `.gitkeep` — so a pack always has somewhere to prove itself. |
+| `ui/` + `ui:` block | — optional | A pack's own branded front end at `/app`. Optional: without it the built-in demo pages still serve the pack. |
+| `knowledge/docs/`, `knowledge/kg/` | — optional | The actual documents / knowledge-graph files a source in `sources.yaml` points at. Present only if a source needs them. |
+
+The rest of this guide is what goes *inside* each of these.
+
+---
+
 ## 1. Anatomy of a pack — every file
 
 ```
