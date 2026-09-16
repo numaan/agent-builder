@@ -471,8 +471,9 @@ A pack is a directory with:
   timings, policy). Two of the refund graph's steps answer from here; a domain whose graphs make
   claims a customer will act on needs its own corpus.
 - **`persona.md`, `policies.md`** - the prompt layers (voice and rules).
-- optionally **`ui/`** with a `ui:` manifest block - the pack's own front end and its forms
-  (below) - and **`evals/`** - golden conversations the CLI can run.
+- optionally **`ui/`** with a `ui:` manifest block - the pack's own front end and branding (below;
+  a node's form is declared on the node, not here) - and **`evals/`** - golden conversations the CLI
+  can run.
 
 Two rules a new pack cannot skip: a `write`/`high` risk tool needs a `confirm` node on every path
 from the last customer input (the validator proves it), and `identity_verified` is set only by the
@@ -505,9 +506,10 @@ transports (the WebSocket at `/channels/web_chat/ws` and the AG-UI SSE endpoint 
 `/channels/ag_ui`), the built-in demo pages, the human desk and handoff queue, knowledge retrieval
 and the citation guardrail, rolling memory, and approval binding. A pack may also ship its **own**
 front end: static assets under `ui/` (served at `/app`) and a `ui:` block in `pack.yaml` for
-branding and for `forms` - schemas the agent renders as `render_form` tool calls over AG-UI, keyed
-by the graph node whose gate they belong to. A new domain is graphs, tools, knowledge, prompts and
-a manifest; the runtime is already there.
+branding. And an `ask` or `confirm` node may carry a `form:` schema - a form the client renders in
+place of a free-text reply, which the AG-UI transport emits as a `render_form` tool call (a channel
+without form support falls back to the node's prompt). A new domain is graphs, tools, knowledge,
+prompts and a manifest; the runtime is already there.
 
 Today core and the sample pack live in one repository (until the phase-9 split in BACKLOG.md's
 decisions log); the shape a real deployment takes is a separate pack repository that depends on

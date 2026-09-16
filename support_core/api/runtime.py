@@ -62,6 +62,7 @@ from support_core.llm.wiring import (
 from support_core.memory import LlmSummarizer
 from support_core.storage import repositories as repo
 from support_core.storage.config import pool_settings
+from support_core.storage.models import Run
 from support_core.storage.session import (
     connections_in_use,
     make_engine,
@@ -356,7 +357,7 @@ class AppRuntime:
                 session=conversation.channel_key if conversation is not None else None,
                 status=run.status if run is not None else "idle",
                 awaiting=self._awaiting_with_form(
-                    AwaitingSummary.of(run.awaiting if run is not None else None)
+                    AwaitingSummary.of(run.awaiting if run is not None else None), run
                 ),
                 history=[
                     {
@@ -368,20 +369,39 @@ class AppRuntime:
                 ],
             )
 
-    def _awaiting_with_form(self, awaiting: AwaitingSummary | None) -> AwaitingSummary | None:
-        """Attach the pack's form for the waiting node, if it declares one.
+    def _awaiting_with_form(
+        self, awaiting: AwaitingSummary | None, run: Run | None
+    ) -> AwaitingSummary | None:
+        """Attach the form the waiting node declares, if it has one (DESIGN.md section 12).
 
-        Rendering is a pack concern, not an engine one: the run's ``awaiting`` says *which* node is
-        waiting, and the pack's :attr:`~support_core.graph.manifest.PackUI.forms` says how to render
-        that node's input. A node with no declared form is unchanged, so a pack that ships no forms
-        pays a dictionary lookup and nothing else.
+        Rendering is a graph concern: the node that suspends carries its own ``form`` (see
+        :mod:`support_core.graph.nodes`), and the run's frame stack says which graph that node is
+        in. A node with no form is unchanged, so a pack that declares none pays a lookup and
+        nothing else.
         """
-        if awaiting is None or awaiting.node is None:
+        if awaiting is None or awaiting.node is None or run is None:
             return awaiting
-        form = self.pack.manifest.ui.forms.get(awaiting.node)
+        graph_id = self._suspended_graph_id(run)
+        graph = self.pack.graphs.get(graph_id) if graph_id else None
+        node = graph.nodes.get(awaiting.node) if graph else None
+        form = getattr(node, "form", None)
         if form is None:
             return awaiting
         return awaiting.model_copy(update={"form": form})
+
+    @staticmethod
+    def _suspended_graph_id(run: Run) -> str | None:
+        """The graph of the frame the run suspended in, addressed by ``awaiting.frame_seq``."""
+        frame_seq = (run.awaiting or {}).get("frame_seq")
+        frames = run.frames or []
+        for frame in frames:
+            if frame.get("frame_seq") == frame_seq:
+                graph_id = frame.get("graph_id")
+                return graph_id if isinstance(graph_id, str) else None
+        if frames:
+            graph_id = frames[-1].get("graph_id")
+            return graph_id if isinstance(graph_id, str) else None
+        return None
 
 
 def build_runtime(

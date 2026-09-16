@@ -8,6 +8,7 @@ const el = {
   subtitle: document.getElementById("subtitle"),
   restart: document.getElementById("restart"),
   transcript: document.getElementById("transcript"),
+  scroll: document.getElementById("scroll"),
   approval: document.getElementById("approval"),
   approvalTool: document.getElementById("approval-tool"),
   approvalPrompt: document.getElementById("approval-prompt"),
@@ -19,7 +20,14 @@ const el = {
   note: document.getElementById("note"),
 };
 
-const state = { threadId: uuid(), suggestions: [], running: false, messages: {}, tool: null };
+const state = {
+  threadId: uuid(),
+  suggestions: [],
+  running: false,
+  messages: {},
+  tool: null,
+  thinkingEl: null,
+};
 
 function uuid() {
   try {
@@ -34,12 +42,41 @@ function note(text, warn) {
   el.note.classList.toggle("warn", Boolean(warn));
 }
 
+function scrollToBottom() {
+  el.scroll.scrollTop = el.scroll.scrollHeight;
+}
+
+// A Claude-style "working" indicator: a bubble of pulsing dots shown while the agent runs, cleared
+// the moment any real output (a message, a form, or an approval) arrives.
+function showThinking() {
+  removeThinking();
+  const li = document.createElement("li");
+  li.className = "turn agent thinking";
+  li.setAttribute("aria-label", "Assistant is working");
+  for (let i = 0; i < 3; i++) {
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    li.appendChild(dot);
+  }
+  el.transcript.appendChild(li);
+  state.thinkingEl = li;
+  scrollToBottom();
+}
+
+function removeThinking() {
+  if (state.thinkingEl) {
+    state.thinkingEl.remove();
+    state.thinkingEl = null;
+  }
+}
+
 function say(author, text) {
+  removeThinking();
   const li = document.createElement("li");
   li.className = "turn " + (author === "customer" ? "customer" : "agent");
   li.textContent = text;
   el.transcript.appendChild(li);
-  li.scrollIntoView({ block: "end" });
+  scrollToBottom();
 }
 
 function renderSuggestions() {
@@ -55,9 +92,11 @@ function renderSuggestions() {
 }
 
 function showApproval(tool, proposal) {
+  removeThinking();
   el.approvalTool.textContent = tool || "a tool";
   el.approvalPrompt.textContent = proposal || "";
   el.approval.hidden = false;
+  el.approval.scrollIntoView({ block: "nearest" });
 }
 
 // Generative UI: build a form from a render_form tool call's schema, validate it, and send the
@@ -143,6 +182,7 @@ function buildField(field) {
 }
 
 function renderForm(schema) {
+  removeThinking();
   el.approval.hidden = true;
   const host = el.formHost;
   host.innerHTML = "";
@@ -177,6 +217,7 @@ function renderForm(schema) {
   actions.appendChild(submit);
   host.appendChild(actions);
   host.hidden = false;
+  host.scrollIntoView({ block: "nearest" });
 
   const nodeFor = (key) => host.querySelector('.fld[data-key="' + key + '"]');
   function raw(field) {
@@ -315,6 +356,7 @@ async function runTurn(text) {
   el.message.disabled = true;
   state.messages = {};
   state.tool = null;
+  showThinking();
   let resp;
   try {
     resp = await fetch("/channels/ag_ui", {
@@ -327,12 +369,14 @@ async function runTurn(text) {
       }),
     });
   } catch (err) {
+    removeThinking();
     note(`Could not start the run: ${err.message}`, true);
     state.running = false;
     el.send.disabled = el.message.disabled = false;
     return;
   }
   if (!resp.ok || !resp.body) {
+    removeThinking();
     note(`Run failed (${resp.status}).`, true);
     state.running = false;
     el.send.disabled = el.message.disabled = false;
@@ -359,6 +403,7 @@ async function runTurn(text) {
       }
     }
   } finally {
+    removeThinking();
     state.running = false;
     el.send.disabled = el.message.disabled = false;
   }
@@ -383,6 +428,7 @@ el.composer.addEventListener("submit", (event) => {
 el.restart.addEventListener("click", () => {
   state.threadId = uuid();
   el.transcript.innerHTML = "";
+  state.thinkingEl = null;
   el.approval.hidden = true;
   el.formHost.hidden = true;
   note("New conversation. Say something to begin.");

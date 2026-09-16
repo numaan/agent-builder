@@ -98,6 +98,48 @@ nodes:
     prompt: >-
       I will change the address on your account to {{ state.line1 }}, {{ state.city }},
       {{ state.postcode }}, {{ state.country }}. Shall I go ahead?
+    # DESIGN.md 12's generative UI. A client that supports forms renders this as the confirmation -
+    # a review the customer edits and submits - instead of a free-text yes; a client that does not
+    # falls back to the prompt above. The AG-UI transport emits it as a `render_form` tool call.
+    form:
+      title: Confirm your new billing address
+      intro: Check the address before we save it - this is exactly what will go on the account.
+      submit_label: Save this address
+      sections:
+        - title: New address
+          fields:
+            - key: line1
+              label: Address line 1
+              type: text
+              required: true
+            - key: line2
+              label: Address line 2
+              type: text
+            - key: city
+              label: City
+              type: text
+              required: true
+            - key: postcode
+              label: Postcode
+              type: text
+              required: true
+              pattern: '^[A-Za-z]{1,2}\d[A-Za-z\d]? ?\d[A-Za-z]{2}$'
+              hint: 'UK format, for example EH7 4AH'
+            - key: country
+              label: Country
+              type: select
+              required: true
+              options:
+                - {value: GB, label: United Kingdom}
+                - {value: IE, label: Ireland}
+                - {value: US, label: United States}
+                - {value: AE, label: United Arab Emirates}
+        - title: Confirmation
+          fields:
+            - key: authorized
+              label: I confirm this address is correct and I am authorized to change it.
+              type: checkbox
+              required: true
     edges:
       yes: apply_change
       no: abandon

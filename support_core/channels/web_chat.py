@@ -38,7 +38,7 @@ from support_core.channels.base import (
     InboundRejected,
 )
 from support_core.engine.types import OutboundMessage
-from support_core.graph.manifest import FormSchema
+from support_core.graph.forms import FormSchema
 
 CHANNEL = "web_chat"
 
