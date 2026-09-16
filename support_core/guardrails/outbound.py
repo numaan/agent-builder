@@ -145,7 +145,36 @@ a stronger check than a citation, and section 3's principle 3 puts every side ef
 trace. Making them require a *knowledge* citation would be wrong twice over - there is no policy
 document that says a particular refund was issued, and it would teach a pack to cite a policy for
 an action. The forbidden-promise check is phase 7's; this is recorded here so that phase does not
-have to rediscover the boundary."""
+have to rediscover the boundary.
+
+**The exemption is scoped to the action's own clause, not the whole sentence**
+(reviews/phase-5.md finding K2). It used to be sentence-wide, on the theory that phase 7's
+forbidden-promise check would cover whatever it missed - but that check does not exist yet, so a
+sentence this pattern matched got no guardrail at all, and because the unit was the whole
+sentence, a pricing or timing fact riding beside the action in the same sentence was exempted
+along with it: "I have issued a refund of $500 ..., which will arrive in 3 to 5 business days."
+passed with nothing checked, while the same content split into two sentences was correctly
+caught. :func:`_action_clauses` splits a trailing relative clause off before this pattern is
+tried, so the fact riding in "which ..." or "that ..." is checked on its own; the action clause
+itself - "I have issued a refund of $500 to your card ending 4242" - stays exempt, amount and all,
+because the amount there is *what was done*, not a separate assertion about pricing policy."""
+
+_TRAILING_RELATIVE_CLAUSE = re.compile(r",\s*(?:which|that)\b", re.IGNORECASE)
+"""Where :func:`_action_clauses` splits a sentence, and the only place it does.
+
+Narrow on purpose: a comma followed by "which" or "that" is what introduces a relative clause
+that asserts something *about* the thing the action clause just named, which is exactly the shape
+of the sentence K2 was reproduced with. A comma followed by anything else - "so", "and", "but" -
+is left alone, because "I've cancelled the plan, so there is no further charge" is one assertion
+about one action and splitting it would manufacture a claim maybe out of its own consequence
+clause rather than catch a fact the action clause was smuggling past the check."""
+
+
+def _action_clauses(sentence: str) -> list[str]:
+    """``sentence``, split at a trailing relative clause. One element when there is none."""
+    parts = _TRAILING_RELATIVE_CLAUSE.split(sentence, maxsplit=1)
+    return [part.strip() for part in parts if part.strip()]
+
 
 _SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
 
@@ -224,9 +253,15 @@ def find_claims(message: str, policy: CitationPolicy | None = None) -> list[Clai
     for sentence in sentences(message):
         if settings.allow_uncited_questions and sentence.endswith("?"):
             continue
-        if _HEDGED.search(sentence) or _ACTION.match(sentence):
+        if _HEDGED.search(sentence):
             continue
-        family = _family(sentence, extra)
+        family: str | None = None
+        for clause in _action_clauses(sentence):
+            if _ACTION.match(clause):
+                continue
+            family = _family(clause, extra)
+            if family is not None:
+                break
         if family is not None:
             found.append(Claim(sentence=sentence, family=family))
     return found

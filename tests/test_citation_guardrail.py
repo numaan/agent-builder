@@ -120,6 +120,50 @@ def test_a_first_person_action_is_somebody_else_s_guardrail() -> None:
     assert find_claims("I've cancelled the plan, so there is no further charge.") == []
 
 
+def test_the_action_exemption_does_not_hide_a_fact_riding_in_the_same_sentence() -> None:
+    """reviews/phase-5.md finding K2. ``_ACTION`` used to exempt the whole sentence a first-person
+    action verb appeared in - on the theory that DESIGN.md 14's forbidden-promise check (phase
+    7's) would catch whatever it missed. That check does not exist yet, so the sentence got no
+    guardrail at all, and because the unit was the whole sentence, a pricing or timing fact riding
+    beside the action in the *same* sentence was exempted along with it. The exact reproduction
+    from the review: an uncited dollar amount and an uncited delivery window in one sentence used
+    to pass with ``claims=()``."""
+    combined = find_claims(
+        "I have issued a refund of $500 to your card ending 4242, which will arrive in "
+        "3 to 5 business days."
+    )
+    assert [claim.family for claim in combined] == ["timing"]
+
+    verdict = check_citations(
+        "I have issued a refund of $500 to your card ending 4242, which will arrive in "
+        "3 to 5 business days.",
+        citations=[],
+        offered=["k1"],
+    )
+    assert not verdict.ok
+    assert verdict.families() == ["timing"]
+
+    # A citation clears it, the same as any other claim.
+    cited = check_citations(
+        "I have issued a refund of $500 to your card ending 4242, which will arrive in "
+        "3 to 5 business days.",
+        citations=["k1"],
+        offered=["k1"],
+    )
+    assert cited.ok
+
+    # The two-sentence phrasing of the same content was always caught correctly, and the fix must
+    # not disturb that: it is the whole reason the old gap was phrasing-dependent rather than a
+    # detector weakness.
+    split_verdict = check_citations(
+        "I have refunded you. It will arrive in 5 to 7 business days.",
+        citations=[],
+        offered=["k1"],
+    )
+    assert not split_verdict.ok
+    assert split_verdict.families() == ["timing"]
+
+
 def test_a_pack_may_add_patterns_and_may_not_remove_one() -> None:
     """Additive only. A pack that could delete the timing family could make "your refund arrives
     tomorrow" not a claim, which is exactly the sentence this exists for."""
