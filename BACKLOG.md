@@ -294,6 +294,16 @@ Design: sections 9.1 (knowledge graph), 10, 20, 4.1.
 - [ ] Scope the node type registry per `Pack` (a `Pack.node_types` consulted by `build_runner` and by the loader that parses node YAML), so two packs loaded side by side cannot fight over one name (phase 2 review finding R6). Refusing a conflicting duplicate registration is already in place; the registry itself is still process-wide, and `NODE_TYPES` is what parses YAML, so the loader and validator have to carry it too.
 - [ ] Split into two distributable packages: `support-core` and the sample pack depending on a pinned version; Dockerfile for the pack.
 - [ ] Sample pack knowledge graph: plans, features, regions.
+- [ ] Add a `sources:` field to a node's `knowledge:` block (`KnowledgeQuery` in
+      `support_core/graph/nodes.py`) and thread it through `RetrievalRequest`,
+      `build_retriever`/`_retrieval` and the two document retrievers so a node can be scoped to a
+      subset of the pack's document sources, per DESIGN.md 9.1's "packs choose which backends a
+      given `llm` node may use via the node's `knowledge:` block" (phase-5 deferred finding K3,
+      reviews/phase-5.md). `DocumentRetriever` and `ColbertRetriever` already accept `source_ids`
+      at construction and a test already proves the underlying filter works
+      (`tests/test_knowledge_retrieval.py:109`) - what is missing is a *per-request* narrowing
+      that construction-time argument cannot express, since today's one retriever is built once at
+      startup and shared by every node.
 
 Exit criterion: the sample pack builds as its own image, starts, and answers "what does my plan include" with a knowledge-graph citation.
 
@@ -462,6 +472,22 @@ Populated by phase reviews. Format: `- [phase N] finding, severity, reason defer
   not harmed and no answer changes retrospectively; what is not true is that a replay is
   byte-identical. Nit, deferred to phase 7, which owns replay (checklist line added there).
 
+- [phase 5] K3: a node's `knowledge:` block (`KnowledgeQuery` in `support_core/graph/nodes.py`)
+  has no field to scope which document sources it searches - every node gets the pack's whole
+  corpus, contradicting DESIGN.md 9.1 ("packs choose which backends a given `llm` node may use via
+  the node's `knowledge:` block") and this phase's own plan text ("the node cannot widen its own
+  `k` or query anything the graph did not declare"). The underlying retrievers already accept a
+  `source_ids` filter at construction (`tests/test_knowledge_retrieval.py:109` proves it works) -
+  only the wiring (`build_retriever` in `support_core/knowledge/wiring.py`, `Executor._retrieval`
+  in `support_core/engine/executor.py`) never narrows it per node, because both retrievers are
+  built once at startup from the pack's whole source list and shared by every node through one
+  `CompositeRetriever`. Not a live defect in `packs/acme_billing` today - both its sources are
+  meant to be customer-facing - but a real containment gap for the first pack that mixes an
+  internal-only source with a customer-facing one. Should-fix (independent review,
+  reviews/phase-5.md finding K3), deferred to phase 9, which owns the rest of the knowledge layer's
+  remaining design gaps (checklist line added there) rather than fixed under time pressure in the
+  same resolution pass that closed phase 5, where a wiring mistake across four modules would have
+  landed with less scrutiny than the finding deserves.
 - [phase 6] P2 (durable half): a handoff no sink would take is visible only in
   `HandoffService.failures`, a per-process list nothing sweeps, so a second replica cannot see it
   and no queue row exists to find later, should-fix, deferred to phase 7. The customer-facing half
