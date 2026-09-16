@@ -356,6 +356,28 @@ Two things to know:
   `neutralise`d, and all untrusted content (customer messages, tool results, retrieved passages,
   state) is wrapped in per-turn unforgeable data fences. Write plain text; core fences it.
 
+### Where the system prompt and skills live (locator)
+
+There is no single "system prompt" file and no `skills/` directory — both are composed from the
+pieces below. The system prompt is **assembled per turn** by `assemble()` in
+`support_core/llm/prompt.py`; a "skill" is a **workflow graph + its tools + its knowledge**.
+
+| Looking for… | It lives in… |
+|---|---|
+| The **assembled** system prompt (per turn) | `support_core/llm/prompt.py` → `assemble()` |
+| Layer 1 — the core system prompt (role, safety, output rules) | `support_core/llm/prompt.py` → `CORE_SYSTEM_PROMPT` — **core-owned, not editable by packs** |
+| Layer 2 — persona (voice) | `packs/<pack>/persona.md` |
+| Layer 3 — policies (hard rules, every prompt) | `packs/<pack>/policies.md` |
+| Layer 4 — node instructions (the step's task) | the `instructions:` of each `llm` node in `packs/<pack>/graphs/*.yaml` |
+| Layer 5 — allowed decisions | derived automatically from that node's `edges` |
+| Layers 6–9 — state / knowledge / tool results / conversation | filled by the engine at run time |
+| A **skill** (a capability like "issue a refund") | a workflow graph in `packs/<pack>/graphs/` (e.g. `refund.yaml`), reachable from `root.yaml`'s `classify` via a `subgraph` edge |
+| The tools a skill calls | `packs/<pack>/tools/` (exported from `tools/__init__.py`) |
+| The knowledge a skill cites | `packs/<pack>/knowledge/` |
+
+So the parts **you author** for the prompt are `persona.md`, `policies.md`, and each node's
+`instructions:`; the parts you author for a skill are its graph, its tools, and its knowledge.
+
 ---
 
 ## 7. UI forms, and linking a form to the flow
