@@ -29,6 +29,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from support_core.graph.forms import FormSchema
+
 SuspendKind = Literal["waiting_customer", "waiting_human", "waiting_async_tool"]
 """DESIGN.md section 7.2 statuses a node can suspend into."""
 
@@ -131,6 +133,9 @@ class AskNode(NodeBase):
     slots: list[str] = Field(min_length=1)
     prompt: str
     next: str
+    form: FormSchema | None = None
+    """A form the client renders to collect these slots, instead of a free-text reply (DESIGN.md
+    section 12). Optional: a channel with no form support falls back to the prompt."""
 
 
 class ToolNode(NodeBase):
@@ -176,6 +181,10 @@ class ConfirmNode(NodeBase):
     action: ConfirmAction
     prompt: str
     edges: dict[Literal["yes", "no"], str]
+    form: FormSchema | None = None
+    """A form the client renders as the confirmation - a review the customer edits and submits -
+    instead of a free-text yes (DESIGN.md section 12). Optional: a channel with no form support
+    still answers with text."""
 
 
 class HandoffNode(NodeBase):

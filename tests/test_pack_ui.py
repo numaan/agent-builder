@@ -13,7 +13,8 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from support_core.api import AppConfig
-from support_core.graph.manifest import FormField, FormSchema, FormSection, PackUI
+from support_core.graph.forms import FormField, FormSchema, FormSection
+from support_core.graph.manifest import PackUI
 from tests.app_support import (
     ACME,
     CASSETTES,
@@ -116,7 +117,6 @@ def test_pack_ui_defaults_are_empty() -> None:
     assert ui.accent is None
     assert ui.suggestions == []
     assert ui.dir == "ui"
-    assert ui.forms == {}
 
 
 # -- form schema constraints ---------------------------------------------------------------
@@ -132,7 +132,7 @@ def test_a_choice_field_requires_options() -> None:
 
 
 def test_a_non_choice_field_rejects_options() -> None:
-    from support_core.graph.manifest import FormOption
+    from support_core.graph.forms import FormOption
 
     with pytest.raises(ValidationError):
         FormField(
@@ -165,11 +165,13 @@ def test_a_valid_form_schema_builds() -> None:
     assert [f.key for s in schema.sections for f in s.fields] == ["line1", "city"]
 
 
-def test_the_acme_pack_declares_a_form_for_confirm_change() -> None:
-    """The example that the AG-UI transport renders as a tool call."""
+def test_the_acme_pack_declares_a_form_on_the_confirm_change_node() -> None:
+    """The form lives on the graph node it renders, in graphs/update_address.yaml."""
     from support_core import load_pack
+    from support_core.graph.nodes import ConfirmNode
 
-    forms = load_pack(ACME).manifest.ui.forms
-    assert "confirm_change" in forms
-    keys = [f.key for s in forms["confirm_change"].sections for f in s.fields]
+    node = load_pack(ACME).graphs["update_address"].nodes["confirm_change"]
+    assert isinstance(node, ConfirmNode)
+    assert node.form is not None
+    keys = [f.key for s in node.form.sections for f in s.fields]
     assert {"line1", "city", "postcode", "country", "authorized"} <= set(keys)
