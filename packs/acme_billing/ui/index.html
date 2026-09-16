@@ -37,24 +37,46 @@
         }
       }
       * { box-sizing: border-box; }
+      html, body { height: 100%; }
       body { margin: 0; background: var(--paper); color: var(--ink);
-             font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-      .bar { display: flex; align-items: center; justify-content: space-between; gap: 12px;
-             padding: 12px 18px; background: var(--accent); color: #fff; }
+             font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+             height: 100vh; height: 100dvh; display: flex; flex-direction: column;
+             overflow: hidden; }
+      .bar { flex: none; display: flex; align-items: center; justify-content: space-between;
+             gap: 12px; padding: 12px 18px; background: var(--accent); color: #fff; }
       .bar h1 { font-size: 17px; margin: 0; }
       .bar .sub { font-size: 12px; opacity: 0.85; }
       .bar button { font: inherit; color: #fff; background: rgba(255, 255, 255, 0.15);
                     border: 1px solid rgba(255, 255, 255, 0.5); border-radius: 8px;
                     padding: 6px 11px; cursor: pointer; }
-      main { max-width: 720px; margin: 0 auto; padding: 18px; }
+      main { max-width: 720px; width: 100%; margin: 0 auto; padding: 18px; flex: 1 1 auto;
+             min-height: 0; display: flex; flex-direction: column; }
+      /* Only the conversation panel scrolls; the header stays pinned above it and the composer
+         below it, so the input is always in view no matter how long the transcript grows. */
+      .scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
+                padding-right: 2px; }
+      .dock { flex: none; padding-top: 10px; }
       .transcript { list-style: none; margin: 0 0 14px; padding: 0; display: flex;
-                    flex-direction: column; gap: 10px; min-height: 44vh; }
+                    flex-direction: column; gap: 10px; }
       .turn { max-width: 82%; padding: 9px 13px; border-radius: 14px; white-space: pre-wrap;
               overflow-wrap: anywhere; }
       .turn.agent { background: var(--agent); border: 1px solid var(--line); align-self: flex-start;
                     border-bottom-left-radius: 4px; }
       .turn.customer { background: var(--accent); color: #fff; align-self: flex-end;
                        border-bottom-right-radius: 4px; }
+      /* The "working" indicator: three dots that pulse while a turn is being processed. */
+      .turn.thinking { align-self: flex-start; display: inline-flex; gap: 5px; align-items: center;
+                       padding: 12px 14px; }
+      .turn.thinking .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted);
+                            animation: think 1.4s ease-in-out infinite both; }
+      .turn.thinking .dot:nth-child(2) { animation-delay: 0.18s; }
+      .turn.thinking .dot:nth-child(3) { animation-delay: 0.36s; }
+      @keyframes think { 0%, 80%, 100% { opacity: 0.25; transform: translateY(0); }
+                         40% { opacity: 0.95; transform: translateY(-3px); } }
+      @media (prefers-reduced-motion: reduce) {
+        .turn.thinking .dot { animation-name: thinkfade; }
+        @keyframes thinkfade { 0%, 100% { opacity: 0.3; } 50% { opacity: 0.9; } }
+      }
       .approval { border: 2px solid var(--warn-line); background: var(--warn-bg); color: var(--warn-ink);
                   border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; }
       .approval h2 { margin: 0 0 6px; font-size: 16px; }
@@ -107,28 +129,32 @@
     </header>
 
     <main>
-      <ol class="transcript" id="transcript" aria-live="polite" aria-label="Conversation"></ol>
+      <div class="scroll" id="scroll">
+        <ol class="transcript" id="transcript" aria-live="polite" aria-label="Conversation"></ol>
 
-      <section class="pform" id="form-host" hidden aria-label="Form from the assistant"></section>
+        <section class="pform" id="form-host" hidden aria-label="Form from the assistant"></section>
 
-      <section class="approval" id="approval" hidden role="region" aria-labelledby="approval-title">
-        <h2 id="approval-title">Your approval is needed</h2>
-        <p>Nothing happens until you answer, and only the exact action described. Approve by
-          sending your reply.</p>
-        <p>waiting to run <code id="approval-tool">a tool</code></p>
-        <blockquote id="approval-prompt"></blockquote>
-      </section>
+        <section class="approval" id="approval" hidden role="region" aria-labelledby="approval-title">
+          <h2 id="approval-title">Your approval is needed</h2>
+          <p>Nothing happens until you answer, and only the exact action described. Approve by
+            sending your reply.</p>
+          <p>waiting to run <code id="approval-tool">a tool</code></p>
+          <blockquote id="approval-prompt"></blockquote>
+        </section>
+      </div>
 
-      <div class="suggestions" id="suggestions" hidden></div>
+      <div class="dock">
+        <div class="suggestions" id="suggestions" hidden></div>
 
-      <form class="composer" id="composer">
-        <label class="visually-hidden" for="message">Your message</label>
-        <input id="message" type="text" autocomplete="off" placeholder="Type a message"
-               maxlength="4000" />
-        <button type="submit" id="send">Send</button>
-      </form>
+        <form class="composer" id="composer">
+          <label class="visually-hidden" for="message">Your message</label>
+          <input id="message" type="text" autocomplete="off" placeholder="Type a message"
+                 maxlength="4000" />
+          <button type="submit" id="send">Send</button>
+        </form>
 
-      <p class="note" id="note"></p>
+        <p class="note" id="note"></p>
+      </div>
     </main>
 
     <script src="app.js"></script>
